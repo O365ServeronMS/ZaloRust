@@ -35,8 +35,6 @@ fn main() {
             "pick_download_dir",
             "choose_app_icon",
             "reset_app_icon",
-            "export_backup",
-            "import_backup",
             "list_accounts",
             "add_account",
             "remove_account",

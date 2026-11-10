@@ -9,8 +9,6 @@
     "allow-pick-download-dir",
     "allow-choose-app-icon",
     "allow-reset-app-icon",
-    "allow-export-backup",
-    "allow-import-backup",
     "allow-restart-app",
     "allow-list-accounts",
     "allow-add-account",

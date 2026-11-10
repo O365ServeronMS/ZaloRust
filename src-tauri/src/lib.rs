@@ -2,7 +2,6 @@ mod accounts;
 mod appicon;
 mod applock;
 mod aumid;
-mod backup;
 mod badge;
 mod biometric;
 mod commands;
@@ -220,8 +219,6 @@ pub fn run() {
             commands::open_settings,
             commands::pick_download_dir,
             commands::choose_app_icon,
-            commands::export_backup,
-            commands::import_backup,
             commands::reset_app_icon,
             commands::list_accounts,
             commands::add_account,

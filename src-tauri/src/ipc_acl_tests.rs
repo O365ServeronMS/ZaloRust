@@ -34,8 +34,6 @@ const SETTINGS_COMMANDS: &[&str] = &[
     "pick_download_dir",
     "choose_app_icon",
     "reset_app_icon",
-    "export_backup",
-    "import_backup",
     "restart_app",
     "list_accounts",
     "add_account",

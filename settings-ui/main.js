@@ -106,26 +106,6 @@ async function resetIcon() {
   } catch (e) { flash(String(e), 6000); }
 }
 
-async function backupExport() {
-  const pass = document.getElementById("backup_pass").value;
-  try {
-    if (await invoke("export_backup", { passphrase: pass })) flash("Backup exportado ✓", 4000);
-  } catch (e) { flash(String(e), 8000); }
-  document.getElementById("backup_pass").value = "";
-}
-
-async function backupImport() {
-  const pass = document.getElementById("backup_pass").value;
-  if (!pass) { flash("Digite a senha do backup.", 6000); return; }
-  if (!(await Dlg.confirm("Importar vai substituir a lista de contas e as configurações atuais, e o Zalo vai reiniciar. Continuar?", { title: "Importar backup", okLabel: "Importar" }))) return;
-  try {
-    if (await invoke("import_backup", { passphrase: pass })) {
-      flash("Backup importado. Reiniciando…", 4000);
-      await invoke("restart_app");
-    }
-  } catch (e) { flash(String(e), 8000); }
-}
-
 async function load() {
   const s = await invoke("get_settings");
   setMacRows(s.platform === "macos");
@@ -394,8 +374,6 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("reset_download_dir").addEventListener("click", resetDownloadDir);
   document.getElementById("choose_icon").addEventListener("click", chooseIcon);
   document.getElementById("reset_icon").addEventListener("click", resetIcon);
-  document.getElementById("backup_export").addEventListener("click", backupExport);
-  document.getElementById("backup_import").addEventListener("click", backupImport);
   // Zoom saves on change rather than on Save: picking a size you cannot see the
   // effect of is guesswork, and the webview applies it immediately.
   document.getElementById("zoom").addEventListener("change", save);
