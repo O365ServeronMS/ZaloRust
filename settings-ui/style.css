@@ -148,9 +148,3 @@ select option { background: var(--bg); color: var(--fg); }
 .notes code { padding: 1px 4px; }
 .notes pre { padding: 8px 10px; overflow-x: auto; white-space: pre-wrap; }
 
-/* Backup section icons */
-.ico { width:18px;height:18px;stroke:currentColor;stroke-width:1.8;fill:none;stroke-linecap:round;stroke-linejoin:round;flex:none; }
-.title-ico { display:flex;align-items:center;gap:10px; } .title-ico .ico { width:24px;height:24px; }
-.row-ico { display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:var(--hover);flex:none;margin-right:12px; }
-.btn-ico { display:inline-flex;align-items:center;gap:6px; }
-.settings-nav a:has(.ico) { display:flex;align-items:center;gap:8px; }

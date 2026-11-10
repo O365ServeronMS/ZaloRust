@@ -55,6 +55,10 @@
   </recommends>
 
   <releases>
+    <release type="stable" version="2026.11.12" date="2026-11-11">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v2026.11.12</url>
+      <description><p>Removed the settings backup (export/import).</p></description>
+    </release>
     <release type="stable" version="2026.11.11" date="2026-11-10">
       <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v2026.11.11</url>
       <description><p>Zalo logo icon; slimmer top bar.</p></description>
