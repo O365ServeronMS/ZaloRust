@@ -1,0 +1,37 @@
+/* In-page replacements for window.alert/confirm/prompt. Shared by the settings
+   window and the lock screen, so the styles stand on their own rather than
+   extending either page's sheet. */
+.dlg-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: #000a;
+}
+.dlg-backdrop[hidden] { display: none; }
+.dlg {
+  box-sizing:border-box;width:100%;max-width:340px;max-height:calc(100vh - 48px);overflow-y:auto;overflow-wrap:anywhere;padding:20px;
+  border-radius: 12px; box-shadow: 0 14px 44px #0007;
+  background: var(--card,#fff); color: var(--fg,#0a0a0a);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px; text-align: left;
+}
+@media (prefers-color-scheme: dark) {
+  .dlg { background: var(--card,#232626); color: var(--fg,#fafafa); }
+}
+.dlg h2 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+.dlg-message { margin: 0; line-height: 1.45; white-space: pre-line; }
+.dlg-input {
+  width: 100%; margin-top: 14px; padding: 9px 11px; font-size: 14px;
+  border: 1px solid #8886; border-radius: 8px;
+  background: transparent; color: inherit;
+}
+.dlg-input:focus { outline: 2px solid #25d36688; outline-offset: 1px; }
+.dlg-error { color: #f15c6d; font-size: 13px; margin: 8px 0 0; }
+.dlg-error[hidden] { display: none; }
+.dlg-actions { display:flex;flex-wrap:wrap; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.dlg-actions button {
+  padding: 8px 16px; font-size: 14px; font-weight: 600;
+  border: 0; border-radius: 20px; cursor: pointer;
+  background: var(--green,#21c063); color: var(--on-green,#0a0a0a);
+}
+.dlg-actions button.dlg-secondary { background: transparent; color: inherit; border: 1px solid #8886; }
+.dlg-actions button.dlg-danger { background: #e5484d; color: #fff; }

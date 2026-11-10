@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Zalo
+Comment=Lightweight unofficial Zalo Web client
+Icon=io.github.o365serveronms.zalors
+Exec=zalors %u
+Terminal=false
+MimeType=x-scheme-handler/zalors;
+Categories=Network;InstantMessaging;
+Keywords=Zalo;Zalo Web;chat;messaging;multi-account;
+StartupWMClass=zalors
+X-GNOME-UsesNotifications=true
+X-Flatpak=io.github.o365serveronms.zalors

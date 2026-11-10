@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Karem, O365ServeronMS -->
+<component type="desktop-application">
+  <id>io.github.o365serveronms.zalors</id>
+  <name>Zalo</name>
+  <summary>Lightweight unofficial Zalo Web client</summary>
+
+  <developer id="io.github.O365ServeronMS">
+    <name>O365ServeronMS</name>
+  </developer>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <url type="homepage">https://github.com/O365ServeronMS/ZaloRust</url>
+  <url type="vcs-browser">https://github.com/O365ServeronMS/ZaloRust</url>
+  <url type="bugtracker">https://github.com/O365ServeronMS/ZaloRust/issues</url>
+  <url type="faq">https://github.com/O365ServeronMS/ZaloRust#faq</url>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#1F3A5F</color>
+    <color type="primary" scheme_preference="dark">#4C7BB5</color>
+  </branding>
+
+  <description>
+    <p>
+      Zalo is an unofficial, independent desktop client that loads the official
+      Zalo Web interface in the system WebKitGTK webview. It is not affiliated
+      with, endorsed by, or sponsored by VNG Corporation or Zalo.
+    </p>
+    <p>It adds desktop features beyond a browser tab:</p>
+    <ul>
+      <li>Multiple isolated Zalo accounts in separate windows</li>
+      <li>Native notifications, system tray integration, and close to tray</li>
+      <li>Drag-and-drop attachment routing with bounded memory use</li>
+      <li>Optional password lock and automatic idle locking</li>
+      <li>Persistent sessions, display scaling, and configurable shortcuts</li>
+    </ul>
+    <p>
+      Voice messages work on Linux. Voice and video calls normally do not because
+      mainstream Linux WebKitGTK runtimes are built without compatible WebRTC support.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.o365serveronms.zalors.desktop</launchable>
+
+  <requires>
+    <internet>always</internet>
+    <display_length compare="ge">600</display_length>
+  </requires>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+
+  <releases>
+    <release type="stable" version="2026.11.11" date="2026-11-10">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v2026.11.11</url>
+      <description><p>Zalo logo icon; slimmer top bar.</p></description>
+    </release>
+    <release type="stable" version="2026.11.10" date="2026-11-10">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v2026.11.10</url>
+      <description><p>Calendar versioning; Windows NSIS only.</p></description>
+    </release>
+    <release type="stable" version="0.6.0" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.6.0</url>
+      <description><p>Tauri 2.12 upgrade.</p></description>
+    </release>
+    <release type="stable" version="0.5.1" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.5.1</url>
+      <description><p>Backup section icons; CI and dependency updates.</p></description>
+    </release>
+    <release type="stable" version="0.5.0" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.5.0</url>
+      <description><p>Renamed to Zalo; install folder zalo-web.</p></description>
+    </release>
+    <release type="stable" version="0.4.0" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.4.0</url>
+      <description><p>Vietnamese interface (default); Portuguese removed.</p></description>
+    </release>
+    <release type="stable" version="0.3.0" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.3.0</url>
+      <description><p>Encrypted export/import of accounts and settings.</p></description>
+    </release>
+    <release type="stable" version="0.2.0" date="2026-11-09">
+      <url type="details">https://github.com/O365ServeronMS/ZaloRust/releases/tag/v0.2.0</url>
+      <description><p>First Zalo build: Zalo Web in a native window, new icon, link handling for chat.zalo.me.</p></description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>

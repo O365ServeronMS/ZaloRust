@@ -1,0 +1,95 @@
+[package]
+name = "zalors"
+version = "2026.11.11"
+edition = "2021"
+rust-version = "1.82"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[lib]
+name = "zalors_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.5", features = ["tray-icon", "image-png", "unstable", "macos-proxy"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+argon2 = { version = "0.5.3", features = ["std"] }  # Argon2id password hashing for the app lock (PHC strings)
+ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
+semver = "1"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"  # authenticated encryption of settings backups
+getrandom = "0.3"           # salt and nonce for backups
+base64 = "0.22"             # custom icon inside the backup JSON
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Version-matched to wry 0.55's webkit2gtk so PlatformWebview::inner() types unify.
+webkit2gtk = "=2.0.2"
+# Already in the tree through tauri/wry; named directly to pin the single-window
+# recovery bar (GtkBox child packing). Same 0.18 line wry uses.
+gtk = "0.18"
+zbus = "5"
+zbus_polkit = "5.0.0"
+
+[target.'cfg(windows)'.dependencies]
+# Version-matched to wry 0.55 for the WebView2 PermissionRequested mic/camera handler.
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",         # existing
+  "Win32_System_Com",         # existing (webview2 permission handler)
+  "Security_Credentials_UI",  # UserConsentVerifier + result/availability enums
+  "Win32_System_WinRT",       # IUserConsentVerifierInterop
+  "Foundation",
+  "Data_Xml_Dom",
+  "UI_Notifications",               # async return-type plumbing
+  "Win32_Security",           # SECURITY_ATTRIBUTES (referenced by RegCreateKeyExW)
+  "Win32_System_Registry",    # RegCreateKeyExW/RegSetValueExW: register the toast AUMID in HKCU
+  "Win32_UI_Shell",           # SetCurrentProcessExplicitAppUserModelID, ShellExecuteW (open links/files)
+  "Win32_UI_Controls_Dialogs", # native per-download Save As dialog
+  "Win32_UI_WindowsAndMessaging", # SW_SHOWNORMAL for ShellExecuteW
+  "Win32_Globalization",      # GetUserDefaultLocaleName: default UI language
+] }
+windows-core = "0.62"
+# In windows-rs 0.61 IAsyncOperation moved out of windows::Foundation into the
+# windows-future crate (0.2.1 is already in the tree via the windows stack).
+windows-future = "0.3"
+# WinRT toasts raised directly so their result can be logged (notify.rs). Same
+# version the notification plugin already pulls in, so no new crate is vendored.
+tauri-winrt-notification = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS < 14 guard for data_store_identifier (per-account isolation). Already at
+# 0.3.2 in Cargo.lock via the dependency graph; the NSProcessInfo feature must be
+# explicit. Inert on Linux/Windows. NSString + NSError added for the Touch ID backend.
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString", "NSError", "NSUserDefaults"] }
+# CGRect/CGPoint/CGSize for the synchronous NSWindow frame restore in menubar.rs.
+objc2-core-foundation = "0.3.2"
+objc2-local-authentication = { version = "0.3.2", features = ["LAContext", "block2"] }
+objc2 = "0.6"
+# The macOS main queue, used by menubar.rs to order panel transitions after window geometry changes
+dispatch2 = "0.3.1"
+block2 = "0.6"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"  # native folder/PNG pickers, called from Rust only (no JS permission): custom download folder + app icon
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-window-state = "2"
+user-idle = { version = "0.6", default-features = false, features = ["dbus"] }  # system idle time for the idle auto-lock trigger (dbus: no libxss-dev needed)
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Mock runtime for the IPC permission tests (src/ipc_acl_tests.rs, Linux only).
+# The feature adds no crates, so Cargo.lock and the offline Flatpak sources are
+# unchanged.
+tauri = { version = "2", features = ["tray-icon", "image-png", "test"] }

@@ -1,0 +1,77 @@
+id: io.github.o365serveronms.zalors
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: zalors
+
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=home:ro
+  - --filesystem=xdg-download
+  - --filesystem=xdg-config/autostart:create
+  - --filesystem=xdg-run/tray-icon:create
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.ScreenSaver
+  - --talk-name=org.gnome.ScreenSaver
+  - --talk-name=org.kde.ScreenSaver
+  # Unity LauncherEntry: the proxy only forwards the unread-count signal if the app may talk to this name.
+  - --talk-name=com.canonical.Unity
+
+modules:
+  - flatpak/shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
+
+  - name: zalors
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/zalors/cargo
+        CARGO_NET_OFFLINE: 'true'
+        PATH: /run/build/zalors/rust/bin:/usr/bin
+        TAURI_CONFIG: '{"identifier":"io.github.o365serveronms.zalors"}'
+    sources:
+      - type: archive
+        url: https://static.rust-lang.org/dist/2025-08-07/rust-1.89.0-x86_64-unknown-linux-gnu.tar.xz
+        sha256: c4f2796b10ee886001f0799bc40caea38746403a33c379d77878c4f4683f9b51
+        dest: rust-toolchain
+        strip-components: 1
+        only-arches:
+          - x86_64
+      - type: archive
+        url: https://static.rust-lang.org/dist/2025-08-07/rust-1.89.0-aarch64-unknown-linux-gnu.tar.xz
+        sha256: ae6f35b027cb32339fa4ac94dab37a21194e9a5c680491d01e54aa61e9da4de7
+        dest: rust-toolchain
+        strip-components: 1
+        only-arches:
+          - aarch64
+      - type: dir
+        path: src-tauri
+        dest: src-tauri
+        skip:
+          - target
+      - type: dir
+        path: settings-ui
+        dest: settings-ui
+      - type: file
+        path: LICENSE
+      - flatpak/cargo-sources.json
+      - type: file
+        path: flatpak/io.github.o365serveronms.zalors.desktop
+      - type: file
+        path: flatpak/io.github.o365serveronms.zalors.metainfo.xml
+      - type: file
+        path: flatpak/io.github.o365serveronms.zalors.svg
+    build-commands:
+      - ./rust-toolchain/install.sh --prefix=/run/build/zalors/rust --without=rust-docs --disable-ldconfig
+      - cargo --offline fetch --locked --manifest-path src-tauri/Cargo.toml
+      - cargo --offline build --release --locked --manifest-path src-tauri/Cargo.toml
+      - install -Dm755 src-tauri/target/release/zalors /app/bin/zalors
+      - install -Dm644 io.github.o365serveronms.zalors.desktop /app/share/applications/io.github.o365serveronms.zalors.desktop
+      - install -Dm644 io.github.o365serveronms.zalors.metainfo.xml /app/share/metainfo/io.github.o365serveronms.zalors.metainfo.xml
+      - install -Dm644 io.github.o365serveronms.zalors.svg /app/share/icons/hicolor/scalable/apps/io.github.o365serveronms.zalors.svg
+      - install -Dm644 LICENSE /app/share/licenses/io.github.o365serveronms.zalors/LICENSE

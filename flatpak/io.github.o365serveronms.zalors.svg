@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Zalo">
+  <rect width="512" height="512" rx="112" fill="#103b31"/>
+  <path fill="#25d366" d="M90 116c0-29 24-52 53-52h226c29 0 53 23 53 52v188c0 29-24 52-53 52H223l-91 67 20-67h-9c-29 0-53-23-53-52z"/>
+  <path d="M151 176l34 103 38-78 38 78 35-103" fill="none" stroke="#ffffff" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(348 355)">
+    <circle r="82" fill="#e76f3c" stroke="#103b31" stroke-width="15"/>
+    <path d="M0-103v22M0 81v22M-103 0h22M81 0h22M-73-73l16 16M57 57l16 16M73-73L57-57M-57 57l-16 16" stroke="#e76f3c" stroke-width="24" stroke-linecap="round"/>
+    <path d="M-24 43v-86h29c29 0 43 13 43 36 0 16-8 27-23 32l26 18H24L0 27v16zm24-38h8c10 0 15-4 15-12 0-8-5-12-15-12H0z" fill="#ffffff"/>
+  </g>
+</svg>

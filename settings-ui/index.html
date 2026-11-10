@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zalo — Configurações</title>
+    <script src="vi.js"></script>
+    <script src="i18n.js"></script>
+    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="dialog.css" />
+  </head>
+  <body>
+    <header class="app-header"><div><strong>Configurações</strong><span>Zalo</span></div><button id="back-to-chat" type="button" class="secondary back-button" aria-label="Voltar ao Zalo" title="Voltar ao Zalo" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5 M12 5l-7 7 7 7"/></svg><span>Voltar ao Zalo</span></button></header>
+    <div class="settings-layout"><nav class="settings-nav" aria-label="Configurações"><a href="#sec-contas">Contas</a><a href="#sec-notificacoes">Notificações</a><a href="#sec-aparencia">Aparência</a><a href="#sec-seguranca">Segurança</a><a href="#sec-sistema">Inicialização</a><a href="#sec-rede">Rede</a><a href="#sec-atualizacoes">Atualizações</a><a href="#sec-backup"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z M9 12l2 2 4-4"/></svg><span>Backup</span></a><a href="#sec-atalhos">Atalhos</a><a href="#sec-diagnostico">Diagnóstico</a></nav>
+    <!-- Local preferences use familiar Zalo rows: titled
+         groups of boxed-list rows, a title + subtitle on the left and the control
+         on the right. Element ids are what main.js uses; keep them stable. -->
+    <main class="prefs">
+      <section class="group" id="sec-contas">
+        <h2 class="group-title">Contas</h2>
+        <label class="row startup-row">
+          <span class="row-text"><span class="row-title">Conta ao iniciar</span></span>
+          <select id="startup_account" aria-label="Conta ao iniciar"></select>
+        </label>
+        <div class="boxed-list" id="single_window_row" hidden>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Mostrar todas as contas em uma janela</span>
+              <span class="row-subtitle" id="single_window_subtitle">Uma janela com um seletor de contas; as contas ocultas continuam conectadas. Requer reiniciar o Zalo.</span></span>
+            <input type="checkbox" class="switch" id="single_window" />
+          </label>
+        </div>
+        <div id="accounts-list" class="boxed-list"></div>
+        <div class="add-row">
+          <input type="text" id="new_account_name" placeholder="Nome da nova conta" aria-label="Nome da nova conta" />
+          <button id="add_account">Adicionar</button>
+        </div>
+        <p id="macos-note" class="macos-note" hidden>Múltiplas contas exigem macOS 14 ou superior.</p>
+        <p id="accounts-note" class="group-note" role="status" aria-live="polite"></p>
+      </section>
+      <section class="group" id="sec-notificacoes"><h2 class="group-title">Notificações</h2><div class="boxed-list">
+<label class="row"><span class="row-text"><span class="row-title">Receber notificações</span><span class="row-subtitle">Ativa os avisos de mensagens do Zalo.</span></span><input type="checkbox" class="switch" id="notifications"></label><label class="row"><span class="row-text"><span class="row-title">Avisar com o aplicativo aberto</span><span class="row-subtitle">Receber avisos mesmo com a janela em primeiro plano.</span></span><input type="checkbox" class="switch" id="notify_when_focused"></label><label class="row"><span class="row-text"><span class="row-title">Avisar na conversa que estou lendo</span><span class="row-subtitle">Também avisar mensagens novas na conversa aberta.</span></span><input type="checkbox" class="switch" id="notify_active_chat"></label><label class="row"><span class="row-text"><span class="row-title">Respeitar conversas silenciadas</span><span class="row-subtitle">Quando o silenciamento não puder ser confirmado, o detector adicional permanece silencioso.</span></span><input type="checkbox" class="switch" id="respect_muted"></label></div><p class="group-note">O detector adicional só usa mensagens novas identificáveis. Conversas silenciadas, histórico e estados desconhecidos não geram avisos adicionais.</p></section>
+
+      <section class="group" id="sec-sistema">
+        <h2 class="group-title">Comportamento</h2>
+        <div class="boxed-list">
+          <label class="row">
+            <span class="row-text"><span class="row-title">Continuar em segundo plano ao fechar</span>
+              <span class="row-subtitle">Mantém suas contas conectadas ao fechar a janela</span></span>
+            <input type="checkbox" class="switch" id="close_to_tray" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Iniciar minimizado</span>
+              <span class="row-subtitle">Iniciar sem abrir a janela principal</span></span>
+            <input type="checkbox" class="switch" id="start_minimized" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Iniciar com o sistema</span></span>
+            <input type="checkbox" class="switch" id="autostart" />
+          </label>
+          <label class="row mac-only" id="menu_bar_icon_row" hidden>
+            <span class="row-text"><span class="row-title">Mostrar ícone na barra de menus</span>
+              <span class="row-subtitle" id="menu_bar_icon_subtitle">Quando desativado, clique no ícone do Dock para abrir o Zalo</span></span>
+            <input type="checkbox" class="switch" id="menu_bar_icon" />
+          </label>
+          <label class="row mac-only" hidden>
+            <span class="row-text"><span class="row-title">Somente na barra de menus</span>
+              <span class="row-subtitle" id="menubar_only_subtitle">Sem ícone no Dock nem janela principal — todas as contas continuam conectadas para notificações e cada uma abre como painel pela bandeja</span></span>
+            <input type="checkbox" class="switch" id="menubar_only" />
+          </label>
+          <label class="row mac-only" hidden>
+            <span class="row-text"><span class="row-title">Ocultar ícone do Dock</span>
+              <span class="row-subtitle">Mantém a janela principal; o ícone da barra de menus passa a ser a forma de reabrir o Zalo</span></span>
+            <input type="checkbox" class="switch" id="hide_dock_icon" />
+          </label>
+        </div>
+      </section>
+
+      <section class="group" id="sec-aparencia">
+        <h2 class="group-title">Aparência</h2>
+        <div class="boxed-list">
+          <label class="row">
+            <span class="row-text"><span class="row-title">Tamanho da interface</span>
+              <span class="row-subtitle">Ajusta o tamanho do Zalo sem alterar as outras contas.</span></span>
+            <select id="zoom">
+              <option value="0.75">Muito pequeno</option>
+              <option value="0.85">Pequeno</option>
+              <option value="1">Padrão</option>
+              <option value="1.15">Grande</option>
+            </select>
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Idioma</span>
+              <span class="row-subtitle">Idioma da interface do Zalo.</span></span>
+            <select id="language">
+              <option value="vi">Tiếng Việt</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Ícone do aplicativo</span>
+              <span class="row-subtitle" id="icon_subtitle">Padrão</span></span>
+            <div class="hotkey-row">
+              <button type="button" id="choose_icon" class="secondary">Escolher PNG…</button>
+              <button type="button" id="reset_icon" class="secondary">Restaurar padrão</button>
+            </div>
+          </div>
+          <p class="group-note" id="icon_note">Imagem PNG quadrada, de 32 a 1024 px e até 5 MB. Vale para o aplicativo todo; a bandeja não muda. No Linux com Wayland, o ícone da janela vem do arquivo .desktop e não muda.</p>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Pasta de downloads</span>
+              <span class="row-subtitle" id="download_dir_subtitle">Pasta Downloads do sistema</span></span>
+            <div class="hotkey-row">
+              <button type="button" id="choose_download_dir" class="secondary">Escolher pasta…</button>
+              <button type="button" id="reset_download_dir" class="secondary">Restaurar Downloads</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="group" id="sec-rede">
+        <h2 class="group-title">Rede</h2>
+        <div class="boxed-list">
+          <label class="row">
+            <span class="row-text"><span class="row-title">Proxy</span>
+              <span class="row-subtitle">Encaminha todo o tráfego das contas do Zalo por um proxy.</span></span>
+            <select id="proxy_mode">
+              <option value="off">Desativado</option>
+              <option value="socks5">SOCKS5</option>
+              <option value="http">HTTP</option>
+            </select>
+          </label>
+          <label class="row entry-row proxy-field">
+            <span class="row-title">Servidor</span>
+            <input type="text" id="proxy_host" autocomplete="off" spellcheck="false" placeholder="127.0.0.1" />
+          </label>
+          <label class="row entry-row proxy-field">
+            <span class="row-title">Porta</span>
+            <input type="text" id="proxy_port" inputmode="numeric" autocomplete="off" placeholder="1080" />
+          </label>
+        </div>
+        <p class="group-note">Proxy com usuário e senha não é suportado: os navegadores embutidos não aceitam credenciais por esse caminho. A alteração vale após reiniciar o Zalo.</p>
+        <p id="proxy_restart" class="hotkey-hint" hidden><span>Reinicie o Zalo para aplicar o proxy.</span> <button type="button" id="proxy_restart_btn" class="secondary">Reiniciar agora</button></p>
+      </section>
+
+      <section class="group" id="sec-atualizacoes">
+        <h2 class="group-title">Atualizações</h2>
+        <div class="boxed-list">
+          <label class="row">
+            <span class="row-text"><span class="row-title">Verificar atualizações automaticamente</span>
+              <span class="row-subtitle">Consulta o GitHub (api.github.com) um minuto após iniciar e a cada 6 horas. Só pergunta qual é a versão mais recente.</span></span>
+            <input type="checkbox" class="switch" id="auto_update_check" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Instalar atualizações automaticamente</span>
+              <span class="row-subtitle" id="auto_update_install_subtitle">Só age quando não é preciso senha.</span></span>
+            <input type="checkbox" class="switch" id="auto_update_install" />
+          </label>
+        </div>
+        <div class="boxed-list">
+          <div class="row">
+            <span class="row-text"><span class="row-title">Versão instalada</span>
+              <span class="row-subtitle" id="upd_current"></span></span>
+            <button type="button" id="upd_check" class="secondary">Verificar agora</button>
+          </div>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Tipo de instalação</span>
+              <span class="row-subtitle" id="upd_method"></span></span>
+          </div>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Última verificação</span>
+              <span class="row-subtitle" id="upd_last"></span></span>
+          </div>
+        </div>
+        <div id="upd_panel" class="upd-panel" hidden>
+          <h3 id="upd_title"></h3>
+          <progress id="upd_progress" max="100" hidden></progress>
+          <p id="upd_message" class="group-note" role="status" aria-live="polite"></p>
+          <p id="upd_error" class="hotkey-hint" role="alert" hidden></p>
+          <div class="group-actions">
+            <button type="button" id="upd_install" hidden>Baixar e instalar</button>
+            <button type="button" id="upd_apply" hidden>Reiniciar e instalar</button>
+            <button type="button" id="upd_restart" hidden>Reiniciar agora</button>
+            <button type="button" id="upd_page" class="secondary" hidden>Ver no GitHub</button>
+          </div>
+          <div id="upd_flatpak" class="upd-flatpak" hidden>
+            <code id="upd_command"></code>
+            <button type="button" id="upd_copy" class="secondary">Copiar</button>
+          </div>
+        </div>
+        <div id="upd_notes_box" hidden>
+          <h3>Novidades</h3>
+          <div id="upd_notes" class="notes"></div>
+        </div>
+        <p class="group-note">Cada arquivo baixado é conferido com a soma de verificação (SHA-256) publicada na versão antes de ser instalado.</p>
+      </section>
+
+      <section class="group" id="sec-atalhos">
+        <h2 class="group-title">Atalhos</h2>
+        <div class="boxed-list">
+          <label class="row">
+            <span class="row-text"><span class="row-title">Atalho para mostrar ou ocultar</span>
+              <span class="row-subtitle">Uma combinação de teclas para mostrar ou ocultar o aplicativo</span></span>
+            <input type="checkbox" class="switch" id="hotkey_enabled" />
+          </label>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Atalho</span></span>
+            <div class="hotkey-row">
+              <input type="text" id="hotkey" placeholder="CmdOrCtrl+Shift+W" aria-label="Atalho" />
+              <button type="button" id="record_hotkey" class="secondary">Gravar</button>
+            </div>
+          </div>
+          <label class="row" hidden style="display:none">
+            <span class="row-text"><span class="row-title">Atalho para desfocar</span>
+              <span class="row-subtitle">Liga ou desliga o desfoque de privacidade em todas as contas. Para escolher o que é desfocado, pressione Ctrl+Shift+P (⌘+Shift+P no Mac) numa janela do Zalo.</span></span>
+            <input type="checkbox" class="switch" id="blur_hotkey_enabled" />
+          </label>
+          <div class="row" hidden style="display:none">
+            <span class="row-text"><span class="row-title">Atalho</span></span>
+            <div class="hotkey-row">
+              <input type="text" id="blur_hotkey" placeholder="CmdOrCtrl+Shift+B" aria-label="Atalho" />
+              <button type="button" id="record_blur_hotkey" class="secondary">Gravar</button>
+            </div>
+          </div>
+        </div>
+        <p id="hotkey_hint" class="hotkey-hint" hidden></p>
+        <p class="group-note">No Linux/Wayland, configure <code>zalors --toggle</code> nos atalhos do sistema.</p>
+      </section>
+
+      <section class="group" id="sec-seguranca">
+        <h2 class="group-title">Segurança</h2>
+
+        <div id="lock-disabled">
+          <div class="boxed-list">
+            <label class="row entry-row">
+              <span class="row-title">Senha</span>
+              <input type="password" id="lock_pw1" autocomplete="new-password" placeholder="Pelo menos 6 caracteres" />
+            </label>
+            <label class="row entry-row">
+              <span class="row-title">Confirmar</span>
+              <input type="password" id="lock_pw2" autocomplete="new-password" />
+            </label>
+          </div>
+          <div class="group-actions">
+            <button id="enable_lock">Ativar bloqueio</button>
+          </div>
+        </div>
+
+        <div id="lock-enabled" hidden>
+          <div class="boxed-list">
+            <label class="row" id="biometric_row" hidden>
+              <span class="row-text"><span class="row-title" id="biometric_label">Usar biometria</span></span>
+              <input type="checkbox" class="switch" id="biometric_enabled" />
+            </label>
+            <label class="row">
+              <span class="row-text"><span class="row-title">Bloquear ao iniciar</span></span>
+              <input type="checkbox" class="switch" id="lock_on_launch" />
+            </label>
+            <label class="row">
+              <span class="row-text"><span class="row-title">Bloquear ao ocultar</span></span>
+              <input type="checkbox" class="switch" id="lock_on_hide" />
+            </label>
+            <label class="row">
+              <span class="row-text"><span class="row-title">Bloquear por inatividade</span>
+                <span class="row-subtitle">Minutos; 0 desativa</span></span>
+              <input type="number" id="idle_min" min="0" step="1" value="0" />
+            </label>
+          </div>
+          <div class="group-actions">
+            <button id="lock_now">Bloquear agora</button>
+            <button id="change_pw" class="secondary">Alterar senha…</button>
+            <button id="disable_lock" class="secondary">Desativar…</button>
+          </div>
+        </div>
+
+        <p class="group-note">O bloqueio protege o acesso às janelas do Zalo. Ele
+          <strong>não</strong> criptografa os dados no disco.</p>
+      </section>
+      <section class="group" id="sec-backup">
+        <h2 class="group-title title-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z M9 12l2 2 4-4"/></svg><span>Backup</span></h2>
+        <div class="boxed-list">
+          <div class="row">
+            <span class="row-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11h12v9H6z M8 11V8a4 4 0 0 1 8 0v3"/></svg></span><span class="row-text"><span class="row-title">Senha do backup</span>
+              <span class="row-subtitle">Mínimo de 8 caracteres. Sem ela o backup não pode ser aberto, e ela não é guardada em lugar nenhum.</span></span>
+            <input type="password" id="backup_pass" autocomplete="off" aria-label="Senha do backup" />
+          </div>
+          <div class="row">
+            <span class="row-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v13H7z M14 3v5h5"/></svg></span><span class="row-text"><span class="row-title">Arquivo de backup</span>
+              <span class="row-subtitle" id="backup_status"></span></span>
+            <div class="hotkey-row">
+              <button type="button" id="backup_export" class="secondary btn-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4 M8 8l4-4 4 4 M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg><span>Exportar…</span></button>
+              <button type="button" id="backup_import" class="secondary btn-ico"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11 M8 11l4 4 4-4 M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg><span>Importar…</span></button>
+            </div>
+          </div>
+        </div>
+        <p class="group-note">O backup guarda a lista de contas, as configurações e o ícone personalizado, cifrados com a sua senha. Não guarda o login do Zalo: no outro computador, cada conta pede o login por QR de novo. Proxy e pasta de downloads não entram. Ao importar, a lista de contas e as configurações atuais são substituídas e o Zalo reinicia.</p>
+      </section>
+
+      <section class="group" id="sec-diagnostico"><h2 class="group-title">Diagnóstico de notificações</h2>
+      <div class="boxed-list"><div class="row"><span class="row-text"><span class="row-title">Verificar avisos do Windows</span><span class="row-subtitle">O teste confirma o envio; confira se o Windows exibe o banner.</span></span><button id="test-notification" type="button">Testar</button></div><div class="row"><span class="row-text">Permissões e Não perturbe</span><button id="windows-notifications" class="secondary" type="button">Abrir no Windows</button></div></div>
+      <p id="diagnostic-note" class="group-note" role="status"></p><div id="route-status" class="boxed-list"></div>
+      <h3>Atividade desta sessão</h3><p class="group-note">Somente horário, conta e resultado. Não armazena o texto das mensagens.</p><div id="notification-history" class="boxed-list"></div>
+      </section>
+    </main></div>
+
+    <footer class="footer">
+      <span id="note" class="note" role="status" aria-live="polite"></span>
+      <button id="save">Salvar</button>
+    </footer>
+
+    <script src="dialog.js"></script>
+    <script src="hotkey.js"></script>
+    <script src="main.js"></script>
+    <script src="panel.js"></script>
+    <script src="notes.js"></script>
+    <script src="updates.js"></script>
+  </body>
+</html>
