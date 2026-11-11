@@ -7,7 +7,8 @@ on:
 
 # Builds the Windows NSIS installer (.exe) and uploads it as a workflow
 # artifact. Pushing a tag `vYYYY.M.D` (no leading zeros: semver) also publishes
-# a GitHub Release with the installer and SHA256SUMS.txt.
+# a GitHub Release with the installer and SHA256SUMS (the exact name the
+# in-app updater reads).
 permissions:
   contents: write
 jobs:
@@ -38,7 +39,7 @@ jobs:
           $dir = "src-tauri/target/release/bundle"
           Get-ChildItem -Recurse $dir -Include *.exe | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)" | Tee-Object -Append SHA256SUMS.txt
+            "$h  $($_.Name)" | Tee-Object -Append SHA256SUMS
           }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -46,7 +47,7 @@ jobs:
           name: Zalo-windows
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
-            SHA256SUMS.txt
+            SHA256SUMS
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -59,4 +60,4 @@ jobs:
           $notes = "docs/release-notes/$tag.md"
           if (-not (Test-Path $notes)) { throw "missing $notes" }
           gh release create $tag --title "Zalo $tag" --notes-file $notes --latest `
-            (Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe).FullName SHA256SUMS.txt
+            (Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe).FullName SHA256SUMS

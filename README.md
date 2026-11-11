@@ -43,7 +43,7 @@ cd src-tauri && cargo test
 ## Releases and versioning
 
 - Versions are calendar versions `YYYY.M.D` (e.g. `2026.11.10`). **No leading zeros** (`2026.12.5`, not `2026.12.05`): the version must stay valid semver for Cargo, NSIS and the in-app updater. A follow-up release on the same day takes the next day's number (e.g. `2026.11.11`).
-- Only the Windows NSIS installer is built. To release: bump `version` in `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, add `docs/release-notes/vYYYY.M.D.md`, push, then push the tag `vYYYY.M.D`; the `windows-build` workflow publishes the GitHub Release with the installer and `SHA256SUMS.txt`.
+- Only the Windows NSIS installer is built. To release: bump `version` in `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`, add `docs/release-notes/vYYYY.M.D.md`, push, then push the tag `vYYYY.M.D`; the `windows-build` workflow publishes the GitHub Release with the installer and `SHA256SUMS`.
 - The installer defaults to `%LOCALAPPDATA%\zalo-web`.
 - The repository is private, so the in-app update check cannot read its releases until it is made public; it then reports that the releases are not reachable.
 

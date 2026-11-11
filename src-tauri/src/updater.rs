@@ -1285,6 +1285,14 @@ mod tests {
         );
     }
 
+    /// v2026.11.11/12 published `SHA256SUMS.txt`, which no installed copy could find.
+    #[test]
+    fn the_release_workflow_publishes_the_sums_file_under_the_name_we_read() {
+        let wf = include_str!("../../.github/workflows/windows-build.yml");
+        assert!(!wf.contains("SHA256SUMS.txt"));
+        assert!(wf.contains("FullName SHA256SUMS"));
+    }
+
     #[test]
     fn checksums_are_found_by_file_name() {
         let a = "a".repeat(64);
