@@ -12,7 +12,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder}
 /// its platform token. macOS is different, see [`user_agent`].
 ///
 /// NOTE (Linux): setting this alone is NOT enough — WebKitGTK's site-specific
-/// quirks override the embedder UA for some sites (e.g. web.whatsapp.com) with a fake macOS Safari
+/// quirks override the embedder UA for some sites with a fake macOS Safari
 /// string. `enable_webview_media` turns quirks off so this UA actually reaches
 /// the site.
 #[cfg(target_os = "linux")]
