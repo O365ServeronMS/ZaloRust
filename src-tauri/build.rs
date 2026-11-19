@@ -27,6 +27,9 @@ fn main() {
             "switcher_accounts",
             "switch_account",
             "zoom_step",
+            // shadow DB bridge taps (resources/bridge.js §0b)
+            "shadow_e2ee_message",
+            "shadow_handshake",
             // settings window
             "get_settings",
             "set_settings",

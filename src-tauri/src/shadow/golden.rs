@@ -33,6 +33,41 @@ pub(crate) fn open_live() -> Connection {
     sqlcipher::open_with_key_readonly(&dir.join("default.db"), &key).unwrap()
 }
 
+/// Frozen oracle (audit step 1.0-c, 2026-11-19): the live DB's
+/// `raw_events` is a 7-day ring, so the 13–14 Nov V1 input that this test
+/// replays would be trimmed from the live DB starting 2026-11-20. The
+/// oracle is the pre-tap backup frozen read-only at
+/// `D:\.opencode\golden-oracle-2026-11-14` (override: `ZR_GOLDEN_DIR`).
+/// The files are COPIED to a temp dir before opening so a WAL reader can
+/// never touch the oracle's own `-shm`/`-wal`.
+pub(crate) fn open_oracle() -> Connection {
+    let src = std::env::var_os("ZR_GOLDEN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"D:\.opencode\golden-oracle-2026-11-14"));
+    let tmp = std::env::temp_dir().join(format!(
+        "zr-golden-{}-{}",
+        std::process::id(),
+        schema::now_ms()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for f in ["default.db", "default.db-wal", "default.db-shm", "default.key"] {
+        let from = src.join(f);
+        if from.exists() {
+            let to = tmp.join(f);
+            std::fs::copy(&from, &to).unwrap();
+            // Copies inherit the oracle's read-only attribute; clear it so
+            // SQLite can use the temp -shm.
+            let mut perm = std::fs::metadata(&to).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            std::fs::set_permissions(&to, perm).unwrap();
+        }
+    }
+    println!("oracle: {} (copied to temp)", src.display());
+    let key = sqlcipher::load_key(&tmp.join("default.key")).unwrap();
+    sqlcipher::open_with_key_readonly(&tmp.join("default.db"), &key).unwrap()
+}
+
 fn scratch() -> Connection {
     let key = sqlcipher::generate_key().unwrap();
     let conn = sqlcipher::open_in_memory(&key).unwrap();
@@ -43,7 +78,7 @@ fn scratch() -> Connection {
 #[test]
 #[ignore]
 fn golden_replay_messages_and_conversations() {
-    let live = open_live();
+    let live = open_oracle();
 
     // --- expectations from the live DB (counts + per-message fields) ---
     struct LiveMsg {
@@ -314,6 +349,8 @@ conversations: missing_in_replay={} extra_in_replay={}",
         extra.len(),
         convs_extra.len(),
     );
+    // The gate used to only PRINT "DIFFS" and still pass (audit L2).
+    assert!(ok, "GOLDEN gate failed — see diff details above");
 }
 
 #[test]
@@ -321,7 +358,7 @@ conversations: missing_in_replay={} extra_in_replay={}",
 fn golden_shape_inventory() {
     // Prints per-endpoint envelope shapes (keys/counts only, no values) so
     // unmapped sources surface quickly.
-    let live = open_live();
+    let live = open_oracle();
     let mut st = live
         .prepare("SELECT kind, endpoint, payload_json FROM raw_events ORDER BY id")
         .unwrap();

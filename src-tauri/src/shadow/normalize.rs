@@ -184,6 +184,61 @@ pub fn normalize_rest(endpoint: &str, env: &Value, own_uid: Option<&str>) -> Vec
     out
 }
 
+/// Why an E2EE bridge payload was refused (audit 1.0-a, A6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum E2eeRefusal {
+    NotJson,
+    NoMsgId,
+    KeyShaped,
+}
+
+/// Gate for bridge-forwarded E2EE payloads, applied BEFORE anything is
+/// stored (raw_events included). Mirrors the bridge's forward policy so a
+/// stale or tampered bridge still cannot land key material in the DB:
+/// - must be a JSON object carrying `msgId`/`messageId` (string or number);
+/// - must not contain key-shaped data anywhere within depth 3 (CryptoJS
+///   WordArray `sigBytes/words`, CipherParams `ciphertext/salt`, Signal
+///   store `record`, `*Key` private material, huge byte-index objects).
+pub fn e2ee_admit(payload: &str) -> Result<Value, E2eeRefusal> {
+    let v: Value = serde_json::from_str(payload).map_err(|_| E2eeRefusal::NotJson)?;
+    let obj = v.as_object().ok_or(E2eeRefusal::NoMsgId)?;
+    let has_id = ["msgId", "messageId"].iter().any(|k| match obj.get(*k) {
+        Some(Value::String(s)) => !s.is_empty() && s.len() < 40,
+        Some(Value::Number(_)) => true,
+        _ => false,
+    });
+    if !has_id {
+        return Err(E2eeRefusal::NoMsgId);
+    }
+    if key_shaped(&v, 0) {
+        return Err(E2eeRefusal::KeyShaped);
+    }
+    Ok(v)
+}
+
+fn key_shaped(v: &Value, depth: u32) -> bool {
+    const KEYISH: &[&str] = &[
+        "priv", "private", "secret", "chainkey", "rootkey", "sessionkey", "privkey",
+        "identitykey", "signedprekey", "prekey", "mackey", "enckey", "keypair", "sigbytes",
+        "words", "record", "ciphertext", "salt",
+    ];
+    if depth > 3 {
+        return false;
+    }
+    match v {
+        Value::Object(m) => {
+            if m.len() > 400 {
+                return true;
+            }
+            m.iter().any(|(k, x)| {
+                KEYISH.contains(&k.to_ascii_lowercase().as_str()) || key_shaped(x, depth + 1)
+            })
+        }
+        Value::Array(a) => a.len() > 4096 || a.iter().any(|x| key_shaped(x, depth + 1)),
+        _ => false,
+    }
+}
+
 /// Map one E2EE plaintext message forwarded by the bridge tap.
 /// `m` is the decrypted message object; `source` is always `e2ee`.
 pub fn normalize_e2ee_message(m: &Value, own_uid: Option<&str>) -> Option<Write> {
@@ -422,5 +477,36 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn e2ee_gate_admits_messages_only() {
+        // A real-shaped message passes (content and nested fields allowed).
+        let ok = r#"{"msgId":"8506747288934","uidFrom":"1","idTo":"2","ts":"1","msgType":"webchat",
+                    "content":"x","e2ee":"abc","quote":{"msg":"y"},"propertyExt":{"color":0}}"#;
+        assert!(e2ee_admit(ok).is_ok());
+        assert!(e2ee_admit(r#"{"msgId":12345,"content":{"href":"h","params":"{}"}}"#).is_ok());
+        // No msgId -> refused (CryptoJS WordArray, configs, empty objects).
+        assert_eq!(
+            e2ee_admit(r#"{"sigBytes":16,"words":[1,2,3,4]}"#).unwrap_err(),
+            E2eeRefusal::NoMsgId
+        );
+        assert_eq!(e2ee_admit("{}").unwrap_err(), E2eeRefusal::NoMsgId);
+        assert_eq!(e2ee_admit("[1,2,3]").unwrap_err(), E2eeRefusal::NoMsgId);
+        assert_eq!(e2ee_admit("not json").unwrap_err(), E2eeRefusal::NotJson);
+        // msgId present but key-shaped data inside -> refused.
+        for bad in [
+            r#"{"msgId":"m","key":{"sigBytes":16,"words":[1]}}"#,
+            r#"{"msgId":"m","data":{"ciphertext":{},"salt":{}}}"#,
+            r#"{"msgId":"m","identifier":"a","record":"b"}"#,
+            r#"{"msgId":"m","session":{"rootKey":"r"}}"#,
+        ] {
+            assert_eq!(e2ee_admit(bad).unwrap_err(), E2eeRefusal::KeyShaped, "{bad}");
+        }
+        // Byte buffers serialized as {0:..,1:..,...} are refused.
+        let mut big = String::from(r#"{"msgId":"m","buf":{"#);
+        big.push_str(&(0..500).map(|i| format!(r#""{i}":1"#)).collect::<Vec<_>>().join(","));
+        big.push_str("}}");
+        assert_eq!(e2ee_admit(&big).unwrap_err(), E2eeRefusal::KeyShaped);
     }
 }

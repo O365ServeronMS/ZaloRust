@@ -150,3 +150,9 @@ mod probe_latest;
 
 #[cfg(test)]
 mod probe_551;
+
+#[cfg(test)]
+mod probe_audit;
+
+#[cfg(test)]
+mod maint_purge;

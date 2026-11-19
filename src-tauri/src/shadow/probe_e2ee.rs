@@ -24,7 +24,7 @@ fn probe_e2ee_plain() {
     );
     let (max_ts, recent): (i64, i64) = conn
         .query_row(
-            "SELECT MAX(ts), (SELECT COUNT(*) FROM raw_events WHERE ts > 1795075000000)",
+            "SELECT (SELECT MAX(ts) FROM raw_events), (SELECT COUNT(*) FROM raw_events WHERE ts > 1795075000000)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )

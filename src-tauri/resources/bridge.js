@@ -136,29 +136,71 @@
       return found;
     }
 
+    // Forward policy (audit 1.0-a, 2026-11-19 — A6 key hygiene). The old
+    // forwarder sent ANY object (incl. CryptoJS WordArrays, CipherParams
+    // and Signal-store records passed to/returned by key functions) to the
+    // shadow DB. Now: only a message object — has msgId/messageId — and
+    // never one that carries key-shaped data anywhere (depth 3). Rust
+    // re-checks the same rules (commands::shadow_e2ee_message).
+    var ZR_KEYISH = /^(priv|private|secret|chainKey|rootKey|sessionKey|privKey|identityKey|signedPreKey|preKey|macKey|encKey|keyPair|sigBytes|words|record|ciphertext|salt)$/i;
+    function zrKeyish(o, depth) {
+      if (!o || typeof o !== "object" || depth > 3) return false;
+      var ks;
+      try { ks = Object.keys(o); } catch (e) { return true; }
+      if (ks.length > 400) return true; // byte buffers serialized as {0:..,1:..}
+      for (var i = 0; i < ks.length; i++) {
+        if (ZR_KEYISH.test(ks[i])) return true;
+        var v;
+        try { v = o[ks[i]]; } catch (e) { continue; }
+        if (v && typeof v === "object" && zrKeyish(v, depth + 1)) return true;
+      }
+      return false;
+    }
+    function zrIsMsg(c) {
+      if (!c || typeof c !== "object" || Array.isArray(c)) return false;
+      var id = c.msgId !== undefined ? c.msgId : c.messageId;
+      return (typeof id === "string" && id.length > 0 && id.length < 40) ||
+        (typeof id === "number" && isFinite(id));
+    }
+    function zrSendMsg(c) {
+      if (!zrIsMsg(c) || zrKeyish(c, 0)) return;
+      var s;
+      try { s = JSON.stringify(c); } catch (e) { return; }
+      if (!s || s.length > 512 * 1024) return;
+      invoke("shadow_e2ee_message", { payload: s });
+    }
     function zrForwardMessage(x) {
       try {
-        // Accept the message object itself or a wrapper carrying it.
-        var cands = [];
-        if (x && typeof x === "object") cands.push(x);
-        if (x && typeof x.then === "function") {
-          x.then(function (v) { zrForwardMessage(v); }).catch(function () {});
+        if (!x || typeof x !== "object") return;
+        if (typeof x.then === "function") {
+          // Success-only subscription; the no-op rejection handler keeps a
+          // rejected page promise from surfacing a SECOND (ours) rejection.
+          x.then(function (v) { zrForwardMessage(v); }, function () {});
+          return;
         }
+        if (Array.isArray(x)) {
+          for (var i = 0; i < x.length && i < 200; i++) if (zrIsMsg(x[i])) zrSendMsg(x[i]);
+          return;
+        }
+        if (zrIsMsg(x)) { zrSendMsg(x); return; }
         ["data", "message", "msg", "decrypted"].forEach(function (k) {
-          if (x && typeof x === "object" && x[k] && typeof x[k] === "object") cands.push(x[k]);
+          var v = x[k];
+          if (zrIsMsg(v)) zrSendMsg(v);
         });
-        var pick = null;
-        for (var i = 0; i < cands.length; i++) {
-          var c = cands[i];
-          if (("msgId" in c) || ("messageId" in c)) { pick = c; break; }
-        }
-        if (!pick) pick = cands[0];
-        if (!pick) return;
-        var s;
-        try { s = JSON.stringify(pick); } catch (e) { return; }
-        if (!s || s.length > 512 * 1024) return;
-        invoke("shadow_e2ee_message", { payload: s });
       } catch (e) {}
+    }
+    // Message-level decrypt surfaces only: never key management, cipher
+    // primitives, configs or stores (those were the C1 leak).
+    function zrTapName(n) {
+      return /message|msg/i.test(n) && /e2ee|ee2e|decrypt/i.test(n) &&
+        !/key|config|creat|cipher|value|session|record|store|encrypt|init|setup/i.test(n);
+    }
+    function zrIsClass(fn) {
+      try {
+        if (/^class[\s{]/.test(Function.prototype.toString.call(fn))) return true;
+        var p = fn.prototype;
+        return !!p && Object.getOwnPropertyNames(p).length > 1;
+      } catch (e) { return true; }
     }
 
     function zrSendKey(k) {
@@ -206,14 +248,15 @@
           any = true;
         }
       }
-      // Decrypt-surface inventory + aggressive extra taps: every
-      // function whose name looks like a decrypt path gets the same
-      // forwarder (Rust normalizes; wrong shapes simply drop).
+      // Decrypt-surface inventory: every decrypt-ish name is LOGGED (so a
+      // bundle rename stays visible, K7), but only message-level surfaces
+      // (zrTapName) that are plain functions (not classes) get wrapped.
       if (!window.__zrInv) {
         window.__zrInv = true;
         try {
           var seen = {};
           var names = [];
+          var tapped = [];
           Object.keys(req.c).forEach(function (id) {
             var ex;
             try { ex = req.c[id] && req.c[id].exports; } catch (e) { return; }
@@ -236,6 +279,8 @@
                     if (typeof p[n] !== "function") return;
                     seen[n] = true;
                     names.push(n);
+                    if (!zrTapName(n) || zrIsClass(p[n])) return;
+                    tapped.push(n);
                     try {
                       var o = p[n];
                       p[n] = function () {
@@ -258,6 +303,7 @@
             });
           });
           zrLog("decrypt inventory: " + (names.length ? names.slice(0, 24).join(",") : "none"));
+          zrLog("decrypt taps (message-level): " + (tapped.length ? tapped.join(",") : "none"));
         } catch (e) {}
       }
       if (!zrArmed.key) {

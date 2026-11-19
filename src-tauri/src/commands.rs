@@ -99,12 +99,45 @@ pub fn shadow_e2ee_message(window: tauri::Webview, payload: String) {
     if crate::integration::remote(&window).is_err() {
         return;
     }
+    use crate::shadow::normalize::{e2ee_admit, E2eeRefusal};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+    // Counters instead of one log line per call (audit KQ7: 2765 lines in
+    // 45 min). Summary at most once a minute; counts only, never content.
+    static OK: AtomicU64 = AtomicU64::new(0);
+    static NO_ID: AtomicU64 = AtomicU64::new(0);
+    static KEYISH: AtomicU64 = AtomicU64::new(0);
+    static OTHER: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicI64 = AtomicI64::new(0);
     if payload.len() > 512 * 1024 {
-        crate::dlog::log("shadow e2ee: dropped oversized payload (cap 512 KB)");
-        return;
+        OTHER.fetch_add(1, Relaxed);
+    } else {
+        match e2ee_admit(&payload) {
+            Ok(_) => {
+                OK.fetch_add(1, Relaxed);
+                crate::shadow::runtime::deliver_e2ee(&window.app_handle(), payload);
+            }
+            Err(E2eeRefusal::NoMsgId) => {
+                NO_ID.fetch_add(1, Relaxed);
+            }
+            Err(E2eeRefusal::KeyShaped) => {
+                KEYISH.fetch_add(1, Relaxed);
+            }
+            Err(E2eeRefusal::NotJson) => {
+                OTHER.fetch_add(1, Relaxed);
+            }
+        }
     }
-    crate::dlog::log("shadow e2ee: message delivered");
-    crate::shadow::runtime::deliver_e2ee(&window.app_handle(), payload);
+    let now = crate::shadow::schema::now_ms();
+    let last = LAST.load(Relaxed);
+    if now - last >= 60_000 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        crate::dlog::log(&format!(
+            "shadow e2ee: delivered={} dropped_no_msgid={} dropped_keyish={} dropped_other={} (cumulative)",
+            OK.load(Relaxed),
+            NO_ID.load(Relaxed),
+            KEYISH.load(Relaxed),
+            OTHER.load(Relaxed)
+        ));
+    }
 }
 
 /// The bridge hands over the page's REST decode key (`getSecretKey()`,
