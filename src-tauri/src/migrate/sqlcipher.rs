@@ -24,9 +24,9 @@ use rusqlite::Connection;
 
 /// DPAPI entropy for the shadow DB key: **none** — verified against the
 /// surviving `default.key` (unwraps to the 32-byte key with fingerprint
-/// `1b701eef6664` only with no entropy, 2026-11-19). Kept parameterless for
-/// compatibility; the D7 import path uses its own labeled wrap
-/// (`zalors.d7`) via `unwrap_with_label`.
+/// `1b701eef6664` only with no entropy, 2026-11-19). Kept parameterless
+/// for compatibility; the D7 Zalo-Desktop import path also uses NO
+/// entropy (audit M2-1) via [`unwrap_no_entropy`].
 
 /// A wrapper around the two failures this module can produce: I/O errors
 /// touching the key file, and key/DB mismatch errors from SQLCipher itself.
@@ -87,10 +87,32 @@ pub fn load_key(path: &Path) -> Result<Vec<u8>, KeyError> {
     unwrap(&blob, None)
 }
 
-/// Unwrap a DPAPI blob captured with an explicit entropy label (e.g. the
-/// D7 Zalo-Desktop key capture, wrapped as `zalors.d7`).
+/// Unwrap a DPAPI blob captured with an explicit entropy label.
+/// NOT the D7 path: the 2026-11-19 D7 Zalo-Desktop capture passed
+/// `"zalors.d7"` as `szDataDescr` (the description parameter), NOT as
+/// entropy, so its blob unwraps only with [`unwrap_no_entropy`]
+/// (audit M2-1). Kept for genuinely labeled captures.
 pub fn unwrap_with_label(blob: &[u8], label: &str) -> Result<Vec<u8>, KeyError> {
     unwrap(blob, Some(label))
+}
+
+/// DPAPI unwrap with NO entropy — the D7 Zalo-Desktop capture path
+/// (audit M2-1: the capture script's `"zalors.d7"` argument was
+/// `szDataDescr`, not entropy; the blob unwraps only with entropy
+/// `None`). Windows-only by design: non-Windows builds fail closed
+/// with a clean error instead of handing back the wrapped bytes.
+pub fn unwrap_no_entropy(blob: &[u8]) -> Result<Vec<u8>, KeyError> {
+    #[cfg(windows)]
+    {
+        unwrap(blob, None)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = blob;
+        Err(KeyError::Db(
+            "DPAPI unwrap requires Windows (D7 captures only exist on Windows)".into(),
+        ))
+    }
 }
 
 /// Every connection this module opens waits up to 5 s on a busy DB
@@ -275,6 +297,22 @@ fn unwrap(blob: &[u8], _label: Option<&str>) -> Result<Vec<u8>, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn d7_blobs_unwrap_with_no_entropy_not_a_label() {
+        // M2-1 (batch 6): the D7 capture script passed "zalors.d7" as
+        // szDataDescr, NOT as entropy — its blob opens with NO entropy
+        // and must be REFUSED by the labeled unwrap the old skeleton
+        // used (`unwrap_with_label(..., "zalors.d7")`).
+        let payload = br#"{"fake":"d7-plaintext"}"#.to_vec();
+        let blob = wrap(&payload, None).unwrap();
+        assert_eq!(unwrap_no_entropy(&blob).unwrap(), payload);
+        assert!(
+            unwrap_with_label(&blob, "zalors.d7").is_err(),
+            "a no-entropy blob must not open through the labeled unwrap"
+        );
+    }
 
     #[test]
     fn key_material_zeroizes_after_use() {
