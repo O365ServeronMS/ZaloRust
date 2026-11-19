@@ -138,8 +138,9 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
 /// READ-ONLY open (T3: the media thread never writes; the flusher owns
 /// every write). Both paths set the H3 busy timeout.
 fn open(dir: &Path, cfg: &ShadowSettings) -> Option<Connection> {
-    let db_path = dir.join("default.db");
-    let key_path = dir.join("default.key");
+    // KQ10: the account helpers name the store files.
+    let db_path = super::db_file(dir);
+    let key_path = super::key_file(dir);
     if !cfg.encrypt {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
@@ -152,6 +153,9 @@ fn open(dir: &Path, cfg: &ShadowSettings) -> Option<Connection> {
     let Ok(key) = sqlcipher::load_key(&key_path) else {
         return None;
     };
+    // L4/D4: the loaded key bytes are wiped once the connection holds
+    // them (SQLCipher keeps its own copy; this Vec must not linger).
+    let key = zeroize::Zeroizing::new(key);
     // Sets busy_timeout (T1) and query_only.
     sqlcipher::open_with_key_readonly(&db_path, &key).ok()
 }

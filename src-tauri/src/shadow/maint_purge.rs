@@ -30,14 +30,15 @@ fn maint_purge_e2ee_keyish() {
     let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap())
         .join("com.o365serveronms.zalors/shadow");
     let apply = std::env::var("ZR_PURGE_APPLY").as_deref() == Ok("1");
-    let key = sqlcipher::load_key(&dir.join("default.key")).unwrap();
+    // KQ10: the account helpers name the store files.
+    let key = sqlcipher::load_key(&super::key_file(&dir)).unwrap();
     if apply && app_running() {
         panic!("refusing to apply: zalors.exe is running (stop the app first — single writer)");
     }
     let conn = if apply {
-        sqlcipher::open_with_key(&dir.join("default.db"), &key).unwrap()
+        sqlcipher::open_with_key(&super::db_file(&dir), &key).unwrap()
     } else {
-        sqlcipher::open_with_key_readonly(&dir.join("default.db"), &key).unwrap()
+        sqlcipher::open_with_key_readonly(&super::db_file(&dir), &key).unwrap()
     };
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     let msgs_before = count("SELECT COUNT(*) FROM messages");

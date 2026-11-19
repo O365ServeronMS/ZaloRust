@@ -43,6 +43,10 @@ flate2 = "1"
 base64 = "0.22"
 # Random 32-byte DB key, DPAPI-wrapped on disk (Windows).
 getrandom = "0.2"
+# L4 (batch 4): zeroize key material at the boundaries (loaded DB key
+# bytes, the PRAGMA hex form, runtime REST/WS keys). Already in the
+# dependency tree via the TLS stack; the lockfile pins 1.9.1.
+zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Version-matched to wry 0.55's webkit2gtk so PlatformWebview::inner() types unify.

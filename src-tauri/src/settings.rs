@@ -82,6 +82,17 @@ pub struct ShadowSettings {
     /// P1b media store root (D11). `None` = `<app data>\ZaloRust Data`.
     /// Set to `D:\ZaloRust Data` for this install.
     pub media_store: Option<String>,
+    /// Own uid (KQ2 / audit 1.4): the Zalo userId of THIS install's
+    /// account, as a configuration decision — the bridge no longer
+    /// probes page DI tokens for it (0 hits in practice, A2 risk).
+    /// Shape: 5..=32 ASCII digits. Seeds the flusher's self-sent
+    /// sender substitution and the `accounts` row; never logged.
+    pub own_uid: Option<String>,
+    /// sha256(UIN) truncated to 12 lowercase hex chars — the account
+    /// fingerprint stored in `accounts.uin_hash` (the UIN itself is
+    /// never stored). `None` = the accounts row is skipped; a hash is
+    /// never invented.
+    pub own_uin_hash: Option<String>,
 }
 
 impl Default for ShadowSettings {
@@ -94,6 +105,10 @@ impl Default for ShadowSettings {
             batch_ms: 200,
             batch_max: 500,
             media_store: None,
+            // KQ2: no configured uid by default — unconfigured installs
+            // keep the old behaviour (the handshake's learned uid).
+            own_uid: None,
+            own_uin_hash: None,
         }
     }
 }
@@ -617,6 +632,39 @@ mod tests {
     fn empty_json_is_all_defaults() {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn old_shadow_settings_load_without_own_uid_fields() {
+        // A settings.json written before batch 4 carries neither
+        // own_uid nor own_uin_hash; both must deserialize to None
+        // (`#[serde(default)]` on the struct) and every other shadow
+        // field keeps its stored value.
+        let s: Settings = serde_json::from_str(
+            r#"{"shadow":{"enabled":true,"raw_events_days":7,"batch_ms":200,"batch_max":500}}"#,
+        )
+        .unwrap();
+        assert!(s.shadow.enabled);
+        assert_eq!(s.shadow.raw_events_days, 7);
+        assert_eq!(s.shadow.own_uid, None);
+        assert_eq!(s.shadow.own_uin_hash, None);
+        // The bare shadow object with no fields at all is the same.
+        let s: Settings = serde_json::from_str(r#"{"shadow":{}}"#).unwrap();
+        assert_eq!(s.shadow.own_uid, None);
+        assert_eq!(s.shadow.own_uin_hash, None);
+    }
+
+    #[test]
+    fn shadow_own_identity_roundtrips() {
+        // Written-back settings keep the configured identity (the
+        // flusher reads exactly these fields at start).
+        let mut s = Settings::default();
+        s.shadow.own_uid = Some("1234567890123456789".into()); // FAKE uid
+        s.shadow.own_uin_hash = Some("abc123def456".into()); // FAKE hash
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.shadow.own_uid.as_deref(), Some("1234567890123456789"));
+        assert_eq!(back.shadow.own_uin_hash.as_deref(), Some("abc123def456"));
     }
 
     #[test]

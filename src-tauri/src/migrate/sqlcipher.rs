@@ -150,10 +150,32 @@ pub fn open_in_memory(key: &[u8]) -> Result<Connection, KeyError> {
 
 /// Apply the raw hex key pragma. SQLCipher requires the `x'…'` form
 /// inside a quoted value, so the statement is assembled explicitly
-/// (never via a bound parameter).
+/// (never via a bound parameter). The exact shape is
+/// `PRAGMA key = "x'<64 hex chars>'";` — semicolon OUTSIDE the
+/// closing double quote, closing `'` BEFORE it. R0 (batch 4 review):
+/// a version of this line swapped the trailing `'` and `;`, building
+/// `PRAGMA key = "x'<hex>';"`, which SQLCipher silently treats as a
+/// PASSPHRASE (`x'<hex>';` is not the raw-key form) and runs through
+/// KDF instead — every pre-existing DB (the live shadow DB, the
+/// golden oracle) then failed its first page read with
+/// `hmac check failed for pgno=1`. A create+open roundtrip cannot
+/// catch that (both sides use the same wrong form); the regression
+/// test below pins the shape against a hand-built statement.
+///
+/// L4/D4 (batch 4): both the hex form of the key and the assembled
+/// statement carry raw key material; both are zeroized after the
+/// pragma lands instead of lingering in freed heap until reuse.
 fn apply_key(conn: &Connection, key: &[u8]) -> Result<(), KeyError> {
-    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-    conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
+    use std::fmt::Write as _;
+    use zeroize::{Zeroize, Zeroizing};
+    let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
+    for b in key {
+        let _ = write!(&mut *hex, "{b:02x}");
+    }
+    let stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+    // Wipe the hex copy now rather than waiting for its drop.
+    hex.zeroize();
+    conn.execute_batch(stmt.as_str())
         .map_err(|e| KeyError::Db(format!("pragma key failed: {e}")))?;
     Ok(())
 }
@@ -255,6 +277,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_material_zeroizes_after_use() {
+        // L4/D4: the zeroize helper really clears every buffer shape
+        // the key paths use (Vec bytes, the 16-byte runtime keys, the
+        // hex String form).
+        use zeroize::Zeroize;
+        let mut v = vec![0xA5u8; 32];
+        v.zeroize();
+        assert!(v.iter().all(|&b| b == 0), "Vec<u8> key bytes must wipe");
+        let mut a = [0x5Au8; 16];
+        a.zeroize();
+        assert!(a.iter().all(|&b| b == 0), "the [u8;16] runtime keys must wipe");
+        let mut s = String::from("0123456789abcdef0123456789abcdef");
+        s.zeroize();
+        assert!(s.bytes().all(|b| b == 0), "the hex String form must wipe");
+    }
+
+    #[test]
     fn busy_timeout_set_on_all_open_paths() {
         // H3/T1: every connection waits up to 5 s instead of erroring
         // out on SQLITE_BUSY.
@@ -333,6 +372,88 @@ mod tests {
         // A wrong key must be refused, not silently open garbage.
         let bad = generate_key().unwrap();
         assert!(open_with_key_readonly(&db, &bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pragma_key_raw_key_shape_cross_open() {
+        // R0 (batch 4 review): pin the statement shape against an
+        // INDEPENDENT encoder. The DB below is created by executing a
+        // literal `PRAGMA key = "x'<hex>'";` built BY HAND here (not via
+        // `apply_key`), then opened with `open_with_key` — which uses
+        // `apply_key`. If `apply_key` ever again builds a swapped
+        // `"x'<hex>';"` (or any other shape), the open fails.
+        //
+        // A create+open roundtrip through `apply_key` on both sides
+        // cannot catch this: both use the same wrong form and the KDF
+        // key the wrong form creates is simply reproducible. This test
+        // can, because the CREATE side is spelled out independently.
+        let fake_key: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(7).wrapping_add(1)).collect();
+        // Independent hex encoding: a nibble lookup table, not the
+        // `write!` loop `apply_key` uses.
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = String::with_capacity(fake_key.len() * 2);
+        for b in &fake_key {
+            hex.push(HEX[(b >> 4) as usize] as char);
+            hex.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        let literal = format!("PRAGMA key = \"x'{hex}'\";");
+        let dir = std::env::temp_dir().join(format!("zalors-r0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            let conn = Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .unwrap();
+            conn.execute_batch(&literal).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t (v) VALUES ('raw-key-shape');",
+            )
+            .unwrap();
+        }
+        // Open through `apply_key`: must accept the hand-keyed DB.
+        {
+            let conn = open_with_key(&db, &fake_key).unwrap();
+            let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, "raw-key-shape");
+        }
+        // Proving raw-key mode with the two passphrase forms that
+        // really run KDF. NOTE (verified at runtime on this SQLCipher
+        // build): the SQL quote STYLE does not select the mode —
+        // SQLCipher inspects the pragma VALUE, and any value shaped
+        // `x'<hex>'` is the raw key, even when spelled with single
+        // quotes as `'x''<hex>'''` (that spelling OPENS this DB; the
+        // failed first version of this assert proved it). The forms
+        // below do not match the raw-key shape, so SQLCipher treats
+        // them as passphrases and derives a different key:
+        // (1) the same hex text WITHOUT the x'…' wrapper;
+        // (2) the R0-corrupted statement itself — `"x'<hex>';"`, the
+        //     trailing `'` and `;` swapped — exactly the form that
+        //     made every pre-existing DB fail under batch 4.
+        for wrong in [
+            format!("PRAGMA key = '{hex}';"),
+            format!("PRAGMA key = \"x'{hex}';\";"),
+        ] {
+            let conn =
+                Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let readable = conn
+                .execute_batch(&wrong)
+                .and_then(|_| {
+                    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                })
+                .is_ok();
+            assert!(
+                !readable,
+                "a passphrase-form key must not open a raw-key DB (form {})",
+                if wrong.starts_with("PRAGMA key = '") { "hex text" } else { "swapped ';'" }
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -152,6 +152,46 @@ pub fn parse_get_response_body(json: &str) -> Result<Vec<u8>, BodyErr> {
     Ok(bytes)
 }
 
+/// D2 (audit M4): how one `Network.webSocketFrame*` event's payload
+/// classifies. Pure — unit-tested with fake frames, no WebView2.
+///
+/// - opcode 1 = text frame: COUNTED, never decoded (policy: capture
+///   decodes the binary WS stream only; text frames used to fail
+///   base64 and vanish silently).
+/// - opcode 2 (or opcode absent — the pre-D2 shape) = binary: the
+///   base64 payload decodes or it is counted `BadBase64`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsFrameClass {
+    /// Binary frame whose payload base64-decoded to bytes.
+    Binary(Vec<u8>),
+    /// Text frame (opcode 1): counted via `ws_stats`, not decoded.
+    Text,
+    /// Binary-shaped payload that failed base64 (counted, was silent).
+    BadBase64,
+    /// Decoded to zero bytes / no payloadData: nothing to do.
+    Ignored,
+}
+
+pub fn classify_ws_frame(v: &serde_json::Value) -> WsFrameClass {
+    let resp = v.get("response");
+    let opcode = resp
+        .and_then(|r| r.get("opcode"))
+        .and_then(serde_json::Value::as_i64);
+    let payload = resp
+        .and_then(|r| r.get("payloadData"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if opcode == Some(1) {
+        return WsFrameClass::Text;
+    }
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(payload) {
+        Ok(bytes) if !bytes.is_empty() => WsFrameClass::Binary(bytes),
+        Ok(_) => WsFrameClass::Ignored,
+        Err(_) => WsFrameClass::BadBase64,
+    }
+}
+
 #[cfg(windows)]
 mod cdp {
     use std::collections::{HashMap, HashSet};
@@ -159,11 +199,22 @@ mod cdp {
 
     use tauri::AppHandle;
 
-    use super::{host_is_zalo_me, is_api_url, parse_get_response_body, BodyErr};
+    use super::{classify_ws_frame, host_is_zalo_me, is_api_url, parse_get_response_body, BodyErr, WsFrameClass};
+    use crate::shadow::bounded::BoundedSet;
     use crate::shadow::rest_stats::{self, RestStage};
     use crate::shadow::runtime;
+    use crate::shadow::ws_stats::{self, WsStage};
 
     type Core = webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
+
+    /// D2/M4 + R1 (batch 4 review): `ws_ids` is bounded — sockets that
+    /// never close must not grow the set forever. Past the cap the
+    /// OLDEST id is evicted (insertion order), never the whole set:
+    /// the clear-all this replaced took the LIVE socket's id with it
+    /// and dropped every later frame of that socket for the rest of
+    /// the session. Evictions are counted (`ws_stats::IdsEvicted`) so
+    /// even that residual loss stays visible.
+    const WS_IDS_CAP: usize = 64;
 
     /// C4 (batch 3): WebView2's Network domain buffer defaults evict
     /// large response bodies before `Network.getResponseBody` can
@@ -197,7 +248,8 @@ mod cdp {
                 }
             };
             // WS connection ids; REST rids pending a finished body.
-            let ws_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+            let ws_ids: Arc<Mutex<BoundedSet<String>>> =
+                Arc::new(Mutex::new(BoundedSet::new(WS_IDS_CAP)));
             let pending: Arc<Mutex<HashMap<String, String>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let fetched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -229,7 +281,9 @@ mod cdp {
                 "in",
                 ws_ids.clone(),
             );
-            ws_frames(&core, app.clone(), "Network.webSocketFrameSent", "out", ws_ids);
+            ws_frames(&core, app.clone(), "Network.webSocketFrameSent", "out", ws_ids.clone());
+            // D2/M4: a closed socket releases its id and its key.
+            ws_closed_evt(&core, app.clone(), ws_ids);
             rest_received(&core, app.clone(), pending.clone());
             // C4: failed loads release their rid instead of leaking it.
             rest_failed(&core, pending.clone());
@@ -270,15 +324,36 @@ mod cdp {
         }
     }
 
-    fn ws_created(core: &Core, ws_ids: Arc<Mutex<HashSet<String>>>) {
+    fn ws_created(core: &Core, ws_ids: Arc<Mutex<BoundedSet<String>>>) {
         recv_handler(core, "Network.webSocketCreated", move |v| {
             if let (Some(rid), Some(url)) = (
                 v.get("requestId").and_then(|r| r.as_str()),
                 v.get("url").and_then(|u| u.as_str()),
             ) {
                 if url.contains("zalo") {
-                    ws_ids.lock().map(|mut s| s.insert(rid.to_string())).ok();
+                    // D2/M4 + R1: bounded insert — the OLDEST id is
+                    // evicted at the cap, never the live one, never
+                    // the whole set; evictions are counted.
+                    if let Ok(mut s) = ws_ids.lock() {
+                        if s.insert(rid.to_string()).is_some() {
+                            ws_stats::bump(WsStage::IdsEvicted);
+                        }
+                    }
                 }
+            }
+        });
+    }
+
+    /// D2/M4: a closed socket releases its tracked id AND tells the
+    /// flusher to drop that connection's decode key (`Job::WsClosed`).
+    fn ws_closed_evt(core: &Core, app: AppHandle, ws_ids: Arc<Mutex<BoundedSet<String>>>) {
+        recv_handler(core, "Network.webSocketClosed", move |v| {
+            let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
+                return;
+            };
+            if ws_ids.lock().map(|mut s| s.remove(rid)).unwrap_or(false) {
+                ws_stats::bump(WsStage::Closed);
+                runtime::ws_closed(&app, rid.to_string());
             }
         });
     }
@@ -288,7 +363,7 @@ mod cdp {
         app: AppHandle,
         event: &'static str,
         direction: &'static str,
-        ws_ids: Arc<Mutex<HashSet<String>>>,
+        ws_ids: Arc<Mutex<BoundedSet<String>>>,
     ) {
         recv_handler(core, event, move |v| {
             let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
@@ -297,16 +372,18 @@ mod cdp {
             if !ws_ids.lock().map(|s| s.contains(rid)).unwrap_or(false) {
                 return;
             }
-            let payload = v
-                .get("response")
-                .and_then(|r| r.get("payloadData"))
-                .and_then(|p| p.as_str())
-                .unwrap_or("");
-            use base64::Engine as _;
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) {
-                if !bytes.is_empty() {
-                    runtime::deliver_ws(&app, bytes, direction);
+            // D2/M4: the conn tag (CDP requestId) rides with the frame
+            // in RAM only — never logged, never stored. Text frames
+            // are counted, never decoded; bad base64 is counted
+            // instead of vanishing.
+            match classify_ws_frame(v) {
+                WsFrameClass::Binary(bytes) => {
+                    ws_stats::bump(WsStage::FramesOk);
+                    runtime::deliver_ws(&app, bytes, rid.to_string(), direction);
                 }
+                WsFrameClass::Text => ws_stats::bump(WsStage::TextFrames),
+                WsFrameClass::BadBase64 => ws_stats::bump(WsStage::BadB64),
+                WsFrameClass::Ignored => {}
             }
         });
     }
@@ -573,5 +650,58 @@ mod tests {
         // A non-object `result` is not the wrapper: fall back to the
         // bare object (which has no body).
         assert_eq!(parse_get_response_body(r#"{"result":5}"#), Err(BodyErr::NoBody));
+    }
+
+    // --- D2 (audit M4): WS frame classification, pure ----------------------
+
+    #[test]
+    fn ws_frame_classification_buckets() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4]);
+        // Binary frame (opcode 2): payload decodes.
+        let bin = serde_json::json!({
+            "requestId": "r1",
+            "response": {"opcode": 2, "payloadData": b64}
+        });
+        assert_eq!(classify_ws_frame(&bin), WsFrameClass::Binary(vec![1, 2, 3, 4]));
+        // Text frame (opcode 1): counted, never decoded — even when
+        // the payload happens to be valid base64.
+        let txt = serde_json::json!({
+            "response": {"opcode": 1, "payloadData": b64}
+        });
+        assert_eq!(classify_ws_frame(&txt), WsFrameClass::Text);
+        let txt2 = serde_json::json!({
+            "response": {"opcode": 1, "payloadData": "hello world"}
+        });
+        assert_eq!(classify_ws_frame(&txt2), WsFrameClass::Text);
+        // Binary shape with a corrupt payload: counted, was silent.
+        let bad = serde_json::json!({
+            "response": {"opcode": 2, "payloadData": "!!not-b64!!"}
+        });
+        assert_eq!(classify_ws_frame(&bad), WsFrameClass::BadBase64);
+        // A zero-byte decode (and a missing payloadData) is nothing.
+        let empty = serde_json::json!({"response": {"opcode": 2, "payloadData": ""}});
+        assert_eq!(classify_ws_frame(&empty), WsFrameClass::Ignored);
+        let no_pd = serde_json::json!({"response": {"opcode": 2}});
+        assert_eq!(classify_ws_frame(&no_pd), WsFrameClass::Ignored);
+        // No opcode at all: keep the pre-D2 decode attempt (events
+        // from an older WebView2 must not regress).
+        let no_op = serde_json::json!({"response": {"payloadData": b64}});
+        assert_eq!(classify_ws_frame(&no_op), WsFrameClass::Binary(vec![1, 2, 3, 4]));
+        let no_op_bad = serde_json::json!({"response": {"payloadData": "!!"}});
+        assert_eq!(classify_ws_frame(&no_op_bad), WsFrameClass::BadBase64);
+        // Not a frame shape at all.
+        assert_eq!(classify_ws_frame(&serde_json::json!({})), WsFrameClass::Ignored);
+        assert_eq!(classify_ws_frame(&serde_json::json!("str")), WsFrameClass::Ignored);
+    }
+
+    #[test]
+    fn ws_classification_never_decodes_text_frames() {
+        // The whole point of the Text bucket (D2): a text payload is
+        // never handed to the binary decode path, whatever its bytes.
+        for payload in ["hello", "", "AAAA", "PDQ/PDw="] {
+            let v = serde_json::json!({"response": {"opcode": 1, "payloadData": payload}});
+            assert_eq!(classify_ws_frame(&v), WsFrameClass::Text, "{payload}");
+        }
     }
 }

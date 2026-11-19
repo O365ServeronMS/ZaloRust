@@ -91,9 +91,36 @@ pub fn reveal_download(app: tauri::AppHandle, id: u64) -> Result<(), String> {
 // message traffic and the handshake key is a secret that must never reach
 // the log file.
 
+// D3 (audit M3): rate limiters for the two bridge commands. Page
+// scripts on chat.zalo.me are trusted at page level — the same level
+// the page itself runs at — and the buckets do not add distrust; they
+// only bound abuse, so a runaway loop or a hostile script on that page
+// cannot flood the shadow pipeline or spam handshakes. Single
+// process: statics behind a Mutex are fine.
+//
+// Shapes (R2, batch 4 review): e2ee capacity 5000 with 500/s refill.
+// Opening a large conversation or the post-login sync decrypts history
+// in bursts — hundreds to thousands of messages in seconds — and
+// dropping legitimate plaintext is unrecoverable data loss, the exact
+// opposite of the capture goal. The old 300/50 shape risked exactly
+// that; this one absorbs a full history sync (a real chat session then
+// sends ~1/s; audit KQ7 saw 2765 calls in 45 min) and still bounds
+// abuse: a runaway loop or a hostile script on that page hits the
+// bucket and stalls at 500/s. Handshake burst 5 with 1 token per 60 s
+// (the page hands the key over once per (re)load) is unchanged.
+static E2EE_LIMITER: std::sync::Mutex<crate::shadow::rate_limit::RateLimiter> =
+    std::sync::Mutex::new(crate::shadow::rate_limit::RateLimiter::new(5000.0, 500.0));
+static HANDSHAKE_LIMITER: std::sync::Mutex<crate::shadow::rate_limit::RateLimiter> =
+    std::sync::Mutex::new(crate::shadow::rate_limit::RateLimiter::new(5.0, 1.0 / 60.0));
+
 /// One E2EE plaintext message forwarded by the bridge tap (bridge.js 0b:
 /// a wrapped `decryptMsgFromServer`). 512 KB hard cap; larger payloads are
 /// dropped and counted, never stored.
+///
+/// Trust boundary (audit M3/D3): the ACL limits callers to the Zalo page
+/// (`https://chat.zalo.me`), and page scripts are trusted at page level —
+/// the same level the page itself runs at. The token bucket on top only
+/// bounds abuse: over-limit calls are dropped and counted, nothing more.
 #[tauri::command(async)]
 pub fn shadow_e2ee_message(window: tauri::Webview, payload: String) {
     if crate::integration::remote(&window).is_err() {
@@ -107,8 +134,17 @@ pub fn shadow_e2ee_message(window: tauri::Webview, payload: String) {
     static NO_ID: AtomicU64 = AtomicU64::new(0);
     static KEYISH: AtomicU64 = AtomicU64::new(0);
     static OTHER: AtomicU64 = AtomicU64::new(0);
+    // D3: calls the token bucket refused (cumulative).
+    static RATE: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicI64 = AtomicI64::new(0);
-    if payload.len() > 512 * 1024 {
+    let now = crate::shadow::schema::now_ms();
+    let allowed = E2EE_LIMITER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow(now);
+    if !allowed {
+        RATE.fetch_add(1, Relaxed);
+    } else if payload.len() > 512 * 1024 {
         OTHER.fetch_add(1, Relaxed);
     } else {
         match e2ee_admit(&payload) {
@@ -127,25 +163,49 @@ pub fn shadow_e2ee_message(window: tauri::Webview, payload: String) {
             }
         }
     }
-    let now = crate::shadow::schema::now_ms();
     let last = LAST.load(Relaxed);
     if now - last >= 60_000 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
         crate::dlog::log(&format!(
-            "shadow e2ee: delivered={} dropped_no_msgid={} dropped_keyish={} dropped_other={} (cumulative)",
+            "shadow e2ee: delivered={} dropped_no_msgid={} dropped_keyish={} dropped_other={} dropped_rate={} (cumulative)",
             OK.load(Relaxed),
             NO_ID.load(Relaxed),
             KEYISH.load(Relaxed),
-            OTHER.load(Relaxed)
+            OTHER.load(Relaxed),
+            RATE.load(Relaxed)
         ));
     }
 }
 
 /// The bridge hands over the page's REST decode key (`getSecretKey()`,
-/// base64 of 16 bytes) and, when it can resolve it, the logged-in uid
-/// (`getUserId()`). RAM only — never logged, never stored.
+/// base64 of 16 bytes) and, when it can resolve it, the logged-in uid.
+/// RAM only — never logged, never stored. Since D1 (KQ2) the uid is
+/// only a cross-check: a uid configured in settings always wins.
+///
+/// Trust boundary (audit M3/D3): the ACL limits callers to the Zalo
+/// page, and page scripts are trusted at page level. The bucket only
+/// bounds abuse — the key legitimately arrives once per (re)load, so
+/// anything faster is dropped and counted.
 #[tauri::command(async)]
 pub fn shadow_handshake(window: tauri::Webview, key: String, uid: Option<String>) {
     if crate::integration::remote(&window).is_err() {
+        return;
+    }
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+    // D3: refused handshakes (cumulative count only — never the key).
+    static RATE: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = crate::shadow::schema::now_ms();
+    let allowed = HANDSHAKE_LIMITER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow(now);
+    if !allowed {
+        let n = RATE.fetch_add(1, Relaxed) + 1;
+        // One throttled line (≤1/min), count only.
+        let last = LAST.load(Relaxed);
+        if now - last >= 60_000 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+            crate::dlog::log(&format!("shadow handshake: rate limited ({n})"));
+        }
         return;
     }
     if key.len() > 256 {

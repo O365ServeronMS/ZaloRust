@@ -36,12 +36,19 @@
 //!   - `repair`  — one-time v1 data repair (maintenance only, never
 //!     called from runtime)
 
+pub mod account;
+/// Insertion-ordered bounded set/map — eviction of the OLDEST entry
+/// only (R1, batch 4 review: clear-all eviction killed live capture
+/// state in `capture.rs` and `runtime.rs`).
+pub mod bounded;
 pub mod capture;
 pub mod cli;
 pub mod import;
 pub mod media;
 pub mod normalize;
 pub mod pipeline;
+/// Pure token bucket bounding the bridge IPC commands (audit M3/D3).
+pub mod rate_limit;
 /// One-time v1 data repair (audit T8). Maintenance/tests ONLY — never
 /// called from `runtime` or startup.
 pub mod repair;
@@ -49,8 +56,46 @@ pub mod repair;
 pub mod rest_stats;
 pub mod runtime;
 pub mod schema;
+/// WS frame stage counters (audit M4/D2, batch 4).
+pub mod ws_stats;
 pub mod wire;
 pub mod writer;
+
+// --- KQ10: the one shadow account ------------------------------------------
+
+/// The shadow DB's account id (KQ10/D18): this build is single-account
+/// and every on-disk shadow artifact is named after it. Renaming the
+/// store later is a file rename plus this constant — nothing else
+/// hardcodes it.
+///
+/// NOT the same concept as the app's window account id that
+/// `accounts.rs`/`window.rs`/`lib.rs` also call `"default"` (which
+/// profile/window an account opens in); those stay untouched.
+pub const SHADOW_ACCOUNT: &str = "default";
+
+/// The shadow DB file for `dir` (`<dir>/default.db`).
+pub fn db_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{SHADOW_ACCOUNT}.db"))
+}
+
+/// The DPAPI-wrapped key file for `dir` (`<dir>/default.key`).
+pub fn key_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{SHADOW_ACCOUNT}.key"))
+}
+
+#[cfg(test)]
+mod account_path_tests {
+    use super::{db_file, key_file, SHADOW_ACCOUNT};
+    use std::path::Path;
+
+    #[test]
+    fn shadow_account_paths_are_the_default_files() {
+        let dir = Path::new(r"D:\shadow");
+        assert_eq!(SHADOW_ACCOUNT, "default");
+        assert_eq!(db_file(dir), dir.join("default.db"));
+        assert_eq!(key_file(dir), dir.join("default.key"));
+    }
+}
 
 #[cfg(test)]
 mod golden;

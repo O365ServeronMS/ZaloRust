@@ -21,6 +21,10 @@
 //!
 //! The WS per-connection AES key is harvested from frame `cmd=1 subCmd=1`
 //! the same way and never touches disk (redacted before `raw_events`).
+//! Since audit M4 (batch 4) keys are PER-CONNECTION, keyed by the CDP
+//! requestId tag the capture layer attaches to every frame — the tag
+//! lives in RAM only, is never logged or stored, and its key is wiped
+//! when the connection closes (`Job::WsClosed`, D2).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -28,9 +32,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tauri::Manager;
+use zeroize::Zeroize;
 
+use super::account::{self, UidEvent};
+use super::bounded::{BoundedMap, Inserted};
 use super::pipeline;
 use super::rest_stats::{self, RestStage};
+use super::ws_stats::{self, WsStage};
 use super::{schema, wire, writer};
 use crate::migrate::sqlcipher;
 use crate::settings::{ShadowSettings, Settings};
@@ -43,8 +51,15 @@ pub struct Shadow {
 /// Jobs on the single writer queue. `MediaDone` carries the media
 /// thread's download outcomes back to the flusher (T3/A5: the media
 /// thread holds a READ-ONLY connection and never writes the DB itself).
+///
+/// D2 (audit M4): WS frames carry a connection tag — the CDP
+/// requestId string. It stays in RAM, is never logged or stored, and
+/// keys the flusher's per-connection decode map; `WsClosed` drops that
+/// connection's key.
 pub(crate) enum Job {
-    WsFrame { bytes: Vec<u8>, direction: &'static str },
+    WsFrame { bytes: Vec<u8>, conn: String, direction: &'static str },
+    /// A tracked WS connection closed: wipe its per-connection key.
+    WsClosed { conn: String },
     RestBody { endpoint: String, body: Vec<u8>, direction: &'static str },
     E2ee { payload: String },
     Handshake { key_b64: String, uid: Option<String> },
@@ -55,6 +70,7 @@ impl Job {
     fn kind(&self) -> &'static str {
         match self {
             Job::WsFrame { .. } => "ws",
+            Job::WsClosed { .. } => "ws-closed",
             Job::RestBody { .. } => "rest",
             Job::E2ee { .. } => "e2ee",
             Job::Handshake { .. } => "handshake",
@@ -114,14 +130,23 @@ pub fn start(app: &tauri::AppHandle) {
 /// Open (or create) the encrypted shadow DB and apply the schema.
 fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<rusqlite::Connection, String> {
     let _ = std::fs::create_dir_all(dir);
-    let db_path = dir.join("default.db");
-    let key_path = dir.join("default.key");
+    // KQ10: every path through the shadow store goes through the
+    // account helpers — nothing hardcodes "default" here anymore.
+    let db_path = super::db_file(dir);
+    let key_path = super::key_file(dir);
     if cfg.encrypt {
         if !key_path.exists() {
-            let key = sqlcipher::generate_key().map_err(|e| e.to_string())?;
+            // L4/D4: the generated key bytes are wiped after the
+            // DPAPI wrap; the wrapped file never holds the raw key.
+            let key =
+                zeroize::Zeroizing::new(sqlcipher::generate_key().map_err(|e| e.to_string())?);
             sqlcipher::save_key(&key, &key_path).map_err(|e| e.to_string())?;
         }
-        let key = sqlcipher::load_key(&key_path).map_err(|e| e.to_string())?;
+        // L4/D4: the loaded key bytes are wiped once the connection
+        // holds them (SQLCipher keeps its own copy; the Rust-side Vec
+        // must not linger).
+        let key =
+            zeroize::Zeroizing::new(sqlcipher::load_key(&key_path).map_err(|e| e.to_string())?);
         let conn = sqlcipher::open_with_key(&db_path, &key).map_err(|e| e.to_string())?;
         schema::apply(&conn).map_err(|e| e.to_string())?;
         Ok(conn)
@@ -135,11 +160,53 @@ fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<rusqlite::Connection, 
     }
 }
 
+/// Cap for the per-connection key map (D2/M4): keys are keyed by the
+/// CDP requestId, so overlapping reconnects each get their own. The
+/// map is bounded — past the cap the OLDEST entry is evicted (never
+/// the newest, never a wholesale drain; every evicted key is
+/// zeroized). R1 (batch 4 review) fixed the comment that used to
+/// claim "a connection re-arms its key on its next cmd=1 subCmd=1
+/// frame": the WS key is sent ONCE per connection (cmd=1 subCmd=1 at
+/// connect), so an evicted connection stays undecoded until it
+/// reconnects — evictions are counted (`ws_stats::KeysEvicted`) to
+/// make that visible instead of silent.
+const WS_KEYS_CAP: usize = 16;
+
 /// The flusher thread: owns the DB connection and both runtime keys.
 fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
-    let mut ws_key: Option<[u8; 16]> = None;
+    // D2 (audit M4): one key PER CONNECTION, not one global —
+    // overlapping reconnects used to decode with the wrong key.
+    // R1: insertion-ordered bounded map — the OLDEST key is evicted
+    // at the cap, never the live one, never the whole map.
+    let mut ws_keys: BoundedMap<String, [u8; 16]> = BoundedMap::new(WS_KEYS_CAP);
     let mut rest_key: Option<[u8; 16]> = None;
+    // D1 (KQ2): the own uid is configuration, not a guess — seed it
+    // from settings; the handshake only cross-checks afterwards.
     let mut own_uid: Option<String> = None;
+    match cfg.own_uid.as_deref() {
+        Some(u) if account::valid_uid(u) => {
+            own_uid = Some(u.to_string());
+            crate::dlog::log(&format!("shadow: own uid configured (len {})", u.len()));
+        }
+        Some(_) => {
+            crate::dlog::log("shadow: own uid config rejected (bad shape)");
+        }
+        None => {}
+    }
+    // D1 (KQ2/KQ10): fill the `accounts` row once at start, inside its
+    // own small transaction. A uid without a uin_hash skips the row —
+    // a hash is never invented.
+    if let Some(uid) = own_uid.as_deref() {
+        match cfg.own_uin_hash.as_deref().filter(|h| account::valid_uin_hash(h)) {
+            Some(h) => seed_account_row(&conn, uid, h),
+            None => {
+                crate::dlog::log("shadow: accounts row skipped (uin_hash not configured)");
+            }
+        }
+    }
+    // D1: `shadow: own uid mismatch (configured kept)` fires at most
+    // once per process, whatever the handshake keeps offering.
+    let mut uid_mismatch_logged = false;
     let batch_ms = Duration::from_millis(cfg.batch_ms.max(20));
     'outer: loop {
         let first = match rx.recv_timeout(batch_ms) {
@@ -162,28 +229,68 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
         for job in jobs {
             match job {
                 Job::Handshake { key_b64, uid } => {
+                    // L4/D4: the b64 form of the key is key material
+                    // too — wiped once the decode is done.
+                    let key_b64 = zeroize::Zeroizing::new(key_b64);
                     if let Some(k) = wire::decode_key_field(&key_b64) {
-                        rest_key = Some(k);
+                        // L4/D4: a replaced key is wiped, not dropped.
+                        if let Some(mut old) = rest_key.replace(k) {
+                            old.zeroize();
+                        }
                         crate::dlog::log("shadow: rest decode key armed (len 16)");
                     } else {
                         crate::dlog::log("shadow: handshake key rejected (bad shape)");
                     }
-                    if let Some(u) = uid {
-                        if u.len() >= 5 && u.len() <= 32 && u.bytes().all(|b| b.is_ascii_digit()) {
-                            own_uid = Some(u);
-                            crate::dlog::log("shadow: own uid learned (len)");
+                    // D1 (KQ2): a configured uid ALWAYS wins; the
+                    // handshake's uid only cross-checks.
+                    let (resolved, ev) = account::resolve_own_uid(
+                        cfg.own_uid.as_deref(),
+                        own_uid.as_deref(),
+                        uid.as_deref(),
+                    );
+                    match ev {
+                        UidEvent::Learned => {
+                            own_uid = resolved;
+                            crate::dlog::log(&format!(
+                                "shadow: own uid learned (len {})",
+                                own_uid.as_deref().map_or(0, |u| u.len())
+                            ));
                         }
+                        UidEvent::Mismatch => {
+                            own_uid = resolved;
+                            if !uid_mismatch_logged {
+                                uid_mismatch_logged = true;
+                                // No values, ever (H-rule).
+                                crate::dlog::log("shadow: own uid mismatch (configured kept)");
+                            }
+                        }
+                        UidEvent::Same => {}
                     }
                 }
-                Job::WsFrame { bytes, direction } => {
+                Job::WsFrame { bytes, conn: ws_conn, direction } => {
                     let Some(frame) = wire::parse_ws_frame(&bytes) else {
                         continue;
                     };
                     if let Some(k) = wire::ws_frame_key(&frame) {
-                        ws_key = Some(k);
+                        // D2/M4 + L4/D4 + R1: per-connection key,
+                        // insertion-ordered bounded map — the OLDEST
+                        // key is evicted (and wiped), never the live
+                        // connection's, never the whole map.
+                        match ws_keys.insert(ws_conn.clone(), k) {
+                            Inserted::Kept => {}
+                            // L4/D4: a replaced key is wiped, not dropped.
+                            Inserted::Replaced(mut old) => old.zeroize(),
+                            Inserted::Evicted(_, mut old) => {
+                                old.zeroize();
+                                ws_stats::bump(WsStage::KeysEvicted);
+                            }
+                        }
+                        ws_stats::set_keys(ws_keys.len() as u64);
                         crate::dlog::log("shadow: ws connection key armed (len 16)");
                     }
-                    let mut decoded = wire::decode_ws_frame(&frame, ws_key.as_ref());
+                    // The conn tag keys the lookup ONLY — it never
+                    // reaches `endpoint` or the stored envelope.
+                    let mut decoded = wire::decode_ws_frame(&frame, ws_keys.get(&ws_conn));
                     if let wire::WsDecoded::Envelope(ref mut env) = decoded {
                         wire::redact_key_in_envelope(env);
                     }
@@ -193,6 +300,14 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
                         endpoint: format!("ws:{}/{}", frame.cmd, frame.sub_cmd),
                         env: decoded.stored_value(),
                     });
+                }
+                Job::WsClosed { conn: ws_conn } => {
+                    // D2/M4 + L4/D4: the connection is gone — its key
+                    // is wiped, not just dropped.
+                    if let Some(mut old) = ws_keys.remove(&ws_conn) {
+                        old.zeroize();
+                        ws_stats::set_keys(ws_keys.len() as u64);
+                    }
                 }
                 Job::RestBody { endpoint, body, direction } => {
                     let outer: Value = match serde_json::from_slice(&body) {
@@ -254,13 +369,64 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
             ));
         }
     }
+    // L4/D4: shutdown wipes every live key instead of leaving them in
+    // freed heap (BoundedMap hands every entry back via IntoIterator).
+    for (_, mut k) in ws_keys {
+        k.zeroize();
+    }
+    if let Some(mut k) = rest_key.take() {
+        k.zeroize();
+    }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 }
 
-/// Deliver a raw WS frame (CDP). Binary bytes exactly as seen on the wire.
-pub fn deliver_ws(app: &tauri::AppHandle, bytes: Vec<u8>, direction: &'static str) {
+/// D1 (KQ2/KQ10): the flusher-start `accounts` upsert, in its own
+/// small transaction.
+///
+/// R3 (batch 4 review): COMMIT only when `BEGIN IMMEDIATE` succeeded
+/// (the old code ignored the BEGIN result and committed regardless —
+/// after a failed BEGIN the COMMIT landed someone ELSE's open
+/// transaction), and on an upsert error ROLLBACK instead of COMMIT.
+/// Logs the write kind only (H-rule): sqlite messages can quote SQL
+/// params, so the error text itself never reaches the log.
+fn seed_account_row(conn: &rusqlite::Connection, uid: &str, uin_hash: &str) {
+    if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+        // No transaction of ours is open: committing here would land
+        // a foreign one. Kind only, no params (H-rule).
+        crate::dlog::log("shadow: accounts upsert failed (begin)");
+        return;
+    }
+    match account::upsert_account(conn, uid, uin_hash) {
+        Ok(()) => {
+            let _ = conn.execute_batch("COMMIT");
+        }
+        Err(e) => {
+            // Kind only (H-rule): sqlite messages can quote params.
+            crate::dlog::log(&format!(
+                "shadow: accounts upsert failed ({})",
+                pipeline::sqlite_kind(&e)
+            ));
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// Deliver a raw WS frame (CDP) for connection `conn` — the CDP
+/// requestId string. It rides the job queue in RAM only, keys the
+/// flusher's per-connection decode map, and is never logged or stored
+/// (D2/M4). Binary bytes exactly as seen on the wire.
+pub fn deliver_ws(app: &tauri::AppHandle, bytes: Vec<u8>, conn: String, direction: &'static str) {
     if let Some(sh) = app.try_state::<Shadow>() {
-        let _ = sh.tx.send(Job::WsFrame { bytes, direction });
+        let _ = sh.tx.send(Job::WsFrame { bytes, conn, direction });
+    }
+}
+
+/// A tracked WS connection closed (CDP `Network.webSocketClosed`): the
+/// flusher drops — and wipes — that connection's decode key (D2/M4).
+/// `conn` is the CDP requestId; RAM only, never logged or stored.
+pub fn ws_closed(app: &tauri::AppHandle, conn: String) {
+    if let Some(sh) = app.try_state::<Shadow>() {
+        let _ = sh.tx.send(Job::WsClosed { conn });
     }
 }
 
@@ -285,8 +451,9 @@ pub fn deliver_e2ee(app: &tauri::AppHandle, payload: String) {
 }
 
 /// Arm the REST decode key from the bridge handshake, and learn the
-/// logged-in account's uid (`getUserId`) for self-sent sender substitution.
-/// Neither value ever enters logs or the DB.
+/// logged-in account's uid for self-sent sender substitution. Neither
+/// value ever enters logs or the DB. Since D1 (KQ2) the learned uid is
+/// only a cross-check: a uid configured in settings always wins.
 pub fn set_rest_key(app: &tauri::AppHandle, key_b64: String, uid: Option<String>) {
     if let Some(sh) = app.try_state::<Shadow>() {
         let _ = sh.tx.send(Job::Handshake { key_b64, uid });
@@ -297,3 +464,111 @@ pub fn set_rest_key(app: &tauri::AppHandle, key_b64: String, uid: Option<String>
 pub fn cfg_from(settings: &Settings) -> ShadowSettings {
     settings.shadow.clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate::sqlcipher;
+
+    /// FAKE values of the documented shapes — never a real uid/hash.
+    const FAKE_UID: &str = "1234567890123456789";
+    const FAKE_HASH: &str = "abc123def456";
+
+    fn mem_db() -> rusqlite::Connection {
+        let key = sqlcipher::generate_key().unwrap();
+        let conn = sqlcipher::open_in_memory(&key).unwrap();
+        super::super::schema::apply(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn seed_account_row_happy_path_commits() {
+        let conn = mem_db();
+        seed_account_row(&conn, FAKE_UID, FAKE_HASH);
+        assert!(
+            conn.is_autocommit(),
+            "a successful seed must leave no transaction open"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the row landed");
+    }
+
+    #[test]
+    fn seed_account_row_upsert_error_rolls_back_never_commits() {
+        let conn = mem_db();
+        // Force the upsert itself to fail: the table is gone, but the
+        // BEGIN still succeeds — the fix must ROLLBACK, not COMMIT.
+        conn.execute_batch("DROP TABLE accounts").unwrap();
+        seed_account_row(&conn, FAKE_UID, FAKE_HASH);
+        assert!(
+            conn.is_autocommit(),
+            "an upsert error must end in ROLLBACK, never COMMIT"
+        );
+    }
+
+    #[test]
+    fn seed_account_row_failed_begin_never_commits_a_foreign_transaction() {
+        // R3: the old code ignored the BEGIN IMMEDIATE result and ran
+        // COMMIT anyway — with a transaction already open (here: this
+        // test's), that COMMIT landed SOMEONE ELSE's transaction. The
+        // fixed code must not touch it: the outer transaction stays
+        // open, under this test's control.
+        let conn = mem_db();
+        conn.execute_batch("BEGIN").unwrap();
+        seed_account_row(&conn, FAKE_UID, FAKE_HASH);
+        assert!(
+            !conn.is_autocommit(),
+            "a failed BEGIN must not COMMIT the caller's open transaction"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(conn.is_autocommit());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "nothing may land through a failed BEGIN");
+    }
+
+    #[test]
+    fn ws_keys_bounded_map_never_drops_the_live_connection_key() {
+        // R1 at the flusher's data structure: the WS key is sent ONCE
+        // per connection, so an eviction must never take the NEWEST
+        // key while older ones exist — a connection armed just now
+        // survives every cap eviction until it is itself the oldest.
+        let mut ws_keys: BoundedMap<String, [u8; 16]> = BoundedMap::new(WS_KEYS_CAP);
+        for i in 0..WS_KEYS_CAP {
+            assert!(matches!(
+                ws_keys.insert(format!("old-{i}"), [2; 16]),
+                Inserted::Kept
+            ));
+        }
+        let live = "live-conn".to_string();
+        // Filling the last slot evicts the OLDEST old key, not the
+        // incoming live one.
+        assert!(matches!(
+            ws_keys.insert(live.clone(), [1; 16]),
+            Inserted::Evicted(_, _)
+        ));
+        // The live key is the NEWEST: further connections evict the
+        // OLDEST old-* keys first, never the live one.
+        let mut evicted_live = false;
+        for i in 0..(WS_KEYS_CAP - 1) {
+            if let Inserted::Evicted(k, _) = ws_keys.insert(format!("new-{i}"), [3; 16]) {
+                if k == live {
+                    evicted_live = true;
+                }
+            }
+        }
+        assert!(
+            !evicted_live,
+            "the live key must never be the evicted one while older keys exist"
+        );
+        assert_eq!(ws_keys.get(&live), Some(&[1; 16]));
+        // A close hands the key back for zeroizing (the flusher wipes
+        // it) and frees the slot.
+        assert_eq!(ws_keys.remove(&live), Some([1; 16]));
+        assert!(ws_keys.get(&live).is_none());
+    }
+}
+

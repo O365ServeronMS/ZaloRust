@@ -206,7 +206,12 @@
     function zrSendKey(k) {
       try {
         if (typeof k !== "string" || !k || k.length > 200) return;
-        invoke("shadow_handshake", { key: k, uid: window.__zrUid || null });
+        // D1 (KQ2, batch 4): the own uid comes from configuration now.
+        // The old DI-token probing (MC.resolveToken) never hit in
+        // practice and risked changing page behaviour (audit A2), so
+        // it is gone; the handshake keeps its uid slot and simply
+        // delivers null — Rust learns the uid from settings instead.
+        invoke("shadow_handshake", { key: k, uid: null });
       } catch (e) {}
     }
 
@@ -321,49 +326,14 @@
           any = true;
         }
       }
-      // Own-uid learning: try DI candidate tokens exposing getUserId().
-      // Purely best-effort — the uid only substitutes self-sent senders.
-      if (!window.__zrUid) {
-        try {          var MC = null;
-          Object.keys(req.c).some(function (id) {
-            var ex;
-            try { ex = req.c[id] && req.c[id].exports; } catch (e) { return false; }
-            if (ex && ex.ModuleContainer && ex.define) { MC = ex.ModuleContainer; return true; }
-            return false;
-          });
-          if (MC) {
-            ["user-controller", "account-service", "auth-service", "session-service",
-             "user-service", "account-controller", "user-store", "current-user",
-             "account-manager", "message-controller"].some(function (t) {
-              var s;
-              try { s = MC.resolveToken(t); } catch (e) { return false; }
-              var p = s, depth = 0;
-              while (p && p !== Object.prototype && depth < 3) {
-                if (typeof p.getUserId === "function") {
-                  var u = null;
-                  try { u = p.getUserId(); } catch (e) {}
-                  if (typeof u === "string" && /^\d{5,32}$/.test(u)) {
-                    window.__zrUid = u;
-                    zrLog("own uid resolved via " + t);
-                    return true;
-                  }
-                }
-                p = Object.getPrototypeOf(p);
-                depth++;
-              }
-              return false;
-            });
-          }
-        } catch (e) {}
-      }
-      // A late uid resolution re-sends the handshake so Rust gets {key, uid}.
-      if (window.__zrUid && !window.__zrUidSent) {
-        window.__zrUidSent = true;
-        var kh2 = zrFindExport(req, ["getSecretKey"]);
-        if (kh2) {
-          try { zrSendKey(kh2.surface.getSecretKey()); } catch (e) {}
-        }
-      }
+      // NOTE (D1/KQ2, batch 4): there is NO own-uid learning here
+      // anymore. Resolving the uid used to mean probing the page's DI
+      // container (MC.resolveToken guesses) and re-sending the
+      // handshake when a token finally answered — 0 hits in practice
+      // and an A2 page-behaviour risk (initializing services out of
+      // order). The uid now arrives from Rust-side configuration
+      // (settings.shadow.own_uid); the handshake above simply sends
+      // uid: null.
       return zrArmed.e2ee && zrArmed.key;
     }
 
