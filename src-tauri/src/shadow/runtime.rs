@@ -83,11 +83,14 @@ pub fn start(app: &tauri::AppHandle) {
     let (tx, rx) = channel::<Job>();
     match open_db(&dir, &s.shadow) {
         Ok(conn) => {
+            let media_cfg = s.shadow.clone();
             std::thread::Builder::new()
                 .name("shadow-flusher".into())
                 .spawn(move || flusher(conn, rx, s.shadow))
                 .ok();
             app.manage(Shadow { tx });
+            // P1b: media auto-download (own connection, rate-limited).
+            super::media::start(dir.clone(), media_cfg);
             crate::dlog::log("shadow: pipeline started (capture mode cdp)");
         }
         Err(e) => {

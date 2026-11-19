@@ -37,6 +37,7 @@
 pub mod capture;
 pub mod cli;
 pub mod import;
+pub mod media;
 pub mod normalize;
 pub mod pipeline;
 pub mod runtime;
@@ -140,3 +141,12 @@ impl Write {
         }
     }
 }
+
+#[cfg(test)]
+mod probe_attach;
+
+#[cfg(test)]
+mod probe_latest;
+
+#[cfg(test)]
+mod probe_551;

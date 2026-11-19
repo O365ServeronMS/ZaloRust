@@ -1,20 +1,20 @@
-Live-verified: E2EE plaintext capture + shadow_dir fix + decrypt inventory taps
+P1b media downloader + live diagnostics probes
 
-Runtime verification against the real account (2026-11-19):
-- ws AES-GCM key armed from frame cmd=1; CDP Network capture flowing
-- REST zpw_enk key handed over by the page (getSecretKey handshake)
-- E2EE plaintext: 4 messages landed source=e2ee with real text
-  (probe: plaintext(source=e2ee)=4, with_text=4, messages 68 then 72)
-- The updated web client renamed the incoming-E2EE decrypt path; the
-  bridge now inventories every decrypt/e2ee surface in the webpack
-  module cache and taps them all (decrypt, createDecryptor,
-  decryptValue, handleReplaceMessageE2ee, ...), forwarding both the
-  return value and the arguments.
-- shadow_dir: pinned to LOCALAPPDATA (Tauri v2 app_data_dir resolves
-  to Roaming on Windows; the first live run silently created a second
-  DB there; misplaced copy kept as shadow-misplaced-2026-11-19).
-- own-uid handshake plumbing (sender substitution for uidFrom=0),
-  -1/0 sentinel conversation skip, unwrap_payload envelope unroll
-  (WS data.data / REST string-payload), golden PASS 68/68 messages.
-- Added probe_e2ee/probe_recent/probe_where/probe_shapes/probe_ctx/
-  probe_group/probe_conv ignored diagnostics.
+- shadow/media.rs: rate-limited downloader thread (own SQLCipher
+  connection, WAL): attachments status='ref' with an https url are
+  fetched into the content-addressed store (sha256 path ab/cd/hash),
+  512 MB per-file cap, tmp+rename, failed marks, 10s/30s backoff.
+  Root order: settings.shadow.media_store, else D:\ZaloRust Data when
+  it exists (D11 for this install), else LOCALAPPDATA fallback.
+  Store created and verified live: "shadow media: store at
+  D:\ZaloRust Data"; first media refs will land with the next
+  non-E2EE media message (E2EE photo content mapping is the next
+  session's first item, see handoff V2 section 3.10).
+- Added ignored diagnostics: probe_attach, probe_latest, probe_551
+  (recent cmd=551 census: 129 frames after session warm-up).
+- Handoff V2 written (D:\.opencode\zalo-handoff-v2-2026-11-19.md):
+  incident + decisions, verified-runtime results table, new wire
+  knowledge (double envelope, ts str13, uidFrom=0 own-uid, sentinel
+  ids, cmd 551 warm-up, renamed decrypt path + inventory tap, zpw_enk
+  runtime-key flow, Roaming-vs-Local shadow_dir trap), D7 memory-scan
+  technique, known-diffs, next moves.
