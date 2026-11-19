@@ -51,20 +51,36 @@ fn flush_digits(out: &mut String, digits: &mut String) {
     digits.clear();
 }
 
+/// Split a URL into (host, path-without-leading-slash) on the same
+/// parsing `is_api_url` always used. Pure.
+fn split_host_path(url: &str) -> Option<(&str, &str)> {
+    let rest = url.split_once("://")?.1;
+    match rest.split_once('/') {
+        Some((h, p)) => Some((h, p)),
+        None => Some((rest, "")),
+    }
+}
+
 /// Which REST URLs are worth storing: Zalo API surfaces, not static assets.
 pub fn is_api_url(url: &str) -> bool {
-    let (host, path) = match url.split_once("://") {
-        Some((_, rest)) => match rest.split_once('/') {
-            Some((h, p)) => (h, p),
-            None => (rest, ""),
-        },
-        None => return false,
+    let Some((host, path)) = split_host_path(url) else {
+        return false;
     };
     if !host.ends_with("zalo.me") && !host.ends_with("zadn.vn") {
         return false;
     }
     host.starts_with("wpa.")
         || host.contains("-wpa.api")
+        // C3 (batch 3): the real web API hosts are
+        // `tt-chat2-wpa.chat.zalo.me`, `tt-group-wpa.chat.zalo.me`,
+        // `tt-profile-wpa.chat.zalo.me`, `tt-convers-wpa.chat.zalo.me`
+        // with paths under `/api/…` — the old `-wpa.api` clause never
+        // matched them, so whole endpoint families were dropped before
+        // the counters existed. (`path` carries no leading slash, so
+        // URL path `/api/x` is `path = "api/x"` here.)
+        || (host.ends_with(".zalo.me")
+            && (host.contains("-wpa.") || host.starts_with("wpa."))
+            && path.starts_with("api/"))
         || host.starts_with("zcld.")
         || host.starts_with("dl-")
         || path.contains("/a/")
@@ -74,6 +90,68 @@ pub fn is_api_url(url: &str) -> bool {
         || path.contains("preloadconvers")
 }
 
+/// C2 host bucket (counter only — the host value itself is never
+/// logged): true when the url's host ends with `zalo.me` on the same
+/// parsing `is_api_url` uses. Counts `*.zalo.me` requests the API
+/// predicate rejects, which is how we spot `is_api_url` being too
+/// narrow without ever logging a host verbatim.
+pub fn host_is_zalo_me(url: &str) -> bool {
+    split_host_path(url).is_some_and(|(host, _)| host.ends_with("zalo.me"))
+}
+
+/// Why a `Network.getResponseBody` completion produced no body bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyErr {
+    /// The completion payload was not valid JSON.
+    NotJson,
+    /// JSON, but no `body` string on the return object.
+    NoBody,
+    /// `base64Encoded: true` but the body did not decode.
+    BadBase64,
+    /// Decoded to zero bytes.
+    Empty,
+}
+
+/// Parse the completion JSON of a `Network.getResponseBody` CDP call
+/// into body bytes (C1, batch 3 — the likely root cause of H2).
+///
+/// WebView2's `CallDevToolsProtocolMethod` completion handler receives
+/// the method's RETURN OBJECT directly as JSON: for `getResponseBody`
+/// that is the bare `{"body": "...", "base64Encoded": bool}` with NO
+/// `result` wrapper — a `result` key only appears when the method's own
+/// return type has one (e.g. `Runtime.evaluate`). The previous code
+/// read `v["result"]["body"]`, so EVERY body was dropped and REST
+/// capture wrote 0 rows. A `{"result":{...}}` wrapper is still accepted
+/// defensively (first `result` object wins) so a WebView2 update that
+/// changes the envelope cannot silently drop bodies again.
+pub fn parse_get_response_body(json: &str) -> Result<Vec<u8>, BodyErr> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|_| BodyErr::NotJson)?;
+    let obj = match v.get("result") {
+        Some(r) if r.is_object() => r,
+        _ => &v,
+    };
+    let body = obj
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(BodyErr::NoBody)?;
+    let b64 = obj
+        .get("base64Encoded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let bytes = if b64 {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .map_err(|_| BodyErr::BadBase64)?
+    } else {
+        body.as_bytes().to_vec()
+    };
+    if bytes.is_empty() {
+        return Err(BodyErr::Empty);
+    }
+    Ok(bytes)
+}
+
 #[cfg(windows)]
 mod cdp {
     use std::collections::{HashMap, HashSet};
@@ -81,10 +159,30 @@ mod cdp {
 
     use tauri::AppHandle;
 
-    use super::is_api_url;
+    use super::{host_is_zalo_me, is_api_url, parse_get_response_body, BodyErr};
+    use crate::shadow::rest_stats::{self, RestStage};
     use crate::shadow::runtime;
 
     type Core = webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
+
+    /// C4 (batch 3): WebView2's Network domain buffer defaults evict
+    /// large response bodies before `Network.getResponseBody` can
+    /// read them back (audit H2 risk note). 100 MB total / 20 MB per
+    /// resource.
+    const NETWORK_ENABLE_PARAMS: &str =
+        r#"{"maxTotalBufferSize":104857600,"maxResourceBufferSize":20971520}"#;
+
+    /// C4: `pending` is bounded — entries leave on
+    /// loadingFinished/loadingFailed, but a response whose load never
+    /// completes (navigation, eviction) must not grow the map forever.
+    /// Past the cap it is dropped wholesale: rids are dedupe keys, not
+    /// data, so the worst case is a missed body, never a leak.
+    const PENDING_CAP: usize = 4096;
+
+    /// C4: `fetched` only exists to dedupe duplicate finished events;
+    /// once a rid left `pending` it can go, so the set is capped (and
+    /// cleared) rather than pruned precisely.
+    const FETCHED_CAP: usize = 4096;
 
     /// Attach the capture listeners to one account webview. Safe to call
     /// per webview; each gets its own listener set.
@@ -104,6 +202,9 @@ mod cdp {
                 Arc::new(Mutex::new(HashMap::new()));
             let fetched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+            // C4: the buffer caps ride on `Network.enable` so big REST
+            // bodies are not evicted before getResponseBody.
+            let enable_params = windows_core::HSTRING::from(NETWORK_ENABLE_PARAMS);
             let done =
                 webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
                     |_, _| Ok(()),
@@ -111,7 +212,7 @@ mod cdp {
             if core
                 .CallDevToolsProtocolMethod(
                     windows_core::w!("Network.enable"),
-                    windows_core::w!("{}"),
+                    windows_core::PCWSTR::from_raw(enable_params.as_ptr()),
                     &done,
                 )
                 .is_err()
@@ -130,6 +231,8 @@ mod cdp {
             );
             ws_frames(&core, app.clone(), "Network.webSocketFrameSent", "out", ws_ids);
             rest_received(&core, app.clone(), pending.clone());
+            // C4: failed loads release their rid instead of leaking it.
+            rest_failed(&core, pending.clone());
             rest_finished(&core, app, pending, fetched);
             crate::dlog::log("shadow cdp: attached");
         }
@@ -218,11 +321,34 @@ mod cdp {
                 .and_then(|r| r.get("url"))
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
+            // C2: every response counts, then the two buckets — matched
+            // vs. zalo.me-but-unmatched (host bucket, never the host).
+            rest_stats::bump(RestStage::ResponseSeen);
             if is_api_url(url) {
-                pending
-                    .lock()
-                    .map(|mut m| m.insert(rid.to_string(), url.to_string()))
-                    .ok();
+                rest_stats::bump(RestStage::ApiMatched);
+                // C4: bounded insert — see PENDING_CAP.
+                if let Ok(mut m) = pending.lock() {
+                    if m.len() >= PENDING_CAP {
+                        m.clear();
+                    }
+                    m.insert(rid.to_string(), url.to_string());
+                }
+            } else if host_is_zalo_me(url) {
+                rest_stats::bump(RestStage::ApiHostUnmatched);
+            }
+        });
+    }
+
+    /// C4 (batch 3): a failed load never yields a body — release the
+    /// rid so `pending` cannot grow and the stage stays visible in the
+    /// counters instead of dying silently.
+    fn rest_failed(core: &Core, pending: Arc<Mutex<HashMap<String, String>>>) {
+        recv_handler(core, "Network.loadingFailed", move |v| {
+            let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
+                return;
+            };
+            if pending.lock().ok().and_then(|mut m| m.remove(rid)).is_some() {
+                rest_stats::bump(RestStage::FailedSeen);
             }
         });
     }
@@ -241,15 +367,23 @@ mod cdp {
             let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
                 return;
             };
-            let Some(url) = pending.lock().ok().and_then(|m| m.get(rid).cloned())
-            else {
+            // C4: whatever happens below, this rid is DONE — remove it
+            // from `pending` first, so a failed body fetch can never
+            // leak the entry (and a duplicate finished event is a no-op).
+            let Some(url) = pending.lock().ok().and_then(|mut m| m.remove(rid)) else {
                 return;
             };
+            rest_stats::bump(RestStage::FinishedSeen);
             {
                 let mut f = match fetched.lock() {
                     Ok(f) => f,
                     Err(_) => return,
                 };
+                // C4: dedupe only — once a rid left `pending` it can
+                // go; cap so the set cannot grow forever.
+                if f.len() >= FETCHED_CAP {
+                    f.clear();
+                }
                 if !f.insert(rid.to_string()) {
                     return;
                 }
@@ -262,37 +396,43 @@ mod cdp {
                 webview2_com::CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
                     move |error: windows_core::Result<()>, json: String| {
                         if error.is_err() {
+                            // C2: counted, never logged verbatim (the
+                            // error text is transport detail).
+                            rest_stats::bump(RestStage::BodyCallErr);
                             return Ok(());
                         }
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                            if let Some(result) = v.get("result") {
-                                let body = result.get("body").and_then(|b| b.as_str()).unwrap_or("");
-                                let b64 = result
-                                    .get("base64Encoded")
-                                    .and_then(|b| b.as_bool())
-                                    .unwrap_or(false);
-                                let bytes = if b64 {
-                                    use base64::Engine as _;
-                                    base64::engine::general_purpose::STANDARD
-                                        .decode(body)
-                                        .unwrap_or_default()
-                                } else {
-                                    body.as_bytes().to_vec()
-                                };
-                                if !bytes.is_empty() {
-                                    runtime::deliver_rest(&app_cb, url.clone(), bytes, "in");
-                                }
+                        // C1: WebView2 hands the method's return object
+                        // directly — NO `result` wrapper for
+                        // getResponseBody. `parse_get_response_body`
+                        // (pure, unit-tested) accepts the bare shape
+                        // and the wrapper defensively.
+                        match parse_get_response_body(&json) {
+                            Ok(bytes) => {
+                                rest_stats::bump(RestStage::BodyOk);
+                                runtime::deliver_rest(&app_cb, url.clone(), bytes, "in");
+                                rest_stats::bump(RestStage::Delivered);
                             }
+                            Err(e) => rest_stats::bump(match e {
+                                BodyErr::NotJson => RestStage::BodyErrNotJson,
+                                BodyErr::NoBody => RestStage::BodyErrNoBody,
+                                BodyErr::BadBase64 => RestStage::BodyErrBadB64,
+                                BodyErr::Empty => RestStage::BodyErrEmpty,
+                            }),
                         }
                         Ok(())
                     },
                 ));
             unsafe {
-                let _ = core_evt.CallDevToolsProtocolMethod(
-                    windows_core::w!("Network.getResponseBody"),
-                    windows_core::PCWSTR::from_raw(params_wide.as_ptr()),
-                    &done,
-                );
+                if core_evt
+                    .CallDevToolsProtocolMethod(
+                        windows_core::w!("Network.getResponseBody"),
+                        windows_core::PCWSTR::from_raw(params_wide.as_ptr()),
+                        &done,
+                    )
+                    .is_err()
+                {
+                    rest_stats::bump(RestStage::BodyCallErr);
+                }
             }
         });
     }
@@ -330,5 +470,108 @@ mod tests {
         assert!(is_api_url("https://zcld.chat.zalo.me/cloudmedia/x"));
         assert!(!is_api_url("https://static.zalo.me/app.css"));
         assert!(!is_api_url("https://example.com/a/get-last-msgs"));
+    }
+
+    // --- C3 (batch 3): the real web API host shapes ------------------------
+
+    #[test]
+    fn api_url_matches_wpa_chat_hosts() {
+        // Real host shapes (audit endpoint list), fake paths: hosts are
+        // `tt-*-wpa.chat.zalo.me` with paths under `/api/…`. The old
+        // predicate only caught these when a path substring happened
+        // to match (`-wpa.api` vs `-wpa.chat`), so whole endpoint
+        // families were invisible.
+        for ok in [
+            "https://tt-chat2-wpa.chat.zalo.me/api/p/get-last-msgs",
+            "https://tt-group-wpa.chat.zalo.me/api/group/getmg-v2",
+            "https://tt-profile-wpa.chat.zalo.me/api/getprofiles/v2",
+            "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers",
+            // Widened: ANY /api/ path on a -wpa./wpa. zalo.me host.
+            "https://tt-chat2-wpa.chat.zalo.me/api/some/other/call",
+            "https://wpa.chat.zalo.me/api/x",
+        ] {
+            assert!(is_api_url(ok), "{ok}");
+        }
+        // Static/CDN hosts never match — the body fetch costs a CDP
+        // round trip and static bytes are worthless rows.
+        for bad in [
+            "https://stc-fake.zdn.vn/app.css",          // zdn.vn: not an API host at all
+            "https://stc-fake.zadn.vn/media/img.jpg",   // zadn.vn image CDN
+            "https://fake.zadn.vn/media/x.jpg",
+            "https://tt-chat2-wpa.chat.zalo.me/static/x.js", // wpa host, non-api path
+            "https://tt-chat2-wpa.chat.zalo.me/api2/x",      // /api2 is not /api/
+        ] {
+            assert!(!is_api_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_zalo_me_bucket() {
+        // The unmatched bucket counts only *.zalo.me hosts — never the
+        // host value itself.
+        assert!(host_is_zalo_me("https://tt-chat2-wpa.chat.zalo.me/api/x"));
+        assert!(host_is_zalo_me("https://anything.zalo.me/"));
+        assert!(!host_is_zalo_me("https://stc-fake.zadn.vn/a.jpg"));
+        assert!(!host_is_zalo_me("https://example.com/x"));
+        assert!(!host_is_zalo_me("not a url"));
+    }
+
+    // --- C1 (batch 3): getResponseBody completion parsing ------------------
+
+    #[test]
+    fn get_response_body_bare_and_wrapped() {
+        // Bare return object — what WebView2's CallDevToolsProtocolMethod
+        // completion actually passes for getResponseBody (no `result`
+        // wrapper; the old code read v["result"] and dropped every body).
+        assert_eq!(
+            parse_get_response_body(r#"{"body":"hello","base64Encoded":false}"#).unwrap(),
+            b"hello".to_vec()
+        );
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"payload bytes");
+        assert_eq!(
+            parse_get_response_body(&format!(r#"{{"body":"{b64}","base64Encoded":true}}"#))
+                .unwrap(),
+            b"payload bytes".to_vec()
+        );
+        // Defensively: a {"result":{…}} wrapper (Runtime.evaluate
+        // shape) is also accepted, both base64 and text.
+        assert_eq!(
+            parse_get_response_body(&format!(
+                r#"{{"result":{{"body":"{b64}","base64Encoded":true}}}}"#
+            ))
+            .unwrap(),
+            b"payload bytes".to_vec()
+        );
+        assert_eq!(
+            parse_get_response_body(r#"{"result":{"body":"x","base64Encoded":false}}"#).unwrap(),
+            b"x".to_vec()
+        );
+        // base64Encoded omitted defaults to text.
+        assert_eq!(parse_get_response_body(r#"{"body":"plain"}"#).unwrap(), b"plain".to_vec());
+    }
+
+    #[test]
+    fn get_response_body_error_variants() {
+        assert_eq!(parse_get_response_body("not json"), Err(BodyErr::NotJson));
+        assert_eq!(parse_get_response_body(""), Err(BodyErr::NotJson));
+        assert_eq!(parse_get_response_body(r#"{"base64Encoded":false}"#), Err(BodyErr::NoBody));
+        assert_eq!(parse_get_response_body(r#"{"body":42}"#), Err(BodyErr::NoBody));
+        assert_eq!(parse_get_response_body("[]"), Err(BodyErr::NoBody));
+        assert_eq!(
+            parse_get_response_body(r#"{"body":"!!not-b64!!","base64Encoded":true}"#),
+            Err(BodyErr::BadBase64)
+        );
+        assert_eq!(
+            parse_get_response_body(r#"{"body":"","base64Encoded":false}"#),
+            Err(BodyErr::Empty)
+        );
+        assert_eq!(
+            parse_get_response_body(r#"{"body":"","base64Encoded":true}"#),
+            Err(BodyErr::Empty)
+        );
+        // A non-object `result` is not the wrapper: fall back to the
+        // bare object (which has no body).
+        assert_eq!(parse_get_response_body(r#"{"result":5}"#), Err(BodyErr::NoBody));
     }
 }

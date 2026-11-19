@@ -18,6 +18,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -92,6 +93,11 @@ pub fn unwrap_with_label(blob: &[u8], label: &str) -> Result<Vec<u8>, KeyError> 
     unwrap(blob, Some(label))
 }
 
+/// Every connection this module opens waits up to 5 s on a busy DB
+/// instead of failing with SQLITE_BUSY (audit H3 / §1.2: busy_timeout
+/// on every connection; a silent busy error is a silent write loss).
+pub const BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// Open `path` (a SQLCipher DB) with `key` and verify the key is accepted.
 ///
 /// `readonly` uses `SQLITE_OPEN_READ_ONLY` so probes and the import CLI
@@ -109,6 +115,10 @@ pub fn open_with_key_opts(
     };
     let conn = Connection::open_with_flags(path, flags)?;
     apply_key(&conn, key)?;
+    // H3: set the busy timeout right after keying, BEFORE the first
+    // page read, so even the verify query below waits instead of
+    // surfacing SQLITE_BUSY as a hard error.
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     // A wrong key only surfaces on the first page read; force one now.
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
         .map_err(|e| KeyError::Db(format!("key rejected or unreadable DB: {e}")))?;
@@ -133,6 +143,8 @@ pub fn open_with_key_readonly(path: &Path, key: &[u8]) -> Result<Connection, Key
 pub fn open_in_memory(key: &[u8]) -> Result<Connection, KeyError> {
     let conn = Connection::open_in_memory()?;
     apply_key(&conn, key)?;
+    // Same H3 rule as every other connection this module opens.
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     Ok(conn)
 }
 
@@ -241,6 +253,39 @@ fn unwrap(blob: &[u8], _label: Option<&str>) -> Result<Vec<u8>, KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_timeout_set_on_all_open_paths() {
+        // H3/T1: every connection waits up to 5 s instead of erroring
+        // out on SQLITE_BUSY.
+        let key = generate_key().unwrap();
+        let mem = open_in_memory(&key).unwrap();
+        let ms: i64 = mem
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5_000);
+
+        let dir = std::env::temp_dir().join(format!("zalors-bt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        {
+            let conn = open_with_key(&db, &key).unwrap();
+            let ms: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ms, 5_000);
+            conn.execute_batch("CREATE TABLE t (v TEXT)").unwrap();
+        }
+        {
+            let conn = open_with_key_readonly(&db, &key).unwrap();
+            let ms: i64 = conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ms, 5_000);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn key_roundtrip() {

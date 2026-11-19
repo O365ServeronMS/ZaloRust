@@ -44,10 +44,14 @@ pub(crate) fn open_oracle() -> Connection {
     let src = std::env::var_os("ZR_GOLDEN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"D:\.opencode\golden-oracle-2026-11-14"));
+    // Tests run in parallel inside one process: pid + ms alone collided
+    // (two tests copying onto the same open file). Add a counter.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
-        "zr-golden-{}-{}",
+        "zr-golden-{}-{}-{}",
         std::process::id(),
-        schema::now_ms()
+        schema::now_ms(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&tmp).unwrap();
     for f in ["default.db", "default.db-wal", "default.db-shm", "default.key"] {
@@ -175,7 +179,7 @@ fn golden_replay_messages_and_conversations() {
             env,
         });
         if batch.len() >= 500 {
-            let s = pipeline::process_batch(&replay, &batch, 7, own_uid.as_deref());
+            let s = pipeline::process_batch(&replay, &batch, &[], 7, own_uid.as_deref());
             acc.raw_events += s.raw_events;
             acc.messages += s.messages;
             acc.conversations += s.conversations;
@@ -186,7 +190,7 @@ fn golden_replay_messages_and_conversations() {
         }
     }
     if !batch.is_empty() {
-        let s = pipeline::process_batch(&replay, &batch, 7, own_uid.as_deref());
+        let s = pipeline::process_batch(&replay, &batch, &[], 7, own_uid.as_deref());
         acc.raw_events += s.raw_events;
         acc.messages += s.messages;
         acc.conversations += s.conversations;
@@ -266,6 +270,19 @@ fn golden_replay_messages_and_conversations() {
     }
     let convs_missing: Vec<&String> = live_convs.keys().filter(|k| !repl_convs.contains_key(*k)).collect();
     let convs_extra: Vec<&String> = repl_convs.keys().filter(|k| !live_convs.contains_key(*k)).collect();
+    // Conversations the V1 oracle left ORPHANED: a live message points at
+    // them but no live conversations row exists (audit H4-e). The writer
+    // now creates a stub for these on purpose, so they are the only
+    // acceptable `convs_extra`.
+    let live_orphan_convs: std::collections::BTreeSet<&String> = live_msgs
+        .values()
+        .map(|m| &m.conv)
+        .filter(|c| !live_convs.contains_key(*c))
+        .collect();
+    let convs_extra_unexplained = convs_extra
+        .iter()
+        .filter(|c| !live_orphan_convs.contains(**c))
+        .count();
 
     // Diff diagnostics (ids + flags only, never content).
     println!("-- diff details --");
@@ -332,6 +349,8 @@ conversations: missing_in_replay={} extra_in_replay={}",
     //   private conv by uidFrom; the wire truth (idTo = group, type 1)
     //   favors this rebuild's mapping.
     // - `conv_extra -1`: sentinel, now skipped.
+    // - `convs_extra` that are stubs for V1-orphaned live messages (H4-e
+    //   fix, batch 1). Any other extra conversation fails the gate.
     let total = live_msgs.len();
     let ok = missing.is_empty()
         && ts_mismatch == 0
@@ -339,15 +358,17 @@ conversations: missing_in_replay={} extra_in_replay={}",
         && text_regress == 0
         && conv_mismatch <= 2
         && extra.len() <= 2
-        && convs_extra.is_empty();
+        && convs_extra_unexplained == 0;
     println!(
-        "GOLDEN: {} ({}/{} messages exact; known-diffs: conv={} extra={} convs_extra={})",
+        "GOLDEN: {} ({}/{} messages exact; known-diffs: conv={} extra={} convs_extra={} (orphan stubs={}, unexplained={}))",
         if ok { "PASS" } else { "DIFFS" },
         total - missing.len(),
         total,
         conv_mismatch,
         extra.len(),
         convs_extra.len(),
+        convs_extra.len() - convs_extra_unexplained,
+        convs_extra_unexplained,
     );
     // The gate used to only PRINT "DIFFS" and still pass (audit L2).
     assert!(ok, "GOLDEN gate failed — see diff details above");

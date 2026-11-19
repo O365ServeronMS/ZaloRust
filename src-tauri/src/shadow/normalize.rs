@@ -70,10 +70,10 @@ pub fn normalize_ws(env: &Value, own_uid: Option<&str>) -> Vec<Write> {
         return out;
     };
     for (key, is_group) in [
-        ("msgs", false),
-        ("groupMsgs", true),
-        ("pageMsgs", false),
-        ("eeMsgs", false),
+        ("msgs", Some(false)),
+        ("groupMsgs", Some(true)),
+        ("pageMsgs", Some(false)),
+        ("eeMsgs", Some(false)),
     ] {
         let Some(arr) = data.get(key).and_then(Value::as_array) else {
             continue;
@@ -130,9 +130,12 @@ pub fn normalize_rest(endpoint: &str, env: &Value, own_uid: Option<&str>) -> Vec
                 }
             }
         }
-        for (key, is_group) in
-            [("msgs", false), ("groupMsgs", true), ("pageMsgs", false), ("eeMsgs", false)]
-        {
+        for (key, is_group) in [
+            ("msgs", Some(false)),
+            ("groupMsgs", Some(true)),
+            ("pageMsgs", Some(false)),
+            ("eeMsgs", Some(false)),
+        ] {
             let Some(arr) = data.get(key).and_then(Value::as_array) else {
                 continue;
             };
@@ -241,13 +244,22 @@ fn key_shaped(v: &Value, depth: u32) -> bool {
 
 /// Map one E2EE plaintext message forwarded by the bridge tap.
 /// `m` is the decrypted message object; `source` is always `e2ee`.
+/// The bridge payload carries no group context on its own (no
+/// envelope array key, no `isGroup` field) — the stub marker stays
+/// `None` (B5), and the conversation id keeps the 1-1 logic.
 pub fn normalize_e2ee_message(m: &Value, own_uid: Option<&str>) -> Option<Write> {
-    message_to_write(m, false, "e2ee", own_uid)
+    message_to_write(m, None, "e2ee", own_uid)
 }
 
 fn message_to_write(
     m: &Value,
-    is_group: bool,
+    // `Some(true)` for the `groupMsgs` array, `Some(false)` for the
+    // 1-1 arrays (`msgs`/`pageMsgs`/`eeMsgs`); `None` when the source
+    // does not say (bridge E2EE). Drives BOTH the conversation-id
+    // logic and the stub conversation type (B5: `Some(true)` -> the
+    // writer's stub is `type 1`; Conversation/Group writes still
+    // refine it later).
+    is_group: Option<bool>,
     source: &'static str,
     own_uid: Option<&str>,
 ) -> Option<Write> {
@@ -257,7 +269,7 @@ fn message_to_write(
     // the other party (uidFrom for incoming, idTo for send-to-me echoes).
     let uid_from = obj.get("uidFrom").and_then(Value::as_str);
     let id_to = obj.get("idTo").and_then(Value::as_str);
-    let conv_id = if is_group {
+    let conv_id = if is_group == Some(true) {
         id_to?.to_string()
     } else {
         match (uid_from, id_to) {
@@ -301,13 +313,42 @@ fn message_to_write(
         text,
         payload: compact(m),
         source,
+        is_group,
     })
 }
 
 /// Stable numeric codes for `messages.type` (app-local convention, kept
 /// identical across runs; the original string stays in payload_json).
+///
+/// H1 (batch 2): the REAL wire strings — `webchat`, `chat.photo`,
+/// `chat.video.msg`, `share.file`, `chat.sticker`, `chat.recommended`,
+/// `chat.delete`, `chat.webcontent` (measured on the live DB, audit
+/// §2-H1) — map first; the V1-era strings (`text`, `photo`, …) keep
+/// the SAME codes so pre-rebuild rows stay comparable. Plausible
+/// not-yet-seen shapes (`chat.voice`, `chat.gif`, `chat.doodle`,
+/// `chat.location.new`, `chat.link`) get their own codes up front so
+/// they never pool in the 100 bucket. `chat.recommended` is a
+/// link/call card, NOT media (7). Unknown strings still land in 100 —
+/// the audit's "type=100 chỉ còn msgType thật sự lạ" gate depends on
+/// that signal staying honest.
 pub fn msg_type_code(t: &str) -> i64 {
     match t {
+        // Real wire shapes (H1).
+        "webchat" => 1,
+        "chat.photo" => 2,
+        "chat.sticker" => 3,
+        "share.file" => 4,
+        "chat.voice" => 5,
+        "chat.video.msg" => 6,
+        "chat.recommended" | "chat.link" => 7,
+        "chat.delete" => 8,
+        "chat.webcontent" => 9,
+        "notification" => 10,
+        "chat.gif" => 11,
+        "chat.doodle" => 12,
+        "chat.location.new" => 13,
+        // V1-era strings keep their codes (back-compat with rows the
+        // pre-rebuild writer stored).
         "text" => 1,
         "photo" | "image" => 2,
         "sticker" => 3,
@@ -317,7 +358,6 @@ pub fn msg_type_code(t: &str) -> i64 {
         "link" | "links" => 7,
         "recall" => 8,
         "chatContent" => 9,
-        "notification" => 10,
         _ if t.is_empty() => 0,
         _ => 100,
     }
@@ -425,7 +465,7 @@ mod tests {
         let m = json!({"msgId": "m3", "uidFrom": "8441", "idTo": "0", "ts": 1,
                         "msgType": "text", "content": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaA==",
                         "e2ee": "abc"});
-        let Some(Write::Message { text, payload, .. }) = message_to_write(&m, false, "capture", None)
+        let Some(Write::Message { text, payload, .. }) = message_to_write(&m, Some(false), "capture", None)
         else {
             panic!()
         };
@@ -508,5 +548,109 @@ mod tests {
         big.push_str(&(0..500).map(|i| format!(r#""{i}":1"#)).collect::<Vec<_>>().join(","));
         big.push_str("}}");
         assert_eq!(e2ee_admit(&big).unwrap_err(), E2eeRefusal::KeyShaped);
+    }
+
+    // --- Batch 2 (H1 / B5) -------------------------------------------------
+
+    #[test]
+    fn msg_type_table_maps_wire_and_v1_strings() {
+        // Real wire shapes (H1, measured on the live DB) + plausible
+        // not-yet-seen ones, with the V1-era strings mapped to the SAME
+        // codes for back-compat. Unknown strings stay in the 100 bucket
+        // (the "type=100 only for genuinely unknown msgType" gate).
+        let table = [
+            ("webchat", 1i64),
+            ("text", 1),
+            ("chat.photo", 2),
+            ("photo", 2),
+            ("image", 2),
+            ("chat.sticker", 3),
+            ("sticker", 3),
+            ("share.file", 4),
+            ("file", 4),
+            ("chat.voice", 5),
+            ("voice", 5),
+            ("chat.video.msg", 6),
+            ("video", 6),
+            ("chat.recommended", 7),
+            ("chat.link", 7),
+            ("link", 7),
+            ("links", 7),
+            ("chat.delete", 8),
+            ("recall", 8),
+            ("chat.webcontent", 9),
+            ("chatContent", 9),
+            ("notification", 10),
+            ("chat.gif", 11),
+            ("chat.doodle", 12),
+            ("chat.location.new", 13),
+            ("", 0),
+            ("something.brandnew", 100),
+        ];
+        for (s, code) in table {
+            assert_eq!(msg_type_code(s), code, "msgType {s:?}");
+        }
+    }
+
+    #[test]
+    fn original_msg_type_stays_in_payload_and_kind_follows_table() {
+        // message_to_write stores the WHOLE message object, so the
+        // wire string must survive in payload_json (B1 "already the
+        // case" — verified here, no extra column needed).
+        let m = json!({"msgId": "mw", "uidFrom": "u1", "idTo": "u2", "ts": 1,
+                        "msgType": "chat.photo", "content": {"href": "https://fake-photo-stal.zdn.vn/x.jpg"}});
+        let Some(Write::Message { kind, payload, .. }) = message_to_write(&m, Some(true), "capture", None)
+        else {
+            panic!()
+        };
+        assert_eq!(kind, 2, "chat.photo -> table code 2");
+        assert!(payload.contains("\"msgType\":\"chat.photo\""), "wire string stays in payload_json");
+        // The recall strings keep their type-8 alignment with
+        // writer::is_recall_msg (no change needed there).
+        let d = json!({"msgId": "md", "uidFrom": "u1", "idTo": "u2", "ts": 1,
+                        "msgType": "chat.delete", "content": ""});
+        let Some(Write::Message { kind, .. }) = message_to_write(&d, None, "e2ee", None) else {
+            panic!()
+        };
+        assert_eq!(kind, 8);
+        // Unknown strings land in 100, empty in 0.
+        assert_eq!(msg_type_code("chat.brand.new"), 100);
+        assert_eq!(msg_type_code(""), 0);
+    }
+
+    #[test]
+    fn group_marker_flows_from_the_envelope_arrays() {
+        // B5: groupMsgs -> Some(true) (conv = idTo, stub type 1), the
+        // 1-1 arrays -> Some(false).
+        let env = json!({
+            "cmd": 2, "subCmd": 1,
+            "data": { "data": {
+                "msgs": [{"msgId": "k1", "uidFrom": "u1", "idTo": "0", "ts": 1,
+                          "msgType": "text", "content": "a"}],
+                "groupMsgs": [{"msgId": "k2", "uidFrom": "u1", "idTo": "4945066207717951086", "ts": 1,
+                                "msgType": "text", "content": "b"}]
+            }}
+        });
+        let out = normalize_ws(&env, None);
+        match (&out[0], &out[1]) {
+            (
+                Write::Message { is_group: one, conv_id: c1, .. },
+                Write::Message { is_group: grp, conv_id: c2, .. },
+            ) => {
+                assert_eq!(*one, Some(false));
+                assert_eq!(*grp, Some(true));
+                assert_eq!(c1, "u1");
+                assert_eq!(c2, "4945066207717951086", "group conv is idTo");
+            }
+            _ => panic!(),
+        }
+        // The bridge E2EE payload carries no group context -> None
+        // (B5: honest unknown; conv id keeps the 1-1 logic).
+        let plain = json!({"msgId": "k3", "uidFrom": "u1", "idTo": "0", "ts": 1,
+                            "msgType": "webchat", "content": "c"});
+        let Some(Write::Message { is_group, .. }) = normalize_e2ee_message(&plain, None) else {
+            panic!()
+        };
+        assert_eq!(is_group, None);
     }
 }

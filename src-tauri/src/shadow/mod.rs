@@ -33,6 +33,8 @@
 //!   - `runtime` — process-wide state, delivery from IPC + capture
 //!   - `cli`     — `zalors import` entry (P2)
 //!   - `import`  — Zalo Desktop DB import (P2)
+//!   - `repair`  — one-time v1 data repair (maintenance only, never
+//!     called from runtime)
 
 pub mod capture;
 pub mod cli;
@@ -40,6 +42,11 @@ pub mod import;
 pub mod media;
 pub mod normalize;
 pub mod pipeline;
+/// One-time v1 data repair (audit T8). Maintenance/tests ONLY — never
+/// called from `runtime` or startup.
+pub mod repair;
+/// REST capture stage counters (audit H2 / batch 3 C2).
+pub mod rest_stats;
 pub mod runtime;
 pub mod schema;
 pub mod wire;
@@ -94,6 +101,13 @@ pub enum Write {
         payload: String,
         /// 'capture' | 'e2ee' | 'import'
         source: &'static str,
+        /// Stub conversation type hint (B5): `Some(true)` when the
+        /// envelope says the message is a group one (`groupMsgs`),
+        /// `Some(false)` for the 1-1 arrays, `None` when the source
+        /// does not say (bridge E2EE payload). The writer creates the
+        /// stub as `type 1` only for `Some(true)`; Conversation/Group
+        /// writes still refine the type later.
+        is_group: Option<bool>,
     },
     /// An edit/recall/delete revision observed for an existing message.
     Revision {

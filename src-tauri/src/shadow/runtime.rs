@@ -16,6 +16,8 @@
 //!   `shadow_e2ee_message`, ACL chat.zalo.me, 512 KB cap).
 //! - `set_rest_key` — the bridge handshake (`shadow_handshake`) handing
 //!   over the page's REST decode key; it lives in RAM only.
+//! - `Job::MediaDone` — the media thread's download outcomes (T3/A5:
+//!   the media connection is READ-ONLY; only the flusher writes).
 //!
 //! The WS per-connection AES key is harvested from frame `cmd=1 subCmd=1`
 //! the same way and never touches disk (redacted before `raw_events`).
@@ -27,7 +29,9 @@ use std::time::Duration;
 use serde_json::Value;
 use tauri::Manager;
 
-use super::{pipeline, schema, wire};
+use super::pipeline;
+use super::rest_stats::{self, RestStage};
+use super::{schema, wire, writer};
 use crate::migrate::sqlcipher;
 use crate::settings::{ShadowSettings, Settings};
 
@@ -36,11 +40,15 @@ pub struct Shadow {
     tx: Sender<Job>,
 }
 
-enum Job {
+/// Jobs on the single writer queue. `MediaDone` carries the media
+/// thread's download outcomes back to the flusher (T3/A5: the media
+/// thread holds a READ-ONLY connection and never writes the DB itself).
+pub(crate) enum Job {
     WsFrame { bytes: Vec<u8>, direction: &'static str },
     RestBody { endpoint: String, body: Vec<u8>, direction: &'static str },
     E2ee { payload: String },
     Handshake { key_b64: String, uid: Option<String> },
+    MediaDone { rowid: i64, outcome: writer::MediaOutcome },
 }
 
 impl Job {
@@ -50,6 +58,7 @@ impl Job {
             Job::RestBody { .. } => "rest",
             Job::E2ee { .. } => "e2ee",
             Job::Handshake { .. } => "handshake",
+            Job::MediaDone { .. } => "media",
         }
     }
 }
@@ -88,9 +97,12 @@ pub fn start(app: &tauri::AppHandle) {
                 .name("shadow-flusher".into())
                 .spawn(move || flusher(conn, rx, s.shadow))
                 .ok();
+            let media_tx = tx.clone();
             app.manage(Shadow { tx });
-            // P1b: media auto-download (own connection, rate-limited).
-            super::media::start(dir.clone(), media_cfg);
+            // P1b/T3: media auto-download on a READ-ONLY connection;
+            // every status flip it triggers flows back through the same
+            // job queue so the flusher stays the only DB writer.
+            super::media::start(dir.clone(), media_cfg, media_tx);
             crate::dlog::log("shadow: pipeline started (capture mode cdp)");
         }
         Err(e) => {
@@ -115,6 +127,9 @@ fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<rusqlite::Connection, 
         Ok(conn)
     } else {
         let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        // H3: every connection waits instead of erroring on a busy DB.
+        conn.busy_timeout(Duration::from_millis(sqlcipher::BUSY_TIMEOUT_MS))
+            .map_err(|e| e.to_string())?;
         schema::apply(&conn).map_err(|e| e.to_string())?;
         Ok(conn)
     }
@@ -141,6 +156,9 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
         }
         // Handshakes first (they arm the decode keys for the rest).
         let mut items: Vec<pipeline::Incoming> = Vec::with_capacity(jobs.len());
+        // T3: media outcomes are applied inside the same batch
+        // transaction (the flusher is the single writer).
+        let mut media: Vec<(i64, writer::MediaOutcome)> = Vec::new();
         for job in jobs {
             match job {
                 Job::Handshake { key_b64, uid } => {
@@ -179,9 +197,19 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
                 Job::RestBody { endpoint, body, direction } => {
                     let outer: Value = match serde_json::from_slice(&body) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(_) => {
+                            // C2 (batch 3): this used to `continue`
+                            // silently — audit H2 had no way to tell
+                            // which stage dropped the bodies. Counted,
+                            // never logged per item.
+                            rest_stats::bump(RestStage::OuterJsonErr);
+                            continue;
+                        }
                     };
                     let env = wire::rest_envelope(&endpoint, &outer, rest_key.as_ref());
+                    // C2: decoded / undecoded / no-key buckets from the
+                    // envelope's `undecoded` flag (counts only).
+                    rest_stats::bump_rest_decode(&outer, &env);
                     items.push(pipeline::Incoming {
                         kind: "rest",
                         direction,
@@ -200,16 +228,29 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
                         env: v,
                     });
                 }
+                Job::MediaDone { rowid, outcome } => media.push((rowid, outcome)),
             }
         }
-        if items.is_empty() {
+        if items.is_empty() && media.is_empty() {
             continue;
         }
-        let s = pipeline::process_batch(&conn, &items, cfg.raw_events_days, own_uid.as_deref());
+        let s = pipeline::process_batch(&conn, &items, &media, cfg.raw_events_days, own_uid.as_deref());
         if s.raw_events > 0 {
             crate::dlog::log(&format!(
                 "shadow batch: raw={} msgs={} convs={} groups={} contacts={} other={}",
                 s.raw_events, s.messages, s.conversations, s.groups, s.contacts, s.other_writes
+            ));
+        }
+        // T2/H3: per-item write failures are no longer swallowed — log
+        // the count and the failing write kind + rusqlite error code
+        // only (no SQL params, no payload, ever). F3: the kinds are
+        // aggregated (kind → count), so even a 500-failure batch logs
+        // one bounded line.
+        if s.write_errors > 0 {
+            crate::dlog::log(&format!(
+                "shadow write errors: {} (kinds: {})",
+                s.write_errors,
+                s.format_error_kinds()
             ));
         }
     }

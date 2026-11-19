@@ -287,6 +287,17 @@ fn truncate_str(s: &str) -> String {
 }
 
 /// Minimal percent-decoder (no allocation for unreserved input).
+///
+/// C5 (batch 3): a literal `+` is NOT mapped to space. Every caller
+/// feeds the result straight into base64 (`decode_gcm_gzip`,
+/// `decode_rest_body`) and the base64 alphabet has no space — so a
+/// literal `+` in these payloads is always a real base64 char. A
+/// percent-encoder escapes `+` to `%2B` anyway, so no legitimate
+/// percent-encoded input loses meaning; meanwhile RAW base64 bodies
+/// (no percent-encoding, `+` and `/` literal) keep decrypting instead
+/// of failing on a corrupted string (audit §2-H2 risk note). The
+/// `+`→space convention belongs to form-urlencoded query strings;
+/// neither REST response bodies nor WS `encrypt=2` frames are one.
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -301,11 +312,7 @@ pub fn percent_decode(s: &str) -> String {
                 continue;
             }
         }
-        if b[i] == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(b[i]);
-        }
+        out.push(b[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -468,5 +475,48 @@ mod tests {
         assert_eq!(percent_decode("a%2Bb%3Dc"), "a+b=c");
         assert_eq!(percent_decode("no-escapes"), "no-escapes");
         assert_eq!(percent_decode("bad%zz"), "bad%zz");
+        // C5: a literal `+` survives — both callers feed base64, whose
+        // alphabet has no space, so the old `+`->space mapping could
+        // only corrupt.
+        assert_eq!(percent_decode("a+b/c=="), "a+b/c==");
+        assert_eq!(percent_decode("+"), "+");
+    }
+
+    #[test]
+    fn rest_raw_base64_with_plus_and_slash_roundtrips() {
+        // C5: pin that a cipher whose base64 carries literal `+` and
+        // `/` decodes BOTH as raw base64 (no percent-encoding — the
+        // shape the live web client most plausibly sends) and in the
+        // percent-encoded form. The old `+`->space mapping made the
+        // raw form fail decryption; base64 has no spaces, so it can
+        // never be right for these payloads.
+        let key = [0x33u8; 16];
+        let iv = [0u8; 16];
+        // Find a small payload whose ciphertext base64 visibly carries
+        // both a `+` and a `/` (a handful of tries at most — each
+        // ciphertext is fresh AES output).
+        let (raw_b64, n): (String, u64) = {
+            let mut i = 0u64;
+            loop {
+                let enc = Aes128CbcEnc::new_from_slices(&key, &iv).unwrap();
+                let inner = serde_json::to_vec(&json!({"error_code": 0, "data": {"n": i}})).unwrap();
+                let ct = enc.encrypt_padded_vec_mut::<Pkcs7>(&inner);
+                let b64 = B64.encode(&ct);
+                if b64.contains('+') && b64.contains('/') {
+                    break (b64, i);
+                }
+                i += 1;
+            }
+        };
+        assert!(raw_b64.contains('+') && raw_b64.contains('/'), "{raw_b64}");
+        // Raw form: base64 with literal + and / must survive untouched.
+        let outer = json!({"error_code": 0, "data": raw_b64});
+        let env = rest_envelope("https://wpa.chat.zalo.me/a/get-last-msgs", &outer, Some(&key));
+        assert_eq!(env["data"]["n"], n, "raw base64 with + and / must decode");
+        // The percent-encoded form of the SAME ciphertext also decodes.
+        let pct = percent_encode_b64(&raw_b64);
+        let outer2 = json!({"error_code": 0, "data": pct});
+        let env2 = rest_envelope("https://wpa.chat.zalo.me/a/get-last-msgs", &outer2, Some(&key));
+        assert_eq!(env2["data"]["n"], n);
     }
 }

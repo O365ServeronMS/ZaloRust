@@ -70,12 +70,12 @@ CREATE TABLE IF NOT EXISTS message_revisions (
 CREATE TABLE IF NOT EXISTS attachments (
   msg_id     TEXT NOT NULL,
   idx        INTEGER NOT NULL,
-  kind       TEXT,                        -- image | video | file | voice | sticker
+  kind       TEXT,                        -- image | video | file | voice
   url        TEXT,                        -- lazy download
-  local_path TEXT,
+  local_path TEXT,                        -- RELATIVE to the media root: ab/cd/<sha> (KQ9)
   size       INTEGER,
   sha256     TEXT,
-  status     TEXT NOT NULL DEFAULT 'ref', -- ref | downloaded | failed
+  status     TEXT NOT NULL DEFAULT 'ref', -- ref | downloaded | failed | ref-encrypted (B4/KQ1)
   PRIMARY KEY (msg_id, idx)
 );
 CREATE TABLE IF NOT EXISTS contacts (
