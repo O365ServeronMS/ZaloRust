@@ -1,12 +1,12 @@
 //! Recent-events census: which cmds landed, and what cmd 551 carries.
 use serde_json::Value;
 
-use super::golden::open_live;
+use super::probe_util::open_copy;
 
 #[test]
 #[ignore]
 fn probe_recent_cmds() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     // Anything from the last 2 hours (runtime ts base ~1795076500000).
     let cutoff: i64 = 1795076000000;
     let mut st = live

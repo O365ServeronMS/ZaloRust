@@ -1,7 +1,7 @@
 //! Focused shape probe for normalize debugging (values never printed).
 use serde_json::Value;
 
-use super::golden::open_live;
+use super::probe_util::open_copy;
 use crate::migrate::sqlcipher;
 
 fn shape(v: &Value, depth: usize) -> String {
@@ -30,7 +30,7 @@ fn shape(v: &Value, depth: usize) -> String {
 #[test]
 #[ignore]
 fn probe_shapes() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     // 1. One message payload_json: field names/types.
     {
         let mut st = live

@@ -100,6 +100,11 @@ mod account_path_tests {
 #[cfg(test)]
 mod golden;
 
+/// Probe access to the live DB always goes through a temp COPY (audit
+/// M2-6: a READ_ONLY WAL connection still touches the live `-shm`).
+#[cfg(test)]
+mod probe_util;
+
 #[cfg(test)]
 mod probe_shapes;
 
@@ -212,6 +217,16 @@ mod probe_551;
 
 #[cfg(test)]
 mod probe_audit;
+
+/// Coverage probe (audit §4 item 1.5 AC iii): re-run the pipeline's
+/// normalizer over stored raw_events and anti-join against messages.
+#[cfg(test)]
+mod probe_coverage;
+
+/// Maintenance probe (audit §1.2 migration, E4): repair_v1 dry-run +
+/// real run against a temp COPY of the live store — never the live DB.
+#[cfg(test)]
+mod maint_repair;
 
 #[cfg(test)]
 mod maint_purge;

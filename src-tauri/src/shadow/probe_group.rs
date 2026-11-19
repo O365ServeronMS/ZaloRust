@@ -1,12 +1,12 @@
 //! Targeted group-message field probe (ids/keys only).
 use serde_json::Value;
 
-use super::golden::open_live;
+use super::probe_util::open_copy;
 
 #[test]
 #[ignore]
 fn probe_group_fields() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     // 1. The message the old code mapped to a different conv.
     for msg_id in ["8486229703394", "8484506616301", "8482383933793"] {
         let mut st = live

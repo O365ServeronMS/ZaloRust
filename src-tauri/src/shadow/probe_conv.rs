@@ -1,10 +1,10 @@
 //! Final discriminator: conv types + per-conv message counts.
-use super::golden::open_live;
+use super::probe_util::open_copy;
 
 #[test]
 #[ignore]
 fn probe_conv_types() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     for id in ["3488546127013384456", "4006768326137472507", "5162217022126664898", "4807758009819181785", "-1"] {
         let row: Option<(i64, i64, Option<String>)> = live
             .query_row(

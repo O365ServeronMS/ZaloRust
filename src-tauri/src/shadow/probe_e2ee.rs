@@ -6,11 +6,7 @@
 #[test]
 #[ignore]
 fn probe_e2ee_plain() {
-    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap())
-        .join("com.o365serveronms.zalors/shadow");
-    let key = crate::migrate::sqlcipher::load_key(&crate::shadow::key_file(&dir)).unwrap();
-    let conn = crate::migrate::sqlcipher::open_with_key_readonly(&crate::shadow::db_file(&dir), &key)
-        .unwrap();
+    let (conn, _tmp) = super::probe_util::open_copy();
     let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     println!(
         "e2ee_total={} plaintext(source=e2ee)={} with_text={} cipher_only={} messages_total={} convs_total={} raw_events={}",

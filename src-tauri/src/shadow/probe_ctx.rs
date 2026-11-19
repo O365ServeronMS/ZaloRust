@@ -1,12 +1,12 @@
 //! Probe: full key set + array name for the diff messages.
 use serde_json::Value;
 
-use super::golden::open_live;
+use super::probe_util::open_copy;
 
 #[test]
 #[ignore]
 fn probe_array_context() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     for msg_id in ["8486229703394", "8484506616301", "8482383933793"] {
         let mut st = live
             .prepare("SELECT kind, payload_json FROM raw_events WHERE payload_json LIKE ?1 LIMIT 5")

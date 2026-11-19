@@ -2,12 +2,15 @@
 //! labels, JSON key NAMES and json types. Never prints message content,
 //! urls, ids of people, keys or tokens.
 //!
+//! Opens a temp COPY of the live DB (batch 5 E0, M2-6: a READ_ONLY WAL
+//! connection still touches the live `-shm`).
+//!
 //! Run: cargo test --lib probe_audit -- --ignored --nocapture
 
 #[test]
 #[ignore]
 fn probe_audit_shapes() {
-    let conn = super::golden::open_live();
+    let (conn, _tmp) = super::probe_util::open_copy();
     let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
 
     println!("== messages.type x payload.msgType x typeof(content) ==");
@@ -130,7 +133,7 @@ fn probe_audit_shapes() {
 #[test]
 #[ignore]
 fn probe_audit_deep() {
-    let conn = super::golden::open_live();
+    let (conn, _tmp) = super::probe_util::open_copy();
     let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
     let rows = |sql: &str| -> Vec<String> {
         let mut st = conn.prepare(sql).unwrap();

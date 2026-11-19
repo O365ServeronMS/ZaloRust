@@ -574,7 +574,10 @@ impl Drop for TempGuard {
 /// (`RIFF`…`WEBP` at offset 8); `video` must be MP4/MOV (`ftyp` at
 /// offset 4) or WEBM (`1A 45 DF A3`). Files/voice and unknown kinds
 /// are not sniffed (a mismatch there means nothing).
-fn magic_ok(kind: Option<&str>, head: &[u8]) -> bool {
+///
+/// `pub(crate)`: the attachments probe (probe_attach, batch 5 E2)
+/// reuses the SAME sniff to verify what the store already holds.
+pub(crate) fn magic_ok(kind: Option<&str>, head: &[u8]) -> bool {
     match kind {
         Some("image") => {
             head.starts_with(&[0xFF, 0xD8, 0xFF])

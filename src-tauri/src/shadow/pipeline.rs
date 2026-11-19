@@ -179,6 +179,27 @@ fn count_aborted(
     s.zero_success();
 }
 
+/// The kind -> normalizer dispatch — the ONE place that decides which
+/// normalizer runs for one decoded envelope. `process_batch` routes
+/// every item through this, and the coverage probe re-runs exactly
+/// this over stored payloads, so the probe's msg-id census can never
+/// drift from what the pipeline would have written.
+pub fn normalize_kind(
+    kind: &str,
+    endpoint: &str,
+    env: &Value,
+    own_uid: Option<&str>,
+) -> Vec<Write> {
+    match kind {
+        "ws" => normalize::normalize_ws(env, own_uid),
+        "rest" => normalize::normalize_rest(endpoint, env, own_uid),
+        "e2ee" => normalize::normalize_e2ee_message(env, own_uid)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Run one batch: store the raw envelopes, normalize them to writes,
 /// apply the writes and any media outcomes, trim the ring — all inside
 /// a single `BEGIN IMMEDIATE … COMMIT`. `own_uid` substitutes self-sent
@@ -223,14 +244,7 @@ pub fn process_batch(
                 }
             }
         }
-        let writes = match item.kind {
-            "ws" => normalize::normalize_ws(&item.env, own_uid),
-            "rest" => normalize::normalize_rest(&item.endpoint, &item.env, own_uid),
-            "e2ee" => normalize::normalize_e2ee_message(&item.env, own_uid)
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
-        };
+        let writes = normalize_kind(item.kind, &item.endpoint, &item.env, own_uid);
         for (j, w) in writes.iter().enumerate() {
             match apply_item(conn, w) {
                 Ok(tag) => s.add_write(tag),
@@ -284,6 +298,40 @@ mod tests {
         let conn = sqlcipher::open_in_memory(&key).unwrap();
         schema::apply(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn normalize_kind_dispatches_the_three_kinds_and_nothing_else() {
+        // The shared dispatch (E1): ws/rest/e2ee route to their
+        // normalizer exactly as `process_batch` does; unknown kinds
+        // (e.g. the legacy 'ws-open' rows) yield nothing.
+        let ws = serde_json::json!({
+            "cmd": 2, "subCmd": 1,
+            "data": { "data": { "msgs": [
+                {"msgId": "k1", "uidFrom": "u1", "idTo": "0", "ts": 1, "msgType": "text", "content": "x"}
+            ]}}
+        });
+        assert!(matches!(
+            normalize_kind("ws", "", &ws, None).first(),
+            Some(Write::Message { msg_id, .. }) if msg_id == "k1"
+        ));
+        let rest = serde_json::json!({
+            "error_code": 0,
+            "data": { "clearUnreads": [{"idTo": "u9", "isGroup": false, "lastMsgId": "m1"}] }
+        });
+        assert!(matches!(
+            normalize_kind("rest", "https://w/a/preloadconvers/get-last-msgs", &rest, None).first(),
+            Some(Write::Conversation { id, .. }) if id == "u9"
+        ));
+        let e2ee = serde_json::json!({
+            "msgId": "k3", "uidFrom": "u1", "idTo": "u2", "ts": 1, "msgType": "webchat", "content": "c"
+        });
+        assert!(matches!(
+            normalize_kind("e2ee", "e2ee:bridge", &e2ee, None).first(),
+            Some(Write::Message { msg_id, .. }) if msg_id == "k3"
+        ));
+        assert!(normalize_kind("ws-open", "", &ws, None).is_empty());
+        assert!(normalize_kind("rest", "https://w/a/group/getmg-v2", &serde_json::json!({}), None).is_empty());
     }
 
     #[test]

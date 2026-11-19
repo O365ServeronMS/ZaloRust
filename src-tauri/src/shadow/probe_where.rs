@@ -1,12 +1,12 @@
 //! Where do E2EE messages live on the wire? Census of e2ee markers.
 use serde_json::Value;
 
-use super::golden::open_live;
+use super::probe_util::open_copy;
 
 #[test]
 #[ignore]
 fn probe_e2ee_where() {
-    let live = open_live();
+    let (live, _tmp) = open_copy();
     // 1. cmds that carried the 5 known E2EE messages (old data).
     let mut st = live
         .prepare("SELECT kind, endpoint, payload_json FROM raw_events WHERE payload_json LIKE '%\"e2ee\":\"%' LIMIT 40")
