@@ -8,6 +8,10 @@ Hướng dẫn cho AI agent (GLM, Claude, Codex…) làm việc trong repo này.
 App chỉ nạp trang chính thức `https://chat.zalo.me` trong webview của hệ thống (WebView2 trên Windows),
 rồi chèn thêm JS để có tray, badge, thông báo native, đa tài khoản, khoá app, proxy, tải file, tự cập nhật.
 
+**Shadow DB** (đang làm trên nhánh `feat/shadow-db-rebuild`): ghi lại lịch sử Zalo **của chính người dùng**
+vào một kho mã hoá trên máy (SQLCipher + kho media), để lưu trữ dài hạn, tìm kiếm và backup.
+Kiến trúc đã được người dùng chốt trong `docs/shadow-architecture.md`. Mục 5b bên dưới là tóm tắt bắt buộc.
+
 - **Nền tảng chính: Windows 10/11.** CI chỉ chạy trên Windows. Trong code có nhánh macOS/Linux
   (`#[cfg(...)]`, Flatpak), giữ cho chúng biên dịch được nhưng không cần thêm tính năng cho chúng.
 - Không liên kết với VNG/Zalo. Không bao giờ thêm logo, tên miền hay nội dung gây hiểu là app chính thức.
@@ -28,6 +32,9 @@ rồi chèn thêm JS để có tray, badge, thông báo native, đa tài khoản
 | `settings-ui/vi.json` | **Nguồn duy nhất** của bản dịch tiếng Việt (khoá = câu tiếng Anh). Rust `include_str!` file này. |
 | `settings-ui/vi.js` | Sinh ra từ `vi.json` bằng `node scripts/gen-vi.mjs`. **Không sửa tay.** |
 | `scripts/` | Công cụ phát triển: sinh `vi.js`, sinh icon, kiểm UI bằng Playwright (`test-ui.ps1`, `test-shell.ps1`, `test-adapter.ps1`). |
+| `src-tauri/src/shadow/` | *(nhánh shadow)* Pipeline shadow DB: `capture.rs` (CDP), `wire.rs` (giải mã WS/REST), `normalize.rs`, `writer.rs`, `pipeline.rs`, `runtime.rs`, `media.rs`, `import.rs`/`cli.rs` (nhập kho Desktop), `golden.rs` + `probe_*.rs` (bộ kiểm hồi quy). |
+| `src-tauri/src/migrate/sqlcipher.rs` | *(nhánh shadow)* Khoá DPAPI và mở SQLCipher. |
+| `docs/shadow-architecture.md` | *(nhánh shadow)* Kiến trúc shadow DB đã chốt: nguyên tắc A1–A8, thứ tự phase, non-goals. |
 | `docs/release-notes/vYYYY.M.D.md` | Ghi chú phát hành, **viết bằng tiếng Việt**. |
 | `flatpak/`, `io.github.o365serveronms.zalors.yml` | Đóng gói Linux. `flatpak/shared-modules` là git submodule, không sửa. |
 | `.github/workflows/` | `check.yml` (kiểm tra mỗi lần push), `windows-build.yml` (phát hành khi có tag), `flatpak.yml`. |
@@ -62,6 +69,15 @@ node settings-ui/notes.test.mjs
 Chạy app khi cần xem tận mắt: `cargo tauri dev` (cần `cargo install tauri-cli --version "^2.0" --locked`).
 Kiểm UI tự động (cần mạng để `npx` tải Playwright): `scripts/test-ui.ps1`, `scripts/test-shell.ps1`, `scripts/test-adapter.ps1`.
 
+Trên nhánh shadow, chạy thêm bộ kiểm hồi quy (xem `docs/shadow-architecture.md` mục 6). Build SQLCipher cần Perl
+trong `PATH`; đường dẫn Perl trên máy này ghi trong file đó.
+
+```powershell
+# Trong src-tauri/
+cargo test --lib golden_replay -- --ignored --nocapture   # phải PASS (số ca ghi trong tài liệu kiến trúc)
+cargo test --lib probe_e2ee    -- --ignored --nocapture   # số đếm phải tăng khi soak
+```
+
 Nếu một lệnh thất bại: sửa nguyên nhân, không tắt lint, không thêm `#[allow(...)]` để né, không xoá test.
 Nếu không chạy được một lệnh (thiếu công cụ, không có mạng), **nói rõ lệnh nào chưa chạy** khi báo cáo.
 
@@ -80,18 +96,53 @@ Nếu không chạy được một lệnh (thiếu công cụ, không có mạng
 ## 5. Các quy tắc không được phá
 
 - **Quyền của trang từ xa phải tối thiểu.** `capabilities/main-remote.json` cố ý **không** cấp `core:default`
-  và chỉ cấp vài command. Không mở rộng quyền cho origin `https://chat.zalo.me` nếu không được yêu cầu rõ.
+  và chỉ cấp vài command (trên nhánh shadow có thêm `allow-shadow-e2ee-message`, `allow-shadow-handshake`).
+  Không mở rộng quyền cho origin `https://chat.zalo.me` nếu không được yêu cầu rõ.
   Thêm command mới → khai báo trong `permissions/app.toml`, gán cho đúng capability, cập nhật `ipc_acl_tests.rs`.
 - **JS chèn vào trang phải kiểm origin.** `bridge.js` và `integration.js` thoát ngay nếu
   `location.origin !== "https://chat.zalo.me"`. Giữ nguyên điều kiện này.
 - **Không phụ thuộc tên class nội bộ của Zalo Web.** Chúng đổi theo từng bản. Ưu tiên selector ổn định,
   API web chuẩn (Notification, title, favicon), và có đường lui khi không tìm thấy phần tử.
-- **Log không bao giờ chứa nội dung tin nhắn, tên liên hệ, số điện thoại, token.** Log ở
-  `%LOCALAPPDATA%\zalo-web\logs\zalors.log` chỉ ghi sự kiện của app.
+- **Log không bao giờ chứa nội dung tin nhắn, tên liên hệ, số điện thoại, token, khoá.** Log ở
+  `%LOCALAPPDATA%\zalo-web\logs\zalors.log` (và `dlog` từ trang) chỉ ghi sự kiện, số đếm, mã lỗi.
+  Nội dung tin nhắn chỉ được nằm trong shadow DB đã mã hoá (mục 5b).
 - **Cập nhật luôn kiểm SHA-256.** Updater tải bản phát hành từ GitHub Releases và đối chiếu file `SHA256SUMS`
   (đúng tên này, không có `.txt`). Không nới lỏng bước kiểm tra.
 - **Mật khẩu khoá app** băm bằng Argon2id (`applock.rs`). Không lưu dạng rõ, không đổi thuật toán.
 - **Không hardcode bí mật** (token, khoá API) vào code hay file cấu hình.
+
+## 5b. Quy tắc shadow DB
+
+Nguồn chính thức là `docs/shadow-architecture.md`. Muốn làm khác điều nào dưới đây → dừng lại, hỏi người dùng,
+và ghi quyết định mới vào file kiến trúc trước khi code.
+
+**Được phép (đã được người dùng duyệt):**
+- Bắt lưu lượng của **chính tài khoản người dùng** trên máy này qua CDP (WS frames, REST bodies) và giải mã trong Rust.
+- Lấy bản rõ tin nhắn E2EE **sau khi chính trang đã giải mã** (bridge tap chỉ đọc).
+- Ghi tin nhắn, hội thoại, media vào shadow DB và kho media trên máy.
+- Nhập (P2) kho của app Zalo Desktop **đã cài trên máy này**, kể cả mở DB local của nó, theo đúng quy trình
+  trong tài liệu (snapshot nguội, `--dry-run` không ghi trước, rồi mới `--apply`).
+
+**Bắt buộc:**
+- **Capture một chiều, chỉ đọc (A1, A2).** Không ghi, không chèn dữ liệu lưu trữ ngược vào giao diện web.
+  Tap phải ném lại lỗi gốc và không đổi luồng chạy của trang.
+- **Kho luôn mã hoá (A3).** SQLCipher, khoá ngẫu nhiên 32 byte bọc bằng DPAPI CurrentUser. Media lưu theo sha256,
+  không đặt tên file theo nội dung rõ.
+- **Khoá chỉ nằm trong RAM (A6).** Khoá WS, khoá REST, khoá DB, cookie, own-uid: không log, không ghi ra file,
+  không đưa vào `raw_events` (phải redact trước), không in ra khi debug, không dán vào báo cáo hay transcript.
+- **Một luồng ghi duy nhất (A5).** Mọi ghi domain đi qua flusher; luồng media chỉ `UPDATE attachments`;
+  import dùng chung guard của writer. Không mở thêm connection ghi.
+- **Import không ghi đè bản capture (A7).** Dòng nhập có `source='import'`; DB nguồn của Desktop mở **chỉ đọc**,
+  không bao giờ bị sửa (kiểm bằng mtime).
+- **Dữ liệu không rời máy.** Không gửi tin nhắn, media, khoá, DB đi bất kỳ đâu (kể cả dịch vụ AI, pastebin, issue).
+  Không commit DB, file khoá, media, golden fixture chứa dữ liệu thật vào repo.
+
+**Không làm (non-goals):**
+- Không tự giải giao thức Signal/E2EE; chỉ dùng bản rõ do trang tạo ra.
+- Không chủ động tải lịch sử cũ từ máy chủ (chỉ bắt khi người dùng tự cuộn).
+- Không thêm đa tài khoản cho shadow DB.
+- Không tự đổi DPAPI sang có entropy hay đổi schema khoá; cần quyết định mới kèm migration.
+- Không làm phase sau khi phase trước chưa đạt tiêu chí nghiệm thu (thứ tự: capture → import → màn hình Lưu trữ → backup).
 
 ## 6. Giao diện và ngôn ngữ
 
@@ -124,8 +175,13 @@ Phát hành lần hai trong cùng ngày thì lấy số của ngày hôm sau.
 
 ## 9. Nghiên cứu Zalo desktop bằng REA
 
-Mục tiêu: hiểu tech stack và cách app Zalo desktop chính thức làm một tính năng, để làm phiên bản **của riêng mình**
-trên Zalo Web. Đây là nghiên cứu, không phải sao chép.
+Mục tiêu:
+- Hiểu cách app Zalo desktop chính thức làm một tính năng, để làm phiên bản **của riêng mình** trên Zalo Web.
+- Phục vụ shadow DB: xác nhận định dạng wire (ý nghĩa trường, cách mã hoá/nén) mà `wire.rs` / `normalize.rs`
+  đang giải, và schema + cách mở DB local của Desktop (`Index.db`, `g*.db`) cho bước import P2.
+  Đọc code JS của Desktop thường cho câu trả lời chắc hơn dò bằng probe lúc chạy.
+
+Đây là nghiên cứu để tự viết lại, không phải sao chép.
 
 ### Công cụ đã cài trên máy
 
@@ -161,7 +217,9 @@ Kiểm tra sức khoẻ: `rea setup --client claude_code --dry-run` (phần `doc
 - Chỉ phân tích **bản cài trên máy này**, tại chỗ. Không tải Zalo từ nguồn không chính thức.
 - **Không commit** mã nguồn, asset, file đã giải nén hay decompile của Zalo vào repo. Trong tài liệu chỉ trích
   đoạn ngắn đủ làm bằng chứng.
-- Không trích xuất hay lưu dữ liệu người dùng: tin nhắn, danh bạ, cookie, token phiên, khoá mã hoá DB local.
-- Không gửi request tự động tới máy chủ Zalo, không vượt cơ chế bảo vệ, không làm client gọi API riêng của Zalo.
-  ZaloRust vẫn chỉ nạp `chat.zalo.me`.
+- Dữ liệu thật của người dùng (tin nhắn, danh bạ, cookie, token, khoá DB) chỉ được xử lý theo mục 5b.
+  Tài liệu nghiên cứu chỉ mô tả **cách** dẫn xuất khoá hay định dạng dữ liệu, không bao giờ ghi **giá trị** khoá
+  hay nội dung tin nhắn thật; ví dụ phải dùng dữ liệu giả hoặc đã che.
+- Không gửi request tự động tới máy chủ Zalo, không làm ZaloRust tự gọi API riêng của Zalo. ZaloRust vẫn chỉ nạp
+  `chat.zalo.me`; shadow DB chỉ **đọc** lưu lượng mà trang tự tạo ra.
 - Tính năng làm cho ZaloRust phải được viết lại từ đầu dựa trên hiểu biết, không chép code của Zalo.
