@@ -75,6 +75,199 @@
     return Promise.resolve();
   }
 
+  // 0b) Shadow DB taps (feat/shadow-db-rebuild). Two PASSIVE, read-only
+  //     taps into Zalo Web's own crypto surface. Neither touches page
+  //     state or behavior; both only observe values the page itself has
+  //     already produced or decrypted:
+  //     - `decryptMsgFromServer`: E2EE plaintext for the shadow DB. The
+  //       WS stream only carries ciphertext (cmd 551); the ONE place the
+  //       plaintext exists is this method's return value in the page.
+  //     - `getSecretKey`/`setDecryptKey` statics: the REST decode key
+  //       (`zpw_enk` class, 16 bytes base64) so Rust can decode the raw
+  //       REST bodies it captures via CDP.
+  //     Everything goes to Rust through `shadow_e2ee_message` /
+  //     `shadow_handshake` (ACL: chat.zalo.me only; 512 KB cap enforced
+  //     Rust-side). Values never reach dlog.
+  //     Technique (proven live 2026-11-14, ported from probes): push a
+  //     fake webpack chunk to capture the module `require`, then scan the
+  //     module cache for the named functions, then wrap them. Retries
+  //     until webpack has booted; re-runs are idempotent via flags.
+  try {
+    var zrTries = 0, zrArmed = { e2ee: false, key: false };
+    function zrLog(m) { try { invoke("dlog", { msg: ("shadow: " + m).slice(0, 290) }); } catch (e) {} }
+
+    // Find the first webpack-cache export whose prototype chain (or the
+    // export itself, or its direct properties) holds `names`.
+    function zrFindExport(req, names) {
+      var found = null;
+      Object.keys(req.c).some(function (id) {
+        var ex;
+        try { ex = req.c[id] && req.c[id].exports; } catch (e) { return false; }
+        if (!ex) return false;
+        var surfaces = [ex, ex.prototype];
+        // Direct object/class properties one level deep.
+        try {
+          Object.keys(ex).forEach(function (k) {
+            var v = ex[k];
+            if (v && (typeof v === "object" || typeof v === "function")) {
+              surfaces.push(v.prototype || v);
+            }
+          });
+        } catch (e) {}
+        for (var i = 0; i < surfaces.length && !found; i++) {
+          var p = surfaces[i], depth = 0;
+          while (p && p !== Object.prototype && depth < 3) {
+            var ok = true;
+            for (var j = 0; j < names.length; j++) {
+              if (typeof p[names[j]] !== "function") { ok = false; break; }
+            }
+            if (ok) { found = { surface: p, names: names }; return true; }
+            p = Object.getPrototypeOf(p);
+            depth++;
+          }
+        }
+        return false;
+      });
+      return found;
+    }
+
+    function zrForwardMessage(x) {
+      try {
+        // Accept the message object itself or a wrapper carrying it.
+        var cands = [];
+        if (x && typeof x === "object") cands.push(x);
+        if (x && typeof x.then === "function") {
+          x.then(function (v) { zrForwardMessage(v); }).catch(function () {});
+        }
+        ["data", "message", "msg", "decrypted"].forEach(function (k) {
+          if (x && typeof x === "object" && x[k] && typeof x[k] === "object") cands.push(x[k]);
+        });
+        var pick = null;
+        for (var i = 0; i < cands.length; i++) {
+          var c = cands[i];
+          if (("msgId" in c) || ("messageId" in c)) { pick = c; break; }
+        }
+        if (!pick) pick = cands[0];
+        if (!pick) return;
+        var s;
+        try { s = JSON.stringify(pick); } catch (e) { return; }
+        if (!s || s.length > 512 * 1024) return;
+        invoke("shadow_e2ee_message", { payload: s });
+      } catch (e) {}
+    }
+
+    function zrSendKey(k) {
+      try {
+        if (typeof k !== "string" || !k || k.length > 200) return;
+        invoke("shadow_handshake", { key: k, uid: window.__zrUid || null });
+      } catch (e) {}
+    }
+
+    function zrArm() {
+      if (zrArmed.e2ee && zrArmed.key) return true;
+      var req = window.__zrReq;
+      if (!req && window.webpackJsonp) {
+        try {
+          window.webpackJsonp.push([
+            ["__zrsh"],
+            { "__zrsh": function (m, e, r) { window.__zrReq = r; } },
+            [["__zrsh"]],
+          ]);
+          req = window.__zrReq;
+        } catch (e) {}
+      }
+      if (!req || !req.c) return false;
+      var any = false;
+      if (!zrArmed.e2ee) {
+        var hit = zrFindExport(req, ["decryptMsgFromServer"]);
+        if (hit) {
+          var surface = hit.surface;
+          var orig = surface.decryptMsgFromServer;
+          surface.decryptMsgFromServer = function () {
+            var r;
+            try { r = orig.apply(this, arguments); } catch (e) { throw e; }
+            try { zrForwardMessage(r); } catch (e) {}
+            return r;
+          };
+          zrArmed.e2ee = true;
+          zrLog("e2ee tap installed");
+          any = true;
+        }
+      }
+      if (!zrArmed.key) {
+        var kh = zrFindExport(req, ["getSecretKey", "setDecryptKey"]);
+        if (kh) {
+          var s = kh.surface;
+          try { zrSendKey(s.getSecretKey()); } catch (e) {}
+          var origSet = s.setDecryptKey;
+          s.setDecryptKey = function (v) {
+            try { zrSendKey(v); } catch (e) {}
+            return origSet.apply(this, arguments);
+          };
+          zrArmed.key = true;
+          zrLog("rest key handshake armed");
+          any = true;
+        }
+      }
+      // Own-uid learning: try DI candidate tokens exposing getUserId().
+      // Purely best-effort — the uid only substitutes self-sent senders.
+      if (!window.__zrUid) {
+        try {          var MC = null;
+          Object.keys(req.c).some(function (id) {
+            var ex;
+            try { ex = req.c[id] && req.c[id].exports; } catch (e) { return false; }
+            if (ex && ex.ModuleContainer && ex.define) { MC = ex.ModuleContainer; return true; }
+            return false;
+          });
+          if (MC) {
+            ["user-controller", "account-service", "auth-service", "session-service",
+             "user-service", "account-controller", "user-store", "current-user",
+             "account-manager", "message-controller"].some(function (t) {
+              var s;
+              try { s = MC.resolveToken(t); } catch (e) { return false; }
+              var p = s, depth = 0;
+              while (p && p !== Object.prototype && depth < 3) {
+                if (typeof p.getUserId === "function") {
+                  var u = null;
+                  try { u = p.getUserId(); } catch (e) {}
+                  if (typeof u === "string" && /^\d{5,32}$/.test(u)) {
+                    window.__zrUid = u;
+                    zrLog("own uid resolved via " + t);
+                    return true;
+                  }
+                }
+                p = Object.getPrototypeOf(p);
+                depth++;
+              }
+              return false;
+            });
+          }
+        } catch (e) {}
+      }
+      // A late uid resolution re-sends the handshake so Rust gets {key, uid}.
+      if (window.__zrUid && !window.__zrUidSent) {
+        window.__zrUidSent = true;
+        var kh2 = zrFindExport(req, ["getSecretKey"]);
+        if (kh2) {
+          try { zrSendKey(kh2.surface.getSecretKey()); } catch (e) {}
+        }
+      }
+      return zrArmed.e2ee && zrArmed.key;
+    }
+
+    // webpack loads a while after the init script; login may re-create
+    // bundles. Retry every 10s for ~4 minutes, then stop trying.
+    var zrTimer = setInterval(function () {
+      zrTries++;
+      var done = false;
+      try { done = zrArm(); } catch (e) {}
+      if (done || zrTries >= 24) {
+        clearInterval(zrTimer);
+        if (!done) zrLog("taps incomplete after retries (e2ee=" + zrArmed.e2ee + " key=" + zrArmed.key + ")");
+      }
+    }, 10000);
+  } catch (e) {}
+
   // Zoom shortcuts: Ctrl (Cmd on macOS) with + / - / 0, and Ctrl+wheel. The page
   // only names the action; Rust steps the saved zoom and applies it to every
   // account (zoom_step). Native webview zoom is switched off in window.rs, so

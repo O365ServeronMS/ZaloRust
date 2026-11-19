@@ -12,6 +12,7 @@ mod integration;
 mod jsonfile;
 mod links;
 mod lock;
+mod migrate;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menubar;
 mod notif_icon;
@@ -21,6 +22,7 @@ mod proxy;
 mod scrollbars;
 mod sessions;
 mod settings;
+pub mod shadow;
 #[cfg(all(windows, debug_assertions))]
 mod smoke;
 mod tray;
@@ -209,6 +211,8 @@ pub fn run() {
             commands::notify,
             commands::set_unread,
             commands::dlog,
+            commands::shadow_e2ee_message,
+            commands::shadow_handshake,
             commands::open_download,
             commands::reveal_download,
             commands::switcher_accounts,
@@ -259,6 +263,10 @@ pub fn run() {
             // way to see notification failures on a Windows GUI build with no
             // console. See dlog.rs.
             dlog::init();
+            // Shadow DB (feat/shadow-db-rebuild): start the capture pipeline
+            // once per process, before any account window produces traffic.
+            // `start` is idempotent and a settings no-op logs and returns.
+            crate::shadow::runtime::start(handle);
             #[cfg(target_os = "macos")]
             dlog::log(if scrollers_forced {
                 "scrollers: forced overlay (AppleShowScrollBars=WhenScrolling in app domain)"

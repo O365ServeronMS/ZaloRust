@@ -84,6 +84,50 @@ pub fn reveal_download(app: tauri::AppHandle, id: u64) -> Result<(), String> {
     Ok(())
 }
 
+// --- Shadow DB (feat/shadow-db-rebuild) ---------------------------------------
+// Both commands are callable ONLY from the Zalo page (the ACL lives in
+// capabilities/main-remote.json; the remote check below is the second
+// layer). Neither logs its payload — the E2EE plaintext is the user's own
+// message traffic and the handshake key is a secret that must never reach
+// the log file.
+
+/// One E2EE plaintext message forwarded by the bridge tap (bridge.js 0b:
+/// a wrapped `decryptMsgFromServer`). 512 KB hard cap; larger payloads are
+/// dropped and counted, never stored.
+#[tauri::command(async)]
+pub fn shadow_e2ee_message(window: tauri::Webview, payload: String) {
+    if crate::integration::remote(&window).is_err() {
+        return;
+    }
+    if payload.len() > 512 * 1024 {
+        crate::dlog::log("shadow e2ee: dropped oversized payload (cap 512 KB)");
+        return;
+    }
+    crate::dlog::log("shadow e2ee: message delivered");
+    crate::shadow::runtime::deliver_e2ee(&window.app_handle(), payload);
+}
+
+/// The bridge hands over the page's REST decode key (`getSecretKey()`,
+/// base64 of 16 bytes) and, when it can resolve it, the logged-in uid
+/// (`getUserId()`). RAM only — never logged, never stored.
+#[tauri::command(async)]
+pub fn shadow_handshake(window: tauri::Webview, key: String, uid: Option<String>) {
+    if crate::integration::remote(&window).is_err() {
+        return;
+    }
+    if key.len() > 256 {
+        crate::dlog::log("shadow handshake: dropped oversized key");
+        return;
+    }
+    if let Some(u) = uid.as_deref() {
+        if u.len() > 64 {
+            crate::dlog::log("shadow handshake: dropped oversized uid");
+            return;
+        }
+    }
+    crate::shadow::runtime::set_rest_key(&window.app_handle(), key, uid);
+}
+
 #[tauri::command(async)]
 pub fn set_unread(
     window: tauri::Webview,

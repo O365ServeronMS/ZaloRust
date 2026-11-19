@@ -363,6 +363,15 @@ pub(crate) fn build_account_view(
         let handle = app.clone();
         let view_label = label.clone();
         view.with_webview(move |platform| enable_media_windows(platform, handle, view_label))?;
+        // Shadow DB capture (feat/shadow-db-rebuild): attach the CDP
+        // Network listeners on the same platform webview. Best-effort —
+        // `capture::attach` logs and never fails the window build.
+        {
+            let cap_app = app.clone();
+            view.with_webview(move |platform| {
+                crate::shadow::capture::attach(platform, cap_app)
+            })?;
+        }
     }
     #[cfg(not(windows))]
     {

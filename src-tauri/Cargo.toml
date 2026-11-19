@@ -28,6 +28,22 @@ ureq = { version = "3", default-features = false, features = ["rustls", "socks-p
 semver = "1"
 sha2 = "0.10"
 
+# --- Shadow DB (feat/shadow-db-rebuild) --------------------------------------
+# SQLCipher storage for the shadow DB. `bundled-sqlcipher-vendored-openssl`
+# builds SQLCipher + OpenSSL from source; that needs perl on PATH at build
+# time (strawberry-perl), see the build-env note in the repo docs.
+rusqlite = { version = "0.34", features = ["bundled-sqlcipher-vendored-openssl"] }
+# WS frames (encrypt=2) use AES-128-GCM with a per-connection key.
+aes-gcm = "0.10"
+# REST bodies (`zpw_enk`) are AES-128-CBC with a zero IV.
+cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.8"
+# encrypt=1/2 bodies are gzip-wrapped.
+flate2 = "1"
+base64 = "0.22"
+# Random 32-byte DB key, DPAPI-wrapped on disk (Windows).
+getrandom = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Version-matched to wry 0.55's webkit2gtk so PlatformWebview::inner() types unify.
 webkit2gtk = "=2.0.2"
@@ -54,6 +70,7 @@ windows = { version = "0.62", features = [
   "Win32_UI_Controls_Dialogs", # native per-download Save As dialog
   "Win32_UI_WindowsAndMessaging", # SW_SHOWNORMAL for ShellExecuteW
   "Win32_Globalization",      # GetUserDefaultLocaleName: default UI language
+  "Win32_Security_Cryptography",  # CryptProtectData/CryptUnprotectData: DPAPI wrap for the shadow DB key (D2)
 ] }
 windows-core = "0.62"
 # In windows-rs 0.61 IAsyncOperation moved out of windows::Foundation into the

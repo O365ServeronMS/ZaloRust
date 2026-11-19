@@ -56,6 +56,46 @@ pub struct Settings {
     /// password (AppImage, macOS app: replaced in place; Windows: downloaded and
     /// verified, installed on a click). On by default; never for .deb or Flatpak.
     pub auto_update_install: bool,
+    /// Shadow DB (feat/shadow-db-rebuild): mirrors the user's own Zalo Web
+    /// traffic on this machine into an encrypted local store. D17 priority
+    /// order: shadow → import → Lưu trữ → backup.
+    pub shadow: ShadowSettings,
+}
+
+/// Shadow capture/store options (D2-D5, D8, D11 defaults from the design).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowSettings {
+    /// Master switch for the capture pipeline.
+    pub enabled: bool,
+    /// Keep the SQLCipher encryption on the shadow DB (D2). Only disable
+    /// for debugging; the key file is always DPAPI-wrapped.
+    pub encrypt: bool,
+    /// Capture transport: `cdp` (WebView2 DevTools protocol network
+    /// events). Reserved: `bridge` (in-page hooks only).
+    pub capture: String,
+    /// `raw_events` retention in days (D4 ring buffer).
+    pub raw_events_days: u32,
+    /// Batch window and cap for the pipeline (D5).
+    pub batch_ms: u64,
+    pub batch_max: usize,
+    /// P1b media store root (D11). `None` = `<app data>\ZaloRust Data`.
+    /// Set to `D:\ZaloRust Data` for this install.
+    pub media_store: Option<String>,
+}
+
+impl Default for ShadowSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            encrypt: true,
+            capture: "cdp".to_string(),
+            raw_events_days: 7,
+            batch_ms: 200,
+            batch_max: 500,
+            media_store: None,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -85,6 +125,7 @@ impl Default for Settings {
             proxy_port: 0,
             auto_update_check: true,
             auto_update_install: true,
+            shadow: ShadowSettings::default(),
         }
     }
 }

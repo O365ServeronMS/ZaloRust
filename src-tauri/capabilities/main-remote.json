@@ -11,6 +11,8 @@
     "allow-notify",
     "allow-set-unread",
     "allow-dlog",
+    "allow-shadow-e2ee-message",
+    "allow-shadow-handshake",
     "allow-open-download",
     "allow-reveal-download",
     "allow-switcher-accounts",
