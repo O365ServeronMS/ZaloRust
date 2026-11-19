@@ -105,12 +105,17 @@
         try { ex = req.c[id] && req.c[id].exports; } catch (e) { return false; }
         if (!ex) return false;
         var surfaces = [ex, ex.prototype];
-        // Direct object/class properties one level deep.
+        // Direct object/class properties one level deep. For a function
+        // (a class) BOTH the function itself (statics) and its prototype
+        // (instance methods) are candidate surfaces.
         try {
           Object.keys(ex).forEach(function (k) {
             var v = ex[k];
-            if (v && (typeof v === "object" || typeof v === "function")) {
-              surfaces.push(v.prototype || v);
+            if (typeof v === "function") {
+              surfaces.push(v);
+              surfaces.push(v.prototype);
+            } else if (v && typeof v === "object") {
+              surfaces.push(v);
             }
           });
         } catch (e) {}
@@ -187,12 +192,73 @@
             var r;
             try { r = orig.apply(this, arguments); } catch (e) { throw e; }
             try { zrForwardMessage(r); } catch (e) {}
+            try {
+              // The updated web client may pass the plaintext in the
+              // ARGUMENTS rather than the return; forward those too.
+              for (var i = 0; i < arguments.length; i++) {
+                zrForwardMessage(arguments[i]);
+              }
+            } catch (e) {}
             return r;
           };
           zrArmed.e2ee = true;
           zrLog("e2ee tap installed");
           any = true;
         }
+      }
+      // Decrypt-surface inventory + aggressive extra taps: every
+      // function whose name looks like a decrypt path gets the same
+      // forwarder (Rust normalizes; wrong shapes simply drop).
+      if (!window.__zrInv) {
+        window.__zrInv = true;
+        try {
+          var seen = {};
+          var names = [];
+          Object.keys(req.c).forEach(function (id) {
+            var ex;
+            try { ex = req.c[id] && req.c[id].exports; } catch (e) { return; }
+            if (!ex) return;
+            var surfaces = [ex, ex.prototype];
+            try {
+              Object.keys(ex).forEach(function (k) {
+                var v = ex[k];
+                if (typeof v === "function") { surfaces.push(v); surfaces.push(v.prototype); }
+                else if (v && typeof v === "object") { surfaces.push(v); }
+              });
+            } catch (e) {}
+            surfaces.forEach(function (s) {
+              var p = s, depth = 0;
+              while (p && p !== Object.prototype && depth < 3) {
+                try {
+                  Object.getOwnPropertyNames(p).forEach(function (n) {
+                    if (seen[n]) return;
+                    if (!/decrypt|decipher|ee2e|e2ee|eemsg/i.test(n)) return;
+                    if (typeof p[n] !== "function") return;
+                    seen[n] = true;
+                    names.push(n);
+                    try {
+                      var o = p[n];
+                      p[n] = function () {
+                        var r;
+                        try { r = o.apply(this, arguments); } catch (err) { throw err; }
+                        try { zrForwardMessage(r); } catch (err2) {}
+                        try {
+                          for (var i = 0; i < arguments.length; i++) {
+                            zrForwardMessage(arguments[i]);
+                          }
+                        } catch (err3) {}
+                        return r;
+                      };
+                    } catch (e2) {}
+                  });
+                } catch (e) {}
+                p = Object.getPrototypeOf(p);
+                depth++;
+              }
+            });
+          });
+          zrLog("decrypt inventory: " + (names.length ? names.slice(0, 24).join(",") : "none"));
+        } catch (e) {}
       }
       if (!zrArmed.key) {
         var kh = zrFindExport(req, ["getSecretKey", "setDecryptKey"]);

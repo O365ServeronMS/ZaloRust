@@ -59,6 +59,15 @@ mod probe_ctx;
 #[cfg(test)]
 mod probe_conv;
 
+#[cfg(test)]
+mod probe_e2ee;
+
+#[cfg(test)]
+mod probe_recent;
+
+#[cfg(test)]
+mod probe_where;
+
 /// One normalized write instruction produced by `normalize`.
 /// The writer maps each variant onto one upsert (see writer.rs).
 #[derive(Debug, Clone, PartialEq)]

@@ -1,0 +1,20 @@
+Live-verified: E2EE plaintext capture + shadow_dir fix + decrypt inventory taps
+
+Runtime verification against the real account (2026-11-19):
+- ws AES-GCM key armed from frame cmd=1; CDP Network capture flowing
+- REST zpw_enk key handed over by the page (getSecretKey handshake)
+- E2EE plaintext: 4 messages landed source=e2ee with real text
+  (probe: plaintext(source=e2ee)=4, with_text=4, messages 68 then 72)
+- The updated web client renamed the incoming-E2EE decrypt path; the
+  bridge now inventories every decrypt/e2ee surface in the webpack
+  module cache and taps them all (decrypt, createDecryptor,
+  decryptValue, handleReplaceMessageE2ee, ...), forwarding both the
+  return value and the arguments.
+- shadow_dir: pinned to LOCALAPPDATA (Tauri v2 app_data_dir resolves
+  to Roaming on Windows; the first live run silently created a second
+  DB there; misplaced copy kept as shadow-misplaced-2026-11-19).
+- own-uid handshake plumbing (sender substitution for uidFrom=0),
+  -1/0 sentinel conversation skip, unwrap_payload envelope unroll
+  (WS data.data / REST string-payload), golden PASS 68/68 messages.
+- Added probe_e2ee/probe_recent/probe_where/probe_shapes/probe_ctx/
+  probe_group/probe_conv ignored diagnostics.

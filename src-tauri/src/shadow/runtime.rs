@@ -55,13 +55,17 @@ impl Job {
 }
 
 /// Resolve the shadow directory for this install.
+///
+/// LEGACY-COMPAT (verified 2026-11-19): the pre-rebuild DB, the surviving
+/// probes and the handoff all use
+/// `%LOCALAPPDATA%\com.o365serveronms.zalors\shadow`. Tauri v2's
+/// `app_data_dir()` resolves to **Roaming** on Windows, which silently
+/// created a second DB there during the first live run — so the path is
+/// pinned to LOCALAPPDATA explicitly.
 pub fn shadow_dir(app: &tauri::AppHandle) -> PathBuf {
-    let data = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
-            .join("com.o365serveronms.zalors"));
-    data.join("shadow")
+    let _ = app; // kept for signature stability; the path is OS-fixed
+    let local = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+    PathBuf::from(local).join("com.o365serveronms.zalors/shadow")
 }
 
 /// Boot the pipeline if enabled in settings. Idempotent: a second call is
