@@ -1,9 +1,0 @@
-docs: finalize shadow DB architecture (user-approved)
-
-One-way capture architecture with the phase order confirmed by the
-user (2026-11-19): capture -> P1b media -> P2 import -> P3 native
-Luu Tru screen (explicitly "later") -> P4 backup (explicitly "last").
-
-Principles A1-A8, as-built component map with live status, per-phase
-runtime acceptance criteria, intentional non-goals, and the per-session
-regression gate (cargo test + golden replay + probes).
