@@ -34,14 +34,16 @@ fn probe_e2ee_where() {
         println!("  {n:3}x {k}");
     }
     // 2. recent window: any e2ee/ee markers at all?
+    // Q4 (batch 17): rolling last-hour window from the real clock.
+    let since = super::schema::now_ms() - 3_600_000;
     let n: i64 = live
         .query_row(
-            "SELECT COUNT(*) FROM raw_events WHERE ts > 1795076000000 AND payload_json LIKE '%e2ee%'",
-            [],
+            "SELECT COUNT(*) FROM raw_events WHERE ts > ?1 AND payload_json LIKE '%e2ee%'",
+            [since],
             |r| r.get(0),
         )
         .unwrap();
-    println!("recent rows mentioning e2ee: {n}");
+    println!("recent rows mentioning e2ee (last 1h): {n}");
     // 3. cmds present in the old 551-class events.
     let mut st = live
         .prepare("SELECT DISTINCT payload_json FROM raw_events WHERE kind='ws' AND payload_json LIKE '%\"cmd\":551%' LIMIT 3")

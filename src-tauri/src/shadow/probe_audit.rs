@@ -2,10 +2,53 @@
 //! labels, JSON key NAMES and json types. Never prints message content,
 //! urls, ids of people, keys or tokens.
 //!
+//! Q2 (batch 17): the "REST endpoints seen" section renders every
+//! stored endpoint through `capture::safe_endpoint` BEFORE aggregating
+//! (legacy V1 rows store the FULL URL — scheme, host, query with device
+//! ids, sign keys, encrypted params — while the new build stores the
+//! path already stripped), so no query/host can ever be printed and
+//! legacy + new rows aggregate under the same path.
+//!
 //! Opens a temp COPY of the live DB (batch 5 E0, M2-6: a READ_ONLY WAL
 //! connection still touches the live `-shm`).
 //!
 //! Run: cargo test --lib probe_audit -- --ignored --nocapture
+
+use std::collections::BTreeMap;
+
+use rusqlite::Connection;
+
+use super::capture::safe_endpoint;
+
+/// Path-only REST endpoint census (Q2, batch 17): every stored `endpoint`
+/// is rendered through [`safe_endpoint`] first — stripping scheme, host,
+/// query and fragment and collapsing long digit runs — so legacy V1 rows
+/// (full URL incl. `?imei=..&signkey=..&params=..`) and new rows (already
+/// safe paths) aggregate under the same bare path. Pure: reads the
+/// connection, returns `(safe path, count)` sorted by count desc.
+fn rest_endpoint_census(conn: &Connection) -> Vec<(String, i64)> {
+    let mut by_path: BTreeMap<String, i64> = BTreeMap::new();
+    let Ok(mut st) = conn
+        .prepare("SELECT endpoint, COUNT(*) FROM raw_events WHERE kind='rest' GROUP BY 1")
+    else {
+        return Vec::new();
+    };
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, i64>(1)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (ep, n) = row.unwrap();
+        *by_path.entry(safe_endpoint(&ep)).or_default() += n;
+    }
+    let mut out: Vec<(String, i64)> = by_path.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
 
 #[test]
 #[ignore]
@@ -118,15 +161,19 @@ fn probe_audit_shapes() {
     );
 
     println!("== REST endpoints seen (safe names) ==");
-    let mut st = conn
-        .prepare("SELECT kind, endpoint, COUNT(*) FROM raw_events WHERE kind='rest' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 40")
-        .unwrap();
-    let rows = st
-        .query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)?)))
-        .unwrap();
-    for row in rows {
-        let (_k, e, n) = row.unwrap();
-        println!("  {:<60} n={n}", e.unwrap_or_default());
+    // Q2 (batch 17): never print the stored endpoint — legacy rows
+    // carry the full URL incl. query (device ids, sign keys, encrypted
+    // params). Path only, aggregated after safe_endpoint.
+    for (path, n) in rest_endpoint_census(&conn).into_iter().take(40) {
+        println!("  {path:<60} n={n}");
+    }
+
+    // Q6 (batch 17): time-scoped integrity — whether NEW rows are
+    // clean, not the whole store the old rows dominate.
+    let since_ms = super::probe_util::since_ms();
+    if since_ms > 0 {
+        println!("== integrity since {since_ms} ==");
+        super::probe_util::print_integrity_since(&conn, since_ms);
     }
 }
 
@@ -189,4 +236,70 @@ fn probe_audit_deep() {
     for r in rows("SELECT source, json_extract(payload_json,'$.msgType'),
                           substr(json_extract(payload_json,'$.content.href'), 1, instr(substr(json_extract(payload_json,'$.content.href'),9),'/')+7) AS host,
                           COUNT(*) FROM messages WHERE json_type(payload_json,'$.content')='object' AND json_extract(payload_json,'$.msgType') IN ('chat.photo','chat.video.msg','share.file','chat.voice') GROUP BY 1,2,3 ORDER BY 4 DESC") { println!("  host: {r}"); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrate::sqlcipher;
+
+    /// A synthetic store (never the live one): one schema, fake rows.
+    fn db() -> Connection {
+        let key = sqlcipher::generate_key().unwrap();
+        let conn = sqlcipher::open_in_memory(&key).unwrap();
+        super::super::schema::apply(&conn).unwrap();
+        conn
+    }
+
+    fn raw(conn: &Connection, kind: &str, endpoint: &str) {
+        conn.execute(
+            "INSERT INTO raw_events (ts, direction, kind, endpoint, payload_json)
+             VALUES (1, 'in', ?1, ?2, '{}')",
+            rusqlite::params![kind, endpoint],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rest_endpoint_census_strips_query_host_and_aggregates_legacy_with_new() {
+        let conn = db();
+        // A LEGACY-shaped row: the full URL as V1 stored it, query
+        // carrying the private material the section used to print.
+        raw(
+            &conn,
+            "rest",
+            "https://tt-chat2-wpa.chat.zalo.me/a/get-last-msgs?imei=867105035731234&signkey=SECRETKEY&params=ENCRYPTEDPAYLOAD",
+        );
+        // A second legacy row for a different endpoint, also with a query.
+        raw(
+            &conn,
+            "rest",
+            "https://tt-group-wpa.chat.zalo.me/api/group/getmg-v2?zcid=123456789012345",
+        );
+        // NEW-build rows: the flusher stores safe_endpoint() already.
+        raw(&conn, "rest", "/a/get-last-msgs");
+        raw(&conn, "rest", "/api/group/getmg-v2");
+        // Noise: not kind='rest', must not appear at all.
+        raw(&conn, "ws", "ws:2/1");
+
+        let census = rest_endpoint_census(&conn);
+        // Legacy and new aggregate under the same bare path.
+        assert_eq!(
+            census,
+            vec![
+                ("/a/get-last-msgs".to_string(), 2),
+                ("/api/group/getmg-v2".to_string(), 2),
+            ],
+            "legacy URL and new path must merge to one census entry"
+        );
+        // The rendered output can never carry a query, an assignment or
+        // a host — no `?`, no `=`, no scheme/host fragment.
+        for (path, _) in &census {
+            assert!(!path.contains('?'), "{path:?}");
+            assert!(!path.contains('='), "{path:?}");
+            assert!(!path.contains("zalo.me"), "{path:?}");
+            assert!(!path.contains("https"), "{path:?}");
+            assert!(!path.contains("//"), "{path:?}");
+        }
+    }
 }

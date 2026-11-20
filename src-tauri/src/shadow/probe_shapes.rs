@@ -51,7 +51,10 @@ fn probe_shapes() {
         for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap() {
             let (ep, p) = row.unwrap();
             let v: Value = serde_json::from_str(&p).unwrap_or(Value::Null);
-            println!("WS-MSGS endpoint={ep}");
+            // Q2 (batch 17): legacy rows may carry a full URL in
+            // `endpoint` — print the safe path only, never the stored
+            // value (query strings carry device ids / sign keys).
+            println!("WS-MSGS endpoint={}", crate::shadow::capture::safe_endpoint(&ep));
             println!("{}", shape(&v, 1));
             if let Some(d) = v.get("data").and_then(Value::as_object) {
                 println!("  data keys: {:?}", d.keys().collect::<Vec<_>>());
@@ -185,17 +188,29 @@ fn probe_shapes() {
         for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap() {
             let (ep, p) = row.unwrap();
             let v: Value = serde_json::from_str(&p).unwrap_or(Value::Null);
-            println!("WS-OPEN endpoint={ep} len={}", p.len());
+            // Q2 (batch 17): ws-open rows are legacy — the endpoint may
+            // be the full WSS URL. Safe path only.
+            println!("WS-OPEN endpoint={} len={}", crate::shadow::capture::safe_endpoint(&ep), p.len());
             println!("{}", shape(&v, 1));
         }
     }
     // 5. Which ws cmds exist.
     {
+        // Q2 (batch 17): aggregate through safe_endpoint BEFORE
+        // printing — legacy rows can store a full URL (scheme+host+
+        // query), and two spellings of one endpoint must not print
+        // as two labels either.
         let mut st = live
             .prepare("SELECT endpoint, COUNT(*) FROM raw_events WHERE kind='ws' GROUP BY 1 ORDER BY 2 DESC")
             .unwrap();
+        let mut by_safe: std::collections::BTreeMap<String, i64> = Default::default();
         for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap() {
             let (ep, n) = row.unwrap();
+            *by_safe.entry(crate::shadow::capture::safe_endpoint(&ep)).or_default() += n;
+        }
+        let mut lines: Vec<(String, i64)> = by_safe.into_iter().collect();
+        lines.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (ep, n) in lines {
             println!("WS {n:3}x {ep}");
         }
     }

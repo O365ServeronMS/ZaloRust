@@ -15,7 +15,9 @@
 //! - `ZR_PROBE_DIR` — the live store dir to copy from (default
 //!   `%LOCALAPPDATA%\com.o365serveronms.zalors\shadow`);
 //! - `ZR_PROBE_SINCE_ID` — `raw_events` id baseline for coverage
-//!   probes (default 0 = scan the whole ring).
+//!   probes (default 0 = scan the whole ring);
+//! - `ZR_PROBE_SINCE_MS` — epoch-ms cut for the time-scoped integrity
+//!   block (Q6, batch 17; unset/<=0 = no second block).
 
 use std::path::{Path, PathBuf};
 
@@ -158,6 +160,123 @@ fn parse_since(raw: Option<&str>) -> i64 {
     raw.and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)
 }
 
+/// The epoch-ms cut for the time-scoped integrity block (Q6, batch 17;
+/// `ZR_PROBE_SINCE_MS`). 0 (unset, unparsable or non-positive) means
+/// "no second block" — an epoch-ms cut at or before 1970 is never a
+/// meaningful acceptance boundary.
+pub fn since_ms() -> i64 {
+    parse_since_ms(std::env::var("ZR_PROBE_SINCE_MS").ok().as_deref())
+}
+
+/// The pure part of [`since_ms`], unit-tested without touching process env.
+fn parse_since_ms(raw: Option<&str>) -> i64 {
+    let v = raw
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if v <= 0 {
+        0
+    } else {
+        v
+    }
+}
+
+/// Time-scoped integrity counters (Q6, batch 17): the audit 1.2
+/// acceptance fields restricted to messages FIRST WRITTEN at/after the
+/// cut, so old rows from the soak build cannot dominate the verdict.
+///
+/// **There is no first-write column.** `messages` (schema.rs DDL) has no
+/// created_at/inserted_at, and `writer::apply` stamps no write time on a
+/// message row — the only `now_ms()` stamps go to `raw_events.ts`,
+/// `message_revisions.ts` and `conversations.updated_at`, none of which
+/// link back to a message's first write. The best available proxy is
+/// **`messages.ts`**: the event time from the wire payload, set on the
+/// first insert and frozen afterwards by the upsert
+/// (`ts = COALESCE(messages.ts, excluded.ts)`), so for capture/e2ee
+/// rows it equals the arrival time within seconds. Documented caveat:
+/// `source='import'` rows carry their ORIGINAL historical ts (written
+/// now, ts in the past), so a since-cut excludes them even when they
+/// were just written — import-cleanliness must be judged from the
+/// import's own dry-run census, not from this block.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TimeScopedIntegrity {
+    pub messages: i64,
+    pub self_sent: i64,
+    pub self_sent_sender_null: i64,
+    pub msgs_without_conv_row: i64,
+    pub sender_null_total: i64,
+    /// msgType string + count (msgType labels are shape-safe).
+    pub type_100_by_msg_type: Vec<(String, i64)>,
+}
+
+/// `type=100` census by payload msgType string, scoped to the cut
+/// (pure; msgType labels are shape-safe). Empty when the query fails.
+fn type_100_by_msg_type(conn: &Connection, since_ms: i64) -> Vec<(String, i64)> {
+    let Ok(mut st) = conn.prepare(
+        "SELECT COALESCE(json_extract(payload_json,'$.msgType'),'<none>'), COUNT(*) \
+         FROM messages WHERE type = 100 AND ts >= ?1 \
+         GROUP BY 1 ORDER BY 2 DESC, 1",
+    ) else {
+        return Vec::new();
+    };
+    st.query_map([since_ms], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })
+    .map(|it| it.filter_map(Result::ok).collect())
+    .unwrap_or_default()
+}
+
+/// Aggregate the time-scoped integrity counters (pure; the cut is
+/// inclusive: `ts >= since_ms`).
+pub fn integrity_since(conn: &Connection, since_ms: i64) -> TimeScopedIntegrity {
+    let q = |sql: &str| -> i64 {
+        conn.query_row(sql, [since_ms], |r| r.get(0))
+            .unwrap_or(-1)
+    };
+    TimeScopedIntegrity {
+        messages: q("SELECT COUNT(*) FROM messages WHERE ts >= ?1"),
+        self_sent: q(
+            "SELECT COUNT(*) FROM messages \
+             WHERE ts >= ?1 AND json_extract(payload_json,'$.uidFrom')='0'",
+        ),
+        self_sent_sender_null: q(
+            "SELECT COUNT(*) FROM messages \
+             WHERE ts >= ?1 AND json_extract(payload_json,'$.uidFrom')='0' \
+               AND sender_id IS NULL",
+        ),
+        msgs_without_conv_row: q(
+            "SELECT COUNT(*) FROM messages m \
+             WHERE m.ts >= ?1 \
+               AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = m.conv_id)",
+        ),
+        sender_null_total: q(
+            "SELECT COUNT(*) FROM messages WHERE ts >= ?1 AND sender_id IS NULL",
+        ),
+        type_100_by_msg_type: type_100_by_msg_type(conn, since_ms),
+    }
+}
+
+/// The `== integrity since <ms> ==` block both probes print (shape
+/// only; msgType strings are allowed). The proxy line documents WHY
+/// the cut is `messages.ts` — there is no first-write column.
+pub fn print_integrity_since(conn: &Connection, since_ms: i64) {
+    let i = integrity_since(conn, since_ms);
+    println!(
+        "  proxy: messages has no first-write column; the cut is messages.ts \
+(frozen at first write; import rows carry historical ts)"
+    );
+    println!(
+        "  messages={} self_sent={} self_sent_sender_null={} sender_null_total={} msgs_without_conv_row={}",
+        i.messages, i.self_sent, i.self_sent_sender_null, i.sender_null_total,
+        i.msgs_without_conv_row
+    );
+    let t100: Vec<String> = i
+        .type_100_by_msg_type
+        .iter()
+        .map(|(mt, n)| format!("{mt}={n}"))
+        .collect();
+    println!("  type_100_by_msgType: {}", t100.join(" "));
+}
+
 /// sha256 hex of `s`, first 12 chars — the probe-safe id fingerprint.
 pub fn h12(s: &str) -> String {
     let mut h = Sha256::new();
@@ -199,6 +318,93 @@ mod tests {
         assert_eq!(parse_since(Some("")), 0);
         assert_eq!(parse_since(Some("abc")), 0);
         assert_eq!(parse_since(Some("12x3")), 0);
+    }
+
+    #[test]
+    fn parse_since_ms_shapes() {
+        // Q6: unset / unparsable / non-positive all disable the block.
+        assert_eq!(parse_since_ms(None), 0);
+        assert_eq!(parse_since_ms(Some("")), 0);
+        assert_eq!(parse_since_ms(Some("abc")), 0);
+        assert_eq!(parse_since_ms(Some("0")), 0);
+        assert_eq!(parse_since_ms(Some("-5")), 0);
+        // A real epoch-ms cut survives, trimmed or not.
+        assert_eq!(parse_since_ms(Some("1795123456000")), 1_795_123_456_000);
+        assert_eq!(parse_since_ms(Some(" 1795123456000 ")), 1_795_123_456_000);
+    }
+
+    #[test]
+    fn integrity_since_counts_only_rows_at_or_after_the_cut() {
+        // Q6: a synthetic store with rows on BOTH sides of the cut.
+        use crate::migrate::sqlcipher as sc;
+        let key = sc::generate_key().unwrap();
+        let conn = sc::open_in_memory(&key).unwrap();
+        super::super::schema::apply(&conn).unwrap();
+
+        let msg = |id: &str, conv: &str, sender: Option<&str>, ts: i64, typ: i64, uid_from: &str| {
+            conn.execute(
+                "INSERT INTO messages (msg_id, conv_id, sender_id, ts, type, text, payload_json, rev, deleted, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, 0, 'capture')",
+                rusqlite::params![
+                    id,
+                    conv,
+                    sender,
+                    ts,
+                    typ,
+                    format!(r#"{{"msgId":"{id}","uidFrom":"{uid_from}","ts":{ts},"msgType":"text","content":"x"}}"#)
+                ],
+            )
+            .unwrap();
+        };
+        let cut = 1_000_000i64;
+        // OLD side (before the cut): a self-sent row stuck at sender
+        // NULL, an unknown-msgType type=100 row, and an orphan conv.
+        msg("old_self", "cOld", None, cut - 1000, 1, "0");
+        msg("old_100", "cOld", Some("u1"), cut - 500, 100, "u1");
+        msg("old_orphan", "cMissing", Some("u1"), cut - 100, 1, "u1");
+        // NEW side (at/after the cut): a clean row, a self-sent row
+        // with the sender RESOLVED, and one new unknown-msgType row.
+        msg("new_ok", "cNew", Some("u2"), cut, 1, "u2");
+        msg("new_self", "cNew", Some("me"), cut + 1000, 1, "0");
+        msg("new_100", "cNew", Some("u2"), cut + 2000, 100, "u2");
+        for c in ["cOld", "cNew"] {
+            conn.execute(
+                "INSERT INTO conversations (id, type, unread, updated_at) VALUES (?1, 0, 0, 1)",
+                [c],
+            )
+            .unwrap();
+        }
+
+        let i = super::integrity_since(&conn, cut);
+        // Only the new side counts, and the cut is inclusive.
+        assert_eq!(i.messages, 3);
+        assert_eq!(i.self_sent, 1, "new_self only; old_self is behind the cut");
+        assert_eq!(i.self_sent_sender_null, 0, "new_self has its sender resolved");
+        assert_eq!(i.sender_null_total, 0);
+        assert_eq!(i.msgs_without_conv_row, 0, "cNew exists; the cMissing orphan is old");
+        assert_eq!(
+            i.type_100_by_msg_type,
+            vec![("text".to_string(), 1)],
+            "only new_100 lands in the scoped type=100 census"
+        );
+
+        // Sanity both ways: the old side alone, via a cut above every
+        // new row, counts nothing…
+        let above = super::integrity_since(&conn, cut + 10_000);
+        assert_eq!(above.messages, 0);
+        assert_eq!(above.type_100_by_msg_type, Vec::new());
+        // …and a cut below everything equals a whole-store count.
+        let all = super::integrity_since(&conn, 1);
+        assert_eq!(all.messages, 6);
+        assert_eq!(all.self_sent, 2);
+        assert_eq!(all.self_sent_sender_null, 1, "old_self");
+        assert_eq!(all.msgs_without_conv_row, 1, "old_orphan");
+        assert_eq!(all.sender_null_total, 1);
+        assert_eq!(
+            all.type_100_by_msg_type,
+            vec![("text".to_string(), 2)],
+            "old_100 + new_100"
+        );
     }
 
     #[test]

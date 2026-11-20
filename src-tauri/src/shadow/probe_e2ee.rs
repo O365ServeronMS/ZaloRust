@@ -18,12 +18,22 @@ fn probe_e2ee_plain() {
         q("SELECT COUNT(*) FROM conversations"),
         q("SELECT COUNT(*) FROM raw_events"),
     );
+    // Q4 (batch 17): `now` is the REAL clock, not a constant frozen at
+    // audit time — the old `now~=1795076200000` printed next to `max_ts`
+    // once read as a "future timestamp" finding. `max_ts_age_s` makes
+    // the freshness of the store explicit; saturating_sub keeps a
+    // skewed/future max_ts from printing a negative age.
+    let now = super::schema::now_ms();
     let (max_ts, recent): (i64, i64) = conn
         .query_row(
-            "SELECT (SELECT MAX(ts) FROM raw_events), (SELECT COUNT(*) FROM raw_events WHERE ts > 1795075000000)",
-            [],
+            "SELECT (SELECT COALESCE(MAX(ts), 0) FROM raw_events),
+                    (SELECT COUNT(*) FROM raw_events WHERE ts > ?1)",
+            [now - 3_600_000],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    println!("raw_events max_ts={max_ts} recent_1h={recent} now~=1795076200000");
+    let max_ts_age_s = now.saturating_sub(max_ts) / 1000;
+    println!(
+        "raw_events max_ts={max_ts} max_ts_age_s={max_ts_age_s} recent_1h={recent} now={now}"
+    );
 }

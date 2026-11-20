@@ -665,9 +665,13 @@ mod probe_fts_bench {
         let (conn, tmp) = probe_util::open_copy_rw();
         assert!(tmp.starts_with(std::env::temp_dir()));
 
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size", [], |r| r.get(0))
-            .unwrap();
+        // Q3 (batch 17): on a SQLCipher DB `PRAGMA page_size` answers
+        // with the CODEC page size as TEXT (rusqlite's error even
+        // names the remapped column: InvalidColumnType(0,
+        // "cipher_page_size", Text)), so the naive `get::<i64>` used
+        // to abort the probe. Read it as a value and parse; None means
+        // "unknown" and only the page-delta estimate is skipped.
+        let page_size = page_size_of(&conn);
         let pages_before: i64 = conn
             .query_row("PRAGMA page_count", [], |r| r.get(0))
             .unwrap();
@@ -682,7 +686,11 @@ mod probe_fts_bench {
         let pages_after: i64 = conn
             .query_row("PRAGMA page_count", [], |r| r.get(0))
             .unwrap();
-        let delta_bytes = (pages_after - pages_before) * page_size;
+        let delta_bytes = match page_size {
+            Some(ps) => (pages_after - pages_before) * ps,
+            // Q3: page size unknown — the delta cannot be estimated.
+            None => -1,
+        };
         // dbstat when the build has it; -1 says "unavailable" and the
         // page_count delta above is the estimate then.
         let fts_bytes_dbstat: i64 = conn
@@ -760,9 +768,13 @@ mod probe_fts_bench {
             "probe_fts_bench: msgs={} fts_rows={} migrate_ms={}",
             msgs, fts_rows, migrate_ms
         );
+        let page_size_label = match page_size {
+            Some(ps) => ps.to_string(),
+            None => "unknown".to_string(),
+        };
         println!(
             "  index_bytes: dbstat={} page_delta={} (page_size={} pages {}->{})",
-            fts_bytes_dbstat, delta_bytes, page_size, pages_before, pages_after
+            fts_bytes_dbstat, delta_bytes, page_size_label, pages_before, pages_after
         );
         println!(
             "  queries={} p50_ms={:.2} p95_ms={:.2} hits: {}",
@@ -779,5 +791,47 @@ mod probe_fts_bench {
         // The live store dir must be byte-for-byte unchanged.
         let after = fingerprint(&live);
         assert_eq!(before, after, "the live store dir must never be written");
+    }
+
+    /// Q3 (batch 17): read `PRAGMA page_size` without assuming the
+    /// column type. On a SQLCipher DB the codec remaps the pragma and
+    /// answers the CIPHER page size as TEXT (the naive
+    /// `r.get::<i64>(0)` panics with InvalidColumnType(..,
+    /// "cipher_page_size", Text)); on a plain SQLite DB it is an
+    /// INTEGER. Integer or parseable text → the value; anything else →
+    /// None ("unknown"). Never panics.
+    fn page_size_of(conn: &Connection) -> Option<i64> {
+        let v: rusqlite::types::Value = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .ok()?;
+        match v {
+            rusqlite::types::Value::Integer(i) => Some(i),
+            rusqlite::types::Value::Text(t) => t.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn page_size_of_survives_the_cipher_pragma_type_on_a_synthetic_db() {
+        // A synthetic SQLCipher DB (in-memory, fresh key — never the
+        // live store): the page size must come back readable whatever
+        // type the codec answers with.
+        let key = crate::migrate::sqlcipher::generate_key().unwrap();
+        let conn = crate::migrate::sqlcipher::open_in_memory(&key).unwrap();
+        let ps = page_size_of(&conn);
+        assert!(ps.is_some(), "the page size must be readable on a SQLCipher DB");
+        assert!(ps.unwrap() > 0);
+        // Whatever this build answers, the two reads must agree when
+        // the naive one works, and the helper must still succeed when
+        // it fails (the reported bug: SQLCipher returns TEXT here and
+        // the probe used to abort with InvalidColumnType).
+        let naive: Result<i64, _> = conn.query_row("PRAGMA page_size", [], |r| r.get(0));
+        match naive {
+            Ok(n) => assert_eq!(ps, Some(n), "both reads must agree on an INTEGER answer"),
+            Err(_) => assert!(
+                ps.is_some(),
+                "the helper must survive the TEXT/cipher_page_size answer the naive read fails on"
+            ),
+        }
     }
 }

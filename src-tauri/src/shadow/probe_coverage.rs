@@ -15,7 +15,32 @@
 //! Also prints the audit 1.2 integrity counters (the migration AC) in
 //! one block: self_sent_sender_null, msgs_without_conv_row,
 //! convs_lastmsg_not_newest, type_100_by_msgType (msgType strings are
-//! allowed), rev_gt0_by_source, rest_endpoints_with_query.
+//! allowed), rev_gt0_by_source, rest_endpoints_with_query — and, when
+//! `ZR_PROBE_SINCE_MS` is set, a second `== integrity since <ms> ==`
+//! block scoped to messages first written at/after that time (Q6,
+//! batch 17; see `probe_util::integrity_since`).
+//!
+//! # Undecoded: the probe's buckets vs the runtime's (Q5, batch 17)
+//!
+//! The runtime's REST buckets (`rest_stats::classify_rest_envelope`,
+//! printed as the `shadow rest stages:` log line) are THREE:
+//! - `decoded` — the stored envelope has NO `undecoded` key (the outer
+//!   `data` cipher string decrypted);
+//! - `undecoded` — `undecoded` present and NOT `"no-key"` (key armed,
+//!   crypto failed; `wire::rest_envelope` stores `true`);
+//! - `no_key` — `undecoded == "no-key"` (no decode key armed yet; the
+//!   WS flush stores the same tag via `wire::Undecoded::NoKey`).
+//!
+//! The old probe definition — `env.get("undecoded").is_some()` — was
+//! ONE bucket that lumped `no_key` rows into `undecoded`, so right
+//! after a deploy (REST traffic flows before the bridge handshake
+//! arms the key) the probe printed `kind rest: undecoded=33` while the
+//! runtime log line said `undecoded=0`: those rows live in the
+//! `no_key=` bucket further along the same line. The probe was wrong;
+//! it now splits the buckets exactly like the runtime, keyed on the
+//! stored flag (works for both `rest` and `ws` rows, whose wire
+//! layers use the same tag). Either way a flagged row can never yield
+//! messages, so both buckets stay out of `missing`.
 //!
 //! Run (reviewer, after the app is stopped — reads a temp COPY):
 //!   cargo test --lib probe_coverage -- --ignored --nocapture
@@ -35,7 +60,11 @@ use super::Write;
 struct KindCov {
     raw_rows: usize,
     rows_with_msg: usize,
+    /// `undecoded` present and NOT `"no-key"` — the runtime's
+    /// `shadow rest stages: undecoded=` bucket (Q5).
     undecoded: usize,
+    /// `undecoded == "no-key"` — the runtime's `no_key=` bucket (Q5).
+    no_key: usize,
     unparsable: usize,
     ids: BTreeSet<String>,
     /// id -> "kind <safe endpoint>" of the first row that produced it
@@ -69,11 +98,21 @@ fn scan_raw(conn: &Connection, since: i64) -> BTreeMap<String, KindCov> {
             cov.unparsable += 1;
             continue;
         };
-        // The stored undecoded flag (wire.rs: `"undecoded": "no-key"` or
-        // `true`) — those rows can never yield messages.
-        if env.get("undecoded").is_some() {
-            cov.undecoded += 1;
-            continue;
+        // The stored undecoded flag, split into the runtime's THREE
+        // buckets (Q5, batch 17 — see the module doc): `"no-key"` is
+        // the no_key bucket, any other truthy flag is undecoded, and
+        // no flag at all means the row decoded. Either flagged shape
+        // can never yield messages, so both stay out of `missing`.
+        match env.get("undecoded") {
+            Some(Value::String(s)) if s == "no-key" => {
+                cov.no_key += 1;
+                continue;
+            }
+            Some(_) => {
+                cov.undecoded += 1;
+                continue;
+            }
+            None => {}
         }
         // own_uid = None: the probe must not depend on account config;
         // a None uid only leaves self-sent senders NULL, which never
@@ -183,8 +222,8 @@ fn probe_coverage() {
         let kmissing = c.ids.intersection(&missing).count();
         total_missing += kmissing;
         println!(
-            "kind {kind}: raw_rows={} rows_with_msg={} distinct_msg_ids={} missing={} undecoded={} unparsable={}",
-            c.raw_rows, c.rows_with_msg, c.ids.len(), kmissing, c.undecoded, c.unparsable
+            "kind {kind}: raw_rows={} rows_with_msg={} distinct_msg_ids={} missing={} undecoded={} no_key={} unparsable={}",
+            c.raw_rows, c.rows_with_msg, c.ids.len(), kmissing, c.undecoded, c.no_key, c.unparsable
         );
     }
     println!("total_missing={total_missing}");
@@ -226,6 +265,14 @@ fn probe_coverage() {
         .map(|(s, n)| format!("{s}={n}"))
         .collect();
     println!("rev_gt0_by_source: {}", revs.join(" "));
+
+    // Q6 (batch 17): time-scoped integrity — whether NEW rows are
+    // clean, not the whole store the old rows dominate.
+    let since_ms = probe_util::since_ms();
+    if since_ms > 0 {
+        println!("== integrity since {since_ms} ==");
+        probe_util::print_integrity_since(&conn, since_ms);
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +334,8 @@ mod tests {
         let ws = &cov["ws"];
         assert_eq!(ws.raw_rows, 4);
         assert_eq!(ws.rows_with_msg, 2);
-        assert_eq!(ws.undecoded, 1);
+        assert_eq!(ws.undecoded, 0, "the flagged ws row is no-key, not undecoded");
+        assert_eq!(ws.no_key, 1);
         assert_eq!(ws.unparsable, 1);
         assert_eq!(ws.ids.len(), 2);
         let rest = &cov["rest"];
@@ -305,6 +353,39 @@ mod tests {
         // The sample-line origins carry kind + safe endpoint (query stripped).
         assert_eq!(cov["e2ee"].origin["fake3"], "e2ee e2ee:bridge");
         assert_eq!(cov["ws"].origin["fake2"], "ws ws:2/1");
+    }
+
+    #[test]
+    fn scan_splits_rest_rows_into_the_runtime_three_buckets() {
+        // Q5 (batch 17): the probe's buckets must match the runtime
+        // (`shadow rest stages:`) — decoded / undecoded / no-key are
+        // THREE separate counts, not one "flag present" count.
+        let conn = db();
+        // DECODED (no `undecoded` key): what the flusher stores after
+        // wire::rest_envelope decrypts the inner envelope — carries a
+        // msgs array, so the row yields a message write.
+        raw(&conn, "rest", "/a/preloadconvers/get-last-msgs",
+            r#"{"error_code":0,"data":{"msgs":[{"msgId":"m_dec","uidFrom":"u1","idTo":"0","ts":1,"msgType":"text","content":"x"}]}}"#);
+        // UNDECODED (flag truthy, not "no-key"): key armed, crypto failed.
+        raw(&conn, "rest", "/api/group/getmg-v2",
+            r#"{"error_code":0,"data":"cipher-text-truncated","undecoded":true}"#);
+        // NO-KEY: the REST key was not armed when the body arrived.
+        raw(&conn, "rest", "/api/group/getmg-v2",
+            r#"{"error_code":0,"data":"cipher-text-truncated","undecoded":"no-key"}"#);
+        // The same split applies to ws rows: "bad-encoding"/"crypto" are
+        // undecoded; "no-key" is no_key.
+        raw(&conn, "ws", "ws:3/0", r#"{"cmd":3,"subCmd":0,"encrypt":1,"undecoded":"bad-encoding","body":"x"}"#);
+
+        let cov = scan_raw(&conn, 0);
+        let rest = &cov["rest"];
+        assert_eq!(rest.raw_rows, 3);
+        assert_eq!(rest.undecoded, 1, "only the truthy-flag row");
+        assert_eq!(rest.no_key, 1, "the no-key row has its own bucket");
+        assert_eq!(rest.rows_with_msg, 1, "only the decoded row can yield writes");
+        assert_eq!(rest.ids, BTreeSet::from(["m_dec".to_string()]));
+        let ws = &cov["ws"];
+        assert_eq!(ws.undecoded, 1, "bad-encoding is a real undecoded row");
+        assert_eq!(ws.no_key, 0);
     }
 
     #[test]

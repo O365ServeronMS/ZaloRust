@@ -7,8 +7,10 @@ use super::probe_util::open_copy;
 #[ignore]
 fn probe_recent_cmds() {
     let (live, _tmp) = open_copy();
-    // Anything from the last 2 hours (runtime ts base ~1795076500000).
-    let cutoff: i64 = 1795076000000;
+    // Anything from the last 2 hours — Q4 (batch 17): a rolling
+    // window from the REAL clock (the old hardcoded cutoff froze the
+    // window at audit time and went stale as the soak ran on).
+    let cutoff: i64 = super::schema::now_ms() - 2 * 3_600_000;
     let mut st = live
         .prepare("SELECT kind, endpoint, payload_json FROM raw_events WHERE ts > ?1 ORDER BY id")
         .unwrap();
