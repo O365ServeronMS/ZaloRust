@@ -155,6 +155,7 @@ fn probe_import_overlap() {
         mapping: Some(PathBuf::from(&map)),
         shadow_copy: None,
         delta: false,
+        distinct: Vec::new(),
         apply: false,
         help: false,
     };

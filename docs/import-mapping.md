@@ -1,10 +1,13 @@
 # Desktop → shadow mapping (Phase 2.3/2.4 tooling)
 
-This is the how-to for the three tools batch 12 added to
-`zalors import`:
+This is the how-to for the tools batch 12 added to `zalors import`
+and the batch-14 addition:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
+- `--distinct` — whitelisted distinct values of one CODE column in a
+  sample DB (batch 14 N1: the tool that settles code tables without
+  ever printing content);
 - `--mapping <file>` + `--shadow-copy <dir>` (+ `--delta`) — the
   declarative mapping dry run with a read-only classification against
   a temp COPY of your shadow store (item 2.4);
@@ -70,6 +73,49 @@ target\debug\zalors.exe import `
 - One unopenable sample among the 1 471 message DBs is REPORTED and
   skipped, not fatal; `Core\Index.db` failing is fatal (the key or
   profile is wrong).
+
+## 1a. Peek at a code column (`--distinct`, batch 14)
+
+When the inventory names are not enough to write a mapping — the
+message type column stores INTEGER codes whose meaning no name can
+tell you — `--distinct` reports the distinct values of ONE column of
+a sample DB, under privacy rules that make the tool unable to print
+content:
+
+```powershell
+target\debug\zalors.exe import `
+  --from-snapshot "D:\ZaloRust Data\import-snapshot\2026-MM-DD" `
+  --account default --uin-hash dca62c394a68 `
+  --key-file D:\.opencode\d7\zalo-desktop-uin-key-2026-11-19.bin `
+  --distinct one2one:message.msgType `
+  --distinct index:conversation.isGroup
+```
+
+- The spec is `<dbkind>:<table>.<column>` with dbkind one of
+  `index`, `one2one`, `group`, `stranger`; the DB probed is the
+  FIRST sample of that kind — the very one `--inventory` reports.
+  Repeatable, **max 10 per run**; its own mode (cannot combine with
+  `--inventory`/`--mapping`/`--shadow-copy`/`--delta`); dry-run only
+  (parse refuses `--apply`).
+- Three layered guards, all enforced in code (unit-tested):
+  1. the column NAME must match the code-column whitelist
+     `^(.*_)?(type|kind|status|state|cmd|subcmd|sub_cmd|msgtype|msg_type|flag|flags|ver|version|src|source|unit|is[a-z_]*|has[a-z_]*)$`
+     (case-insensitive) — `message`, `content`, `displayName`,
+     `serverTime` and every other content-bearing name are refused
+     BEFORE any row is read, with an error quoting the rule;
+  2. the read is exactly
+     `SELECT col, COUNT(*) FROM t GROUP BY col ORDER BY COUNT(*) DESC LIMIT 51`;
+  3. a value is only ever printed as: the INTEGER/REAL number,
+     `NULL`, a code-shaped TEXT token (non-empty, ≤ 32 chars, every
+     char in `[A-Za-z0-9._:-]` — e.g. `chat.photo`), the
+     fingerprint `text(len=N,h12=…)` for any other TEXT, or
+     `blob(len=N)` for a BLOB.
+- More than 50 distinct values print the first 50 plus
+  `… (more than 50 distinct — not a code column?)` — a column that
+  trips this (batch 14 found `friend.status` does: >50 distinct
+  sentence-like TEXT values) is not a code column in practice.
+- Output of a good code column looks like
+  `  1 x 57` — value `1`, seen on 57 rows of the sample.
 
 ## 2. Write the mapping JSON
 

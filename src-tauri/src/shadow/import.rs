@@ -53,6 +53,11 @@ use super::Write;
 /// Batch 12 L1: shape-only schema inventory (`--inventory`).
 pub mod inventory;
 
+/// Batch 14 N1: the whitelisted `--distinct` code-column probe —
+/// privacy-guarded by construction (whitelist → fixed aggregation →
+/// code-shape-only rendering), unit-tested against synthetic DBs.
+pub mod distinct;
+
 /// The snapshot manifest file (F5 writes it, `run` requires it):
 /// proof that `--from-snapshot` is a cold, byte-verified copy.
 pub const SNAPSHOT_MANIFEST: &str = "snapshot-manifest.json";
@@ -707,6 +712,106 @@ pub fn run_inventory(a: &ImportArgs) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The `--distinct` mode (batch 14 N1, dry-run only — parse refuses
+/// `--apply`): whitelisted code-column distinct values from the first
+/// sample DB of each requested kind (`--inventory`'s samples). Every
+/// spec is validated against the inventory BEFORE any row is read;
+/// all violations are listed at once (the `plan` convention). Nothing
+/// writes to the snapshot; every DB opens `mode=ro&immutable=1`.
+pub fn run_distinct(a: &ImportArgs) -> Result<Vec<String>, String> {
+    use import_map::MapDb;
+
+    let p = prepare(a)?;
+    let g = gather_inventories(&p)?;
+
+    // Validate every spec first: sample, table, column, whitelist.
+    // The whitelist refusal names the rule (the N1 hard rule: the
+    // tool must be unable to print content, so content-bearing
+    // columns never reach the aggregation).
+    let mut errs = Vec::new();
+    for spec in &a.distinct {
+        let who = format!("--distinct {}", distinct::spec_str(spec));
+        let Some(kinv) = sample_inventory(&g.inv, spec.kind) else {
+            errs.push(format!(
+                "{who}: the snapshot has no {} sample DB to read",
+                spec.kind.name()
+            ));
+            continue;
+        };
+        let Some(tinfo) = kinv.inventory.table(&spec.table) else {
+            errs.push(format!(
+                "{who}: table {:?} does not exist (inventory {})",
+                spec.table, kinv.source_rel
+            ));
+            continue;
+        };
+        if !tinfo.columns.iter().any(|c| c.name == spec.column) {
+            errs.push(format!(
+                "{who}: column {:?} does not exist in table {:?} (inventory {})",
+                spec.column, spec.table, kinv.source_rel
+            ));
+            continue;
+        }
+        if !distinct::is_code_column(&spec.column) {
+            errs.push(format!(
+                "{who}: column {:?} is not on the code-column whitelist — refused \
+                 (rule: {}, case-insensitive; content-bearing columns can never \
+                 be probed by this tool)",
+                spec.column, distinct::CODE_COLUMN_RULE
+            ));
+        }
+    }
+    if !errs.is_empty() {
+        return Err(format!(
+            "--distinct validation ({} error(s)):\n  - {}",
+            errs.len(),
+            errs.join("\n  - ")
+        ));
+    }
+
+    // All specs valid: read the samples, one open per kind.
+    let mut lines = Vec::new();
+    let mut conns: std::collections::BTreeMap<MapDb, Connection> = Default::default();
+    for spec in &a.distinct {
+        if !conns.contains_key(&spec.kind) {
+            let kinv = sample_inventory(&g.inv, spec.kind).expect("validated above");
+            let path = sample_db_path(&p, &kinv.source_rel);
+            let conn = open_desktop_db(&path, p.passphrase.as_str(), p.profile)
+                .map_err(|e| format!("--distinct {}: {e}", distinct::spec_str(spec)))?;
+            conns.insert(spec.kind, conn);
+        }
+        let conn = conns.get(&spec.kind).expect("opened above");
+        let kinv = sample_inventory(&g.inv, spec.kind).expect("validated above");
+        let out = distinct::distinct_report(conn, spec, &kinv.source_rel)
+            .map_err(|e| format!("--distinct {}: {e}", distinct::spec_str(spec)))?;
+        lines.extend(out);
+    }
+    Ok(lines)
+}
+
+/// The inventory sample of one DB kind (`run_distinct`'s lookup —
+/// the same samples `--inventory` reports).
+fn sample_inventory<'a>(
+    inv: &'a inventory::SnapshotInventories,
+    kind: import_map::MapDb,
+) -> Option<&'a inventory::KindInventory> {
+    match kind {
+        import_map::MapDb::Index => inv.index.as_ref(),
+        import_map::MapDb::OneToOne => inv.one_to_one.as_ref(),
+        import_map::MapDb::Group => inv.group.as_ref(),
+        import_map::MapDb::Stranger => inv.stranger_box.as_ref(),
+    }
+}
+
+/// The absolute path of a sample's `source_rel` (the forward-slash
+/// relative path inside the snapshot, e.g. `Core/Message/123.db` —
+/// built by `gather_inventories`, never raw user input).
+fn sample_db_path(p: &Prepared, source_rel: &str) -> PathBuf {
+    let mut path = p.uid_dir.clone();
+    path.extend(source_rel.split('/'));
+    path
+}
+
 /// The `--mapping`/`--shadow-copy` dry-run mode (L2, dry-run only):
 /// plan the mapping against the snapshot inventory, extract every DB
 /// of the mapped kinds into `Write`s, and classify each write
@@ -1122,6 +1227,7 @@ mod tests {
             mapping: None,
             shadow_copy: None,
             delta: false,
+            distinct: Vec::new(),
             apply: false,
             help: false,
         }
@@ -2025,6 +2131,195 @@ mod tests {
             dir.join("mapping.json").to_string_lossy().into_owned(),
         ];
         assert_eq!(crate::shadow::cli::main(&argv), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 14 N1: --distinct (end to end on synthetic snapshots) ----
+
+    /// The fake Index.db schema for the --distinct fixture: one
+    /// conversation-ish table with a whitelisted `isGroup` column.
+    #[cfg(windows)]
+    const INDEX_DB_SQL: &str = "CREATE TABLE conv (
+        id INTEGER PRIMARY KEY, v TEXT, isGroup INTEGER
+      );
+      INSERT INTO conv (id, v, isGroup) VALUES (11, 'a', 0), (12, 'b', 1);";
+
+    /// The fake Desktop message schema for the --distinct fixture:
+    /// code columns carrying mixed INTEGER/TEXT/BLOB/NULL values,
+    /// plus the content columns (`content`, `message`) the whitelist
+    /// must refuse. Synthetic data only.
+    #[cfg(windows)]
+    const CODES_DB_SQL: &str = "CREATE TABLE message (
+        msgId TEXT PRIMARY KEY, msgType INTEGER, status INTEGER,
+        src INTEGER, cmd INTEGER, isLocalMsgId INTEGER, content TEXT, message TEXT
+      );
+      INSERT INTO message (msgId, msgType, status, src, cmd, isLocalMsgId, content, message) VALUES
+        ('m1', 1, 0, 1, 0, 0, 'plain words here', 'plain words here'),
+        ('m2', 1, 0, 1, 0, 0, 'more words here', 'more words here'),
+        ('m3', 2, 1, 1, 551, 1, 'sentences have spaces', 'sentences have spaces'),
+        ('m4', NULL, 0, NULL, NULL, NULL, 'x', 'x'),
+        ('m5', 'chat.photo', 0, 1, 0, 0, 'y', 'y');
+      INSERT INTO message (msgId, msgType, status) VALUES ('m6', x'00', 0);";
+
+    /// A synthetic snapshot whose Index.db and every message-DB kind
+    /// carry the code-column fixture. Returns the key path.
+    #[cfg(windows)]
+    fn synthetic_snapshot_codes(dir: &Path, pass: &str) -> PathBuf {
+        write_manifest_json(dir, valid_manifest_json());
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        make_cipher_db_sql(&core.join("Index.db"), pass, INDEX_DB_SQL);
+        for name in ["111.db", "g222.db", "stranger_box.db"] {
+            make_cipher_db_sql(&core.join("Message").join(name), pass, CODES_DB_SQL);
+        }
+        for name in ["undefined.db", "weird.db"] {
+            std::fs::write(core.join("Message").join(name), b"fake").unwrap();
+        }
+        let key = dir.join("d7.bin");
+        fake_d7_key_file(&key, pass);
+        key
+    }
+
+    /// ImportArgs with parsed `--distinct` specs for a synthetic snapshot.
+    #[cfg(windows)]
+    fn distinct_args(from: &Path, uin: &str, key: &Path, specs: &[&str]) -> ImportArgs {
+        let mut a = args_for(from, uin, Some(key));
+        a.distinct = specs
+            .iter()
+            .map(|s| super::distinct::parse_spec(s).unwrap())
+            .collect();
+        a
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_distinct_prints_code_values_only_and_writes_nothing() {
+        let dir = temp_dir("dst");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_codes(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        let a = distinct_args(
+            &dir,
+            &uin,
+            &key,
+            &[
+                "one2one:message.msgType",
+                "group:message.msgType",
+                "stranger:message.status",
+                "index:conv.isGroup",
+            ],
+        );
+        let lines = run_distinct(&a).unwrap();
+        let joined = lines.join("\n");
+        // Headers name the kind, the column and the sample source (a
+        // relative path — not data).
+        assert!(
+            joined.contains("distinct: one2one:message.msgType source=Core/Message/111.db"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("distinct: group:message.msgType source=Core/Message/g222.db"),
+            "{joined}"
+        );
+        assert!(
+            joined
+                .contains("distinct: stranger:message.status source=Core/Message/stranger_box.db"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("distinct: index:conv.isGroup source=Core/Index.db"),
+            "{joined}"
+        );
+        // msgType (mixed types in one column): the integer counts
+        // first (count order), then the singles — the code-shaped TEXT
+        // prints as the token, the blob prints its length only.
+        assert!(joined.contains("  1 x 2"), "{joined}");
+        for needle in [
+            "  2 x 1", "  NULL x 1", "  chat.photo x 1", "  blob(len=1) x 1",
+        ] {
+            assert!(joined.contains(needle), "{needle} missing: {joined}");
+        }
+        // status: 0 x 5, 1 x 1. conv.isGroup: 0/1 only.
+        assert!(joined.contains("  0 x 5"), "{joined}");
+        assert!(joined.contains("  1 x 1"), "{joined}");
+        // Privacy (the N1 point): the sentence content of `content`/
+        // `message` never appears — those columns were never read, and
+        // the only TEXT printed is the code-shaped one.
+        assert!(!joined.contains("sentences"), "{joined}");
+        assert!(!joined.contains("words"), "{joined}");
+        // Immutable proof: nothing was created in the snapshot.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(
+            names,
+            vec![
+                "111.db".to_string(),
+                "g222.db".to_string(),
+                "stranger_box.db".to_string(),
+                "undefined.db".to_string(),
+                "weird.db".to_string(),
+            ]
+        );
+        // The CLI exit-code path: success → 0.
+        let mut argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            uin,
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
+        // A refused column through the same path: exit 1.
+        argv.push("--distinct".into());
+        argv.push("one2one:message.content".into());
+        assert_eq!(crate::shadow::cli::main(&argv), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_distinct_refuses_content_columns_naming_the_rule() {
+        let dir = temp_dir("dstrf");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_codes(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        // `content` and `message` are content-bearing: refused with
+        // the rule quoted; no row is read.
+        let a = distinct_args(&dir, &uin, &key, &["one2one:message.content"]);
+        let e = run_distinct(&a).unwrap_err();
+        assert!(e.contains("--distinct validation (1 error(s))"), "{e}");
+        assert!(
+            e.contains("column \"content\" is not on the code-column whitelist"),
+            "{e}"
+        );
+        assert!(
+            e.contains(&format!("rule: {}", super::distinct::CODE_COLUMN_RULE)),
+            "{e}"
+        );
+        // Every violation at once (the plan convention): two refused
+        // columns, a missing column, a missing table.
+        let a = distinct_args(
+            &dir,
+            &uin,
+            &key,
+            &[
+                "one2one:message.content",
+                "group:message.message",
+                "group:message.noCol",
+                "stranger:zzz.msgType",
+            ],
+        );
+        let e = run_distinct(&a).unwrap_err();
+        assert!(e.contains("(4 error(s))"), "{e}");
+        assert!(e.contains("column \"message\" is not on the code-column whitelist"), "{e}");
+        assert!(e.contains("column \"noCol\" does not exist in table \"message\""), "{e}");
+        assert!(e.contains("table \"zzz\" does not exist"), "{e}");
+        assert!(
+            e.contains("inventory Core/Message/g222.db") || e.contains("g222.db"),
+            "{e}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

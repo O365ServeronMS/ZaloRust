@@ -1,6 +1,7 @@
 //! `zalors import` CLI (P2, audit §4 items 2.0–2.4; batch 6 F1;
 //! batch 12 adds `--inventory`/`--out` and the
-//! `--mapping`/`--shadow-copy`/`--delta` dry-run mode).
+//! `--mapping`/`--shadow-copy`/`--delta` dry-run mode; batch 14
+//! adds the whitelisted `--distinct` code-column probe).
 //!
 //! Spec (KQ4: the import only ever reads a COLD SNAPSHOT):
 //! ```text
@@ -8,6 +9,7 @@
 //!              [--key-file <file>] [--cipher-compat <3|4>]
 //!              [--dry-run | --apply]
 //!              [--inventory [--out <file>]
+//!               | [--distinct <dbkind>:<table>.<column>]… (max 10)
 //!               | [--mapping <file>] [--shadow-copy <dir>] [--delta]]
 //!              [--help]
 //! ```
@@ -44,6 +46,14 @@ modes (one per run; all dry-run only — --apply stays fail-closed):
   --inventory                schema inventory of Core\\Index.db + ONE sample
                              per message-DB kind (names/types/counts only);
                              --out <file> writes the same as JSON
+  --distinct <kind>:<t>.<c>  whitelisted code-column distinct values from the
+                             first sample DB of that kind (batch 14): the
+                             column NAME must match the code-column whitelist
+                             (type/kind/status/state/cmd/.../is*/has*), values
+                             render code-shape only — numbers, NULL, <=32-char
+                             [A-Za-z0-9._:-] tokens, else text(len,h12) /
+                             blob(len) fingerprints; repeatable, max 10 per
+                             run
   --mapping <file>           mapping dry run (docs/import-mapping.md): extract
   [--shadow-copy <dir>]      per the mapping JSON and, with --shadow-copy,
   [--delta]                  classify each write READ-ONLY against a temp
@@ -61,6 +71,8 @@ flags:
 --shadow-copy    shadow STORE dir whose temp COPY is classified against
                   (its files are read; the store itself is never opened)
 --delta          skip rows at/before the per-DB import cursor (dry-run only)
+--distinct       see the modes above: whitelisted code-column distinct
+                  values, repeatable, max 10 per run, dry-run only
 --dry-run        inventory only, zero writes (the default)
 --apply          write into the shadow DB (not wired yet: fail-closed)
 --help           this usage, exit 0";
@@ -93,6 +105,11 @@ pub struct ImportArgs {
     /// `--delta` (batch 12 L4): skip rows at/before the per-DB cursor
     /// (dry-run only now).
     pub delta: bool,
+    /// `--distinct <dbkind>:<table>.<column>` (batch 14 N1), parsed
+    /// specs in argv order: whitelisted code-column distinct values
+    /// from the first sample DB of each kind. Repeatable, max
+    /// `distinct::MAX_PER_RUN` per run; dry-run only.
+    pub distinct: Vec<import::distinct::DistinctSpec>,
     /// `--apply`: write into the shadow DB (still fail-closed).
     pub apply: bool,
     /// `--help`: print usage, exit 0 (no other flag required).
@@ -165,6 +182,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let mut out: Option<PathBuf> = None;
     let mut mapping: Option<PathBuf> = None;
     let mut shadow_copy: Option<PathBuf> = None;
+    let mut distinct: Vec<import::distinct::DistinctSpec> = Vec::new();
     let (mut dry_run, mut apply, mut help, mut inventory, mut delta) =
         (false, false, false, false, false);
 
@@ -181,6 +199,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--out"
                 | "--mapping"
                 | "--shadow-copy"
+                | "--distinct"
         );
         if value_flag {
             let value =
@@ -199,6 +218,20 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 "--out" => set_once(&mut out, flag, PathBuf::from(value))?,
                 "--mapping" => set_once(&mut mapping, flag, PathBuf::from(value))?,
                 "--shadow-copy" => set_once(&mut shadow_copy, flag, PathBuf::from(value))?,
+                // Batch 14 N1: repeatable, max 10 per run. The spec
+                // shape (kind, table, column) is validated HERE, pure;
+                // existence + the code-column whitelist run against
+                // the inventory in `run_distinct`.
+                "--distinct" => {
+                    distinct.push(import::distinct::parse_spec(value)?);
+                    if distinct.len() > import::distinct::MAX_PER_RUN {
+                        return Err(format!(
+                            "--distinct: at most {} per run (this is the {}th)",
+                            import::distinct::MAX_PER_RUN,
+                            distinct.len()
+                        ));
+                    }
+                }
                 _ => unreachable!("the value_flag match lists every value flag"),
             }
             i += 2;
@@ -225,8 +258,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     if dry_run && apply {
         return Err("--dry-run and --apply are mutually exclusive".into());
     }
-    // Batch-12 modes stay dry-run only (2.5 is a later, user-approved
-    // step): refuse any combination with --apply, naming the flag.
+    // Batch-12/14 modes stay dry-run only (2.5 is a later,
+    // user-approved step): refuse any combination with --apply,
+    // naming the flag.
     if apply {
         let conflicting = [
             ("--inventory", inventory),
@@ -234,6 +268,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             ("--out", out.is_some()),
             ("--mapping", mapping.is_some()),
             ("--shadow-copy", shadow_copy.is_some()),
+            ("--distinct", !distinct.is_empty()),
         ]
         .into_iter()
         .find(|(_, on)| *on);
@@ -250,6 +285,16 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     if inventory && (mapping.is_some() || shadow_copy.is_some() || delta) {
         return Err(
             "--inventory cannot be combined with --mapping/--shadow-copy/--delta \
+             (one mode per run)"
+                .into(),
+        );
+    }
+    // Batch 14 N1: --distinct is its own mode too.
+    if !distinct.is_empty()
+        && (inventory || mapping.is_some() || shadow_copy.is_some() || delta)
+    {
+        return Err(
+            "--distinct cannot be combined with --inventory/--mapping/--shadow-copy/--delta \
              (one mode per run)"
                 .into(),
         );
@@ -273,6 +318,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             mapping,
             shadow_copy,
             delta,
+            distinct,
             apply: false,
             help: true,
         });
@@ -288,6 +334,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         mapping,
         shadow_copy,
         delta,
+        distinct,
         apply,
         help: false,
     })
@@ -330,6 +377,19 @@ pub fn main(args: &[String]) -> i32 {
                 }
             }
         }
+        // Batch 14 N1: the whitelisted distinct-values mode.
+        Ok(a) if !a.distinct.is_empty() => match import::run_distinct(&a) {
+            Ok(lines) => {
+                for line in &lines {
+                    println!("{line}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                1
+            }
+        },
         Ok(a) => match import::run(&a) {
             Ok(summary) => {
                 // F4: counts, profile name, key sha12 — nothing else.
@@ -351,6 +411,7 @@ pub fn main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow::import_map;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -684,6 +745,124 @@ mod tests {
         // Either selector is enough (required flags included).
         assert!(parse(&with_base(&["--delta", "--mapping", "m.json"])).is_ok());
         assert!(parse(&with_base(&["--delta", "--shadow-copy", r"D:\s"])).is_ok());
+    }
+
+    // --- batch 14 N1: --distinct ----------------------------------------
+
+    #[test]
+    fn parse_distinct_consumes_one_value_and_repeats_to_ten() {
+        // Ten specs parse; the 11th is refused with the cap named.
+        let mut v = args(&[
+            "--from-snapshot",
+            "s",
+            "--account",
+            "default",
+            "--uin-hash",
+            "dca62c394a68",
+        ]);
+        for i in 0..10 {
+            v.push("--distinct".into());
+            v.push(format!("one2one:message.msgType{i}"));
+        }
+        let a = parse(&v).unwrap();
+        assert_eq!(a.distinct.len(), 10);
+        assert_eq!(a.distinct[0].column, "msgType0");
+        assert_eq!(a.distinct[9].column, "msgType9");
+        assert_eq!(a.distinct[0].kind, import_map::MapDb::OneToOne);
+        // Duplicate specs are allowed (the brief says repeatable).
+        let a = parse(&args(&[
+            "--from-snapshot",
+            "s",
+            "--account",
+            "default",
+            "--uin-hash",
+            "dca62c394a68",
+            "--distinct",
+            "one2one:message.msgType",
+            "--distinct",
+            "one2one:message.msgType",
+        ]))
+        .unwrap();
+        assert_eq!(a.distinct.len(), 2);
+        v.push("--distinct".into());
+        v.push("one2one:message.eleventh".into());
+        let e = parse(&v).unwrap_err();
+        assert!(e.contains("at most 10 per run"), "{e}");
+        assert!(e.contains("11th"), "{e}");
+        // A missing or flag-like value is an error, like every value flag.
+        let e = parse(&args(&["--distinct"])).unwrap_err();
+        assert!(e.contains("--distinct requires a value"), "{e}");
+        let e = parse(&args(&["--distinct", "--apply"])).unwrap_err();
+        assert!(e.contains("--distinct requires a value"), "{e}");
+    }
+
+    #[test]
+    fn parse_distinct_validates_the_spec_shape() {
+        let a = parse(&with_base(&["--distinct", "index:conversation.isGroup"])).unwrap();
+        assert_eq!(
+            a.distinct,
+            vec![import::distinct::DistinctSpec {
+                kind: import_map::MapDb::Index,
+                table: "conversation".into(),
+                column: "isGroup".into(),
+            }]
+        );
+        for (bad, needle) in [
+            (
+                "bogus:message.msgType",
+                "unknown dbkind \"bogus\" (allowed: index, one2one, group, stranger)",
+            ),
+            ("one2one", "must be <dbkind>:<table>.<column>"),
+            ("one2one:message", "missing the .<column> part"),
+            ("one2one:.msgType", "empty <table> part"),
+            ("group:message.", "empty <column> part"),
+        ] {
+            let e = parse(&with_base(&["--distinct", bad])).unwrap_err();
+            assert!(e.contains(&format!("--distinct {bad:?}:")), "{bad} -> {e}");
+            assert!(e.contains(needle), "{bad} -> {e}");
+        }
+    }
+
+    #[test]
+    fn parse_distinct_conflicts_with_apply_and_the_other_modes() {
+        // --apply names the flag (dry-run only).
+        let e = parse(&args(&[
+            "--apply",
+            "--distinct",
+            "index:conversation.isGroup",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains("--distinct is dry-run only and conflicts with --apply"),
+            "{e}"
+        );
+        // One mode per run.
+        for flags in [
+            vec!["--inventory", "--distinct", "index:conversation.isGroup"],
+            vec!["--mapping", "m.json", "--distinct", "index:conversation.isGroup"],
+            vec!["--delta", "--mapping", "m.json", "--distinct", "index:conversation.isGroup"],
+            vec!["--shadow-copy", r"D:\s", "--distinct", "index:conversation.isGroup"],
+        ] {
+            let e = parse(&args(&flags)).unwrap_err();
+            assert!(e.contains("--distinct cannot be combined"), "{e}");
+        }
+        // --out still needs --inventory.
+        let e = parse(&args(&["--distinct", "index:conversation.isGroup", "--out", "o.json"]))
+            .unwrap_err();
+        assert!(e.contains("--out needs --inventory"), "{e}");
+        // --help yields on a consistent invocation…
+        let a = parse(&args(&["--help", "--distinct", "index:conversation.isGroup"])).unwrap();
+        assert!(a.help);
+        // …but a conflicting pair is still an error — conflicts beat
+        // help, exactly like the batch-6 --dry-run/--apply rule.
+        let e = parse(&args(&[
+            "--help",
+            "--inventory",
+            "--distinct",
+            "index:conversation.isGroup",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--distinct cannot be combined"), "{e}");
     }
 
     #[test]
