@@ -102,6 +102,9 @@ select option { background: var(--bg); color: var(--fg); }
 .add-row input { border-radius:24px; min-width: 0; flex: 1; background: var(--hover); border: 0; padding: 12px 14px; }
 .hotkey-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .hotkey-row input { min-width: 0; width: 190px; }
+/* Shadow storage (batch 7): a folder path needs more room than a key
+   combination; the pick button sits beside it in the same row. */
+.hotkey-row input.wide { width: min(340px, 60vw); }
 .recording { outline: 2px dashed var(--green); }
 .hotkey-hint { font-size: 13px; color: var(--warn); }
 .footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 24px; border-top: 1px solid var(--border); }

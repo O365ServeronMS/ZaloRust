@@ -11,7 +11,7 @@
   </head>
   <body>
     <header class="app-header"><div><strong>Configurações</strong><span>Zalo</span></div><button id="back-to-chat" type="button" class="secondary back-button" aria-label="Voltar ao Zalo" title="Voltar ao Zalo" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5 M12 5l-7 7 7 7"/></svg><span>Voltar ao Zalo</span></button></header>
-    <div class="settings-layout"><nav class="settings-nav" aria-label="Configurações"><a href="#sec-contas">Contas</a><a href="#sec-notificacoes">Notificações</a><a href="#sec-aparencia">Aparência</a><a href="#sec-seguranca">Segurança</a><a href="#sec-sistema">Inicialização</a><a href="#sec-rede">Rede</a><a href="#sec-atualizacoes">Atualizações</a><a href="#sec-atalhos">Atalhos</a><a href="#sec-diagnostico">Diagnóstico</a></nav>
+    <div class="settings-layout"><nav class="settings-nav" aria-label="Configurações"><a href="#sec-contas">Contas</a><a href="#sec-notificacoes">Notificações</a><a href="#sec-aparencia">Aparência</a><a href="#sec-seguranca">Segurança</a><a href="#sec-sistema">Inicialização</a><a href="#sec-rede">Rede</a><a href="#sec-shadow">Armazenamento</a><a href="#sec-atualizacoes">Atualizações</a><a href="#sec-atalhos">Atalhos</a><a href="#sec-diagnostico">Diagnóstico</a></nav>
     <!-- Local preferences use familiar Zalo rows: titled
          groups of boxed-list rows, a title + subtitle on the left and the control
          on the right. Element ids are what main.js uses; keep them stable. -->
@@ -139,6 +139,31 @@
         </div>
         <p class="group-note">Proxy com usuário e senha não é suportado: os navegadores embutidos não aceitam credenciais por esse caminho. A alteração vale após reiniciar o Zalo.</p>
         <p id="proxy_restart" class="hotkey-hint" hidden><span>Reinicie o Zalo para aplicar o proxy.</span> <button type="button" id="proxy_restart_btn" class="secondary">Reiniciar agora</button></p>
+      </section>
+
+      <section class="group" id="sec-shadow">
+        <h2 class="group-title">Armazenamento shadow</h2>
+        <div class="boxed-list">
+          <div class="row">
+            <span class="row-text"><span class="row-title">Pasta de armazenamento de mídia</span>
+              <span class="row-subtitle">Onde os arquivos de mídia capturados são gravados. Vazio usa a pasta padrão.</span></span>
+            <div class="hotkey-row">
+              <input type="text" id="media_store" class="wide" autocomplete="off" spellcheck="false" aria-label="Pasta de armazenamento de mídia" />
+              <button type="button" id="choose_media_store" class="secondary">Escolher pasta…</button>
+            </div>
+          </div>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Uid da própria conta</span>
+              <span class="row-subtitle">O userId do Zalo desta conta (5 a 32 dígitos). Vazio mantém o aprendido pela sessão.</span></span>
+            <input type="text" id="own_uid" autocomplete="off" spellcheck="false" inputmode="numeric" aria-label="Uid da própria conta" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Hash UIN</span>
+              <span class="row-subtitle">sha256 do UIN em 12 caracteres hexadecimais minúsculos. Vazio não grava a linha da conta.</span></span>
+            <input type="text" id="own_uin_hash" autocomplete="off" spellcheck="false" aria-label="Hash UIN" />
+          </label>
+        </div>
+        <p class="group-note">As alterações desta seção são aplicadas após reiniciar o Zalo.</p>
       </section>
 
       <section class="group" id="sec-atualizacoes">

@@ -56,6 +56,10 @@ pub mod repair;
 pub mod rest_stats;
 pub mod runtime;
 pub mod schema;
+/// Shadow settings field validation (audit 1.3/KQ9 + 1.4/KQ2, batch 7
+/// G1): the pure checks `commands::set_settings` runs before the
+/// settings file is written.
+pub mod settings_check;
 /// WS frame stage counters (audit M4/D2, batch 4).
 pub mod ws_stats;
 pub mod wire;
@@ -230,3 +234,10 @@ mod maint_repair;
 
 #[cfg(test)]
 mod maint_purge;
+
+/// MAINTENANCE (audit KQ8, batch 7 G5): replay the misplaced Roaming
+/// store into a temp COPY of the main one — filtered, idempotent,
+/// never the live DB. Selection/dedupe are pure + unit-tested; the
+/// replay itself is the ignored `maint_replay_roaming` test.
+#[cfg(test)]
+mod maint_replay;

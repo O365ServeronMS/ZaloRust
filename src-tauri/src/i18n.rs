@@ -291,6 +291,15 @@ static EN_TABLE: &[(&str, &str)] = &[
     ("Não há atualização instalada para reiniciar.", "There is no installed update to restart into."),
     ("Não foi possível reiniciar o Zalo. Abra-o manualmente.", "Could not restart Zalo. Please open it yourself."),
     ("Atualizar para {0}", "Update to {0}"),
+    // shadow settings validation (audit 1.3/KQ9 + 1.4/KQ2, batch 7 G1;
+    // PT keys only — the settings window lives in settings-ui/)
+    ("O caminho da pasta de armazenamento precisa ser absoluto.", "The storage folder path must be absolute."),
+    ("A pasta de armazenamento não existe.", "The storage folder does not exist."),
+    ("O caminho de armazenamento não é uma pasta.", "The storage path is not a folder."),
+    ("Não é possível gravar na pasta de armazenamento.", "The storage folder is not writable."),
+    ("A pasta de armazenamento precisa estar na mesma unidade dos dados do Zalo.", "The storage folder must be on the same drive as the Zalo data."),
+    ("O uid configurado não é válido: use de 5 a 32 dígitos.", "The configured uid is not valid: use 5 to 32 digits."),
+    ("O hash UIN configurado não é válido: use 12 caracteres hexadecimais minúsculos.", "The configured UIN hash is not valid: use 12 lowercase hexadecimal characters."),
     // window titles
     ("Zalo — Configurações", "Zalo — Settings"),
     ("Zalo — Conta destacada", "Zalo — Detached account"),

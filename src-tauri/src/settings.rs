@@ -668,6 +668,24 @@ mod tests {
     }
 
     #[test]
+    fn shadow_settings_roundtrip_keeps_every_field_untouched() {
+        // Batch 7 G1: a settings save that does not touch the shadow
+        // section must keep the stored media_store / own_uid /
+        // own_uin_hash verbatim — `set_settings` persists exactly this
+        // struct, so its serialization is the round-trip contract.
+        let mut s = Settings::default();
+        s.shadow.media_store = Some("D:\\ZaloRust Data".into()); // documented install default
+        s.shadow.own_uid = Some("1234567890123456789".into()); // FAKE uid
+        s.shadow.own_uin_hash = Some("abc123def456".into()); // FAKE hash
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s, "the whole struct survives a save cycle");
+        assert_eq!(back.shadow.media_store.as_deref(), Some("D:\\ZaloRust Data"));
+        assert_eq!(back.shadow.own_uid.as_deref(), Some("1234567890123456789"));
+        assert_eq!(back.shadow.own_uin_hash.as_deref(), Some("abc123def456"));
+    }
+
+    #[test]
     fn roundtrip() {
         let s = Settings {
             autostart: true,

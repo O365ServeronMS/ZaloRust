@@ -71,7 +71,19 @@ fn assert_is_temp_copy(tmp: &Path) {
 /// the OS temp dir (same uniqueness pattern as `golden::open_oracle`:
 /// pid+ms alone collided with parallel tests) and return the dir. The
 /// copy is left on disk.
+///
+/// Batch 7 G5 (KQ8): the copy step is split from the dir choice so the
+/// Roaming misplaced store can be copied the same way — see
+/// [`copy_live_set_from`].
 pub fn copy_live_set() -> PathBuf {
+    copy_live_set_from(&probe_dir())
+}
+
+/// [`copy_live_set`] for an EXPLICIT store dir — used by the KQ8 replay
+/// (`maint_replay.rs`) to copy the misplaced Roaming store. The temp
+/// assertion still runs: a caller passing the live dir by accident gets
+/// a fresh COPY under the OS temp dir, never a handle on the source.
+pub fn copy_live_set_from(dir: &Path) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = std::env::temp_dir().join(format!(
         "zr-probe-{}-{}-{}",
@@ -81,7 +93,8 @@ pub fn copy_live_set() -> PathBuf {
     ));
     std::fs::create_dir_all(&tmp).unwrap();
     assert_is_temp_copy(&tmp);
-    for from in live_set(&probe_dir()) {
+    assert_ne!(tmp, dir, "probe copy must never be the source dir");
+    for from in live_set(dir) {
         if !from.exists() {
             continue; // -wal/-shm are absent on a checkpointed store
         }
@@ -121,6 +134,16 @@ pub fn open_copy_rw() -> (Connection, PathBuf) {
     let tmp = copy_live_set();
     assert_is_temp_copy(&tmp);
     (open_at(&tmp, false), tmp)
+}
+
+/// Open a COPY of an EXPLICIT store dir (batch 7 G5/KQ8): the misplaced
+/// Roaming store read-only as the replay SOURCE, or any store copy
+/// read-write. Same guarantee as [`open_copy`]/[`open_copy_rw`] — the
+/// connection is on a temp copy, never on `dir`.
+pub fn open_copy_from(dir: &Path, readonly: bool) -> (Connection, PathBuf) {
+    let tmp = copy_live_set_from(dir);
+    assert_is_temp_copy(&tmp);
+    (open_at(&tmp, readonly), tmp)
 }
 
 /// The `raw_events` id baseline for coverage probes (`ZR_PROBE_SINCE_ID`;
@@ -200,5 +223,42 @@ mod tests {
                 super::super::key_file(dir),
             ]
         );
+    }
+
+    #[test]
+    fn copy_live_set_from_copies_an_explicit_dir_under_temp() {
+        // A FAKE store (opaque bytes), never a real one: the KQ8 replay
+        // copies the Roaming dir the same way the probes copy the live
+        // dir, and this checks the mechanics without touching it.
+        let fake = std::env::temp_dir().join(format!(
+            "zr-fake-store-{}-{}",
+            std::process::id(),
+            super::super::schema::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&fake);
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(super::super::db_file(&fake), b"opaque-bytes-db").unwrap();
+        std::fs::write(fake.join("default.db-wal"), b"opaque-bytes-wal").unwrap();
+        std::fs::write(super::super::key_file(&fake), b"opaque-bytes-key").unwrap();
+
+        let tmp = copy_live_set_from(&fake);
+        assert!(tmp.starts_with(std::env::temp_dir()));
+        assert_ne!(tmp, fake);
+        assert_eq!(
+            std::fs::read(tmp.join("default.db")).unwrap(),
+            b"opaque-bytes-db"
+        );
+        assert_eq!(
+            std::fs::read(tmp.join("default.db-wal")).unwrap(),
+            b"opaque-bytes-wal"
+        );
+        // -wal/-shm present in the source are copied; -shm absent here.
+        assert!(!tmp.join("default.db-shm").exists());
+        assert_eq!(
+            std::fs::read(tmp.join("default.key")).unwrap(),
+            b"opaque-bytes-key"
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::remove_dir_all(&fake).unwrap();
     }
 }

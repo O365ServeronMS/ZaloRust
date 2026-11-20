@@ -92,6 +92,22 @@ async function resetDownloadDir() {
   await save();
 }
 
+// Reuses the download-dir folder picker (batch 7 G1): pick_download_dir
+// only chooses a folder and returns the path (null on cancel) — the
+// path is then saved with the other settings and validated by
+// set_settings (media-store checks, KQ9).
+async function chooseMediaStore() {
+  const input = document.getElementById("media_store");
+  const previous = input.value;
+  try {
+    const dir = await invoke("pick_download_dir");
+    if (!dir) return;
+    input.value = dir;
+    // save() shows a refusal in the note; then restore the input.
+    if (!(await save())) input.value = previous;
+  } catch (e) { flash(String(e)); }
+}
+
 async function chooseIcon() {
   try {
     if (await invoke("choose_app_icon")) { showIcon(true); flash("Alterações salvas ✓", 1500); }
@@ -148,6 +164,12 @@ async function load() {
   syncMenuBarIconRow();
   downloadDir = s.download_dir || null;
   showDownloadDir();
+  // Shadow storage (batch 7 G1): the three fields round-trip through
+  // the settings object — a save that does not touch them keeps the
+  // stored values, because save() only overrides what the page shows.
+  document.getElementById("media_store").value = s.shadow?.media_store || "";
+  document.getElementById("own_uid").value = s.shadow?.own_uid || "";
+  document.getElementById("own_uin_hash").value = s.shadow?.own_uin_hash || "";
   showIcon(!!s.custom_icon);
   loadProxy(s);
 }
@@ -204,6 +226,13 @@ async function save() {
   s.zoom = parseFloat(document.getElementById("zoom").value) || ZOOM_DEFAULT;
   s.language = document.getElementById("language").value;
   s.download_dir = downloadDir;
+  // Shadow storage (batch 7 G1): empty text = not configured (null).
+  // Shape validation (uid digits, 12 lowercase hex) and the media-store
+  // folder checks run in set_settings; its error strings never echo
+  // the typed values.
+  s.shadow.media_store = document.getElementById("media_store").value.trim() || null;
+  s.shadow.own_uid = document.getElementById("own_uid").value.trim() || null;
+  s.shadow.own_uin_hash = document.getElementById("own_uin_hash").value.trim() || null;
   if (proxySupported) {
     s.proxy_mode = document.getElementById("proxy_mode").value;
     s.proxy_host = document.getElementById("proxy_host").value.trim();
@@ -372,6 +401,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("record_blur_hotkey").addEventListener("click", () => toggleRecording("blur_hotkey", "record_blur_hotkey"));
   document.getElementById("choose_download_dir").addEventListener("click", chooseDownloadDir);
   document.getElementById("reset_download_dir").addEventListener("click", resetDownloadDir);
+  document.getElementById("choose_media_store").addEventListener("click", chooseMediaStore);
   document.getElementById("choose_icon").addEventListener("click", chooseIcon);
   document.getElementById("reset_icon").addEventListener("click", resetIcon);
   // Zoom saves on change rather than on Save: picking a size you cannot see the

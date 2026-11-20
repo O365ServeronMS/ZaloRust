@@ -353,5 +353,21 @@
  "Could not restart Zalo. Please open it yourself.": "Không thể khởi động lại Zalo. Hãy tự mở lại.",
  "Update to {0}": "Cập nhật lên {0}",
  "Zalo — Detached account": "Zalo — Tài khoản tách riêng",
- "Cannot reach the published releases (HTTP {0}). The repository may be private.": "Không truy cập được các bản phát hành (HTTP {0}). Kho mã nguồn có thể đang ở chế độ riêng tư."
+ "Cannot reach the published releases (HTTP {0}). The repository may be private.": "Không truy cập được các bản phát hành (HTTP {0}). Kho mã nguồn có thể đang ở chế độ riêng tư.",
+ "The storage folder path must be absolute.": "Đường dẫn thư mục lưu trữ phải là đường dẫn tuyệt đối.",
+ "The storage folder does not exist.": "Thư mục lưu trữ không tồn tại.",
+ "The storage path is not a folder.": "Đường dẫn lưu trữ không phải là một thư mục.",
+ "The storage folder is not writable.": "Thư mục lưu trữ không ghi được.",
+ "The storage folder must be on the same drive as the Zalo data.": "Thư mục lưu trữ phải nằm trên cùng một ổ đĩa với dữ liệu Zalo.",
+ "The configured uid is not valid: use 5 to 32 digits.": "Uid đã cấu hình không hợp lệ: hãy dùng 5 đến 32 chữ số.",
+ "The configured UIN hash is not valid: use 12 lowercase hexadecimal characters.": "Hash UIN đã cấu hình không hợp lệ: hãy dùng 12 ký tự thập lục phân viết thường.",
+ "Storage": "Lưu trữ",
+ "Shadow storage": "Lưu trữ shadow",
+ "Media storage folder": "Thư mục lưu trữ media",
+ "Where captured media files are written. Empty uses the default folder.": "Nơi ghi các tệp media đã thu thập. Để trống sẽ dùng thư mục mặc định.",
+ "Own account uid": "Uid tài khoản của mình",
+ "This account's Zalo userId (5 to 32 digits). Empty keeps the session-learned one.": "userId Zalo của tài khoản này (5 đến 32 chữ số). Để trống sẽ giữ giá trị học được từ phiên.",
+ "UIN hash": "Hash UIN",
+ "sha256 of the UIN as 12 lowercase hex characters. Empty skips the accounts row.": "sha256 của UIN dạng 12 ký tự thập lục phân viết thường. Để trống sẽ bỏ qua hàng tài khoản.",
+ "Changes in this section take effect after restarting Zalo.": "Các thay đổi trong mục này có hiệu lực sau khi khởi động lại Zalo."
 }

@@ -333,6 +333,35 @@ pub fn set_settings(
             crate::downloads::validate_dir(std::path::Path::new(dir))?;
         }
     }
+    // Shadow store + own identity (audit 1.3/KQ9 + 1.4/KQ2, batch 7 G1):
+    // a NEWLY chosen media_store must work now (an unchanged one is not
+    // re-checked, the same rule as download_dir — the flusher's own root
+    // resolution falls back when a saved folder has gone away); the uid /
+    // uin_hash shapes are validated on every save. Error strings are
+    // translated and never echo the values.
+    {
+        let (uid, uin_hash) = crate::shadow::settings_check::validate_own_identity(
+            settings.shadow.own_uid.as_deref(),
+            settings.shadow.own_uin_hash.as_deref(),
+        )?;
+        settings.shadow.own_uid = uid;
+        settings.shadow.own_uin_hash = uin_hash;
+        let media_store =
+            crate::shadow::settings_check::normalize_media_store(settings.shadow.media_store.as_deref());
+        if media_store != stored.shadow.media_store {
+            if let Some(path) = &media_store {
+                // KQ9/D9: the same-volume check only applies while the
+                // Desktop data root actually exists on this machine.
+                let reference = std::path::Path::new(crate::shadow::settings_check::DESKTOP_DATA_ROOT);
+                let reference = reference.is_dir().then_some(reference);
+                crate::shadow::settings_check::validate_media_store(
+                    std::path::Path::new(path),
+                    reference,
+                )?;
+            }
+        }
+        settings.shadow.media_store = media_store;
+    }
     // The icon is only switched through choose_app_icon / reset_app_icon.
     settings.custom_icon = stored.custom_icon;
     crate::proxy::validate(&mut settings)?;
