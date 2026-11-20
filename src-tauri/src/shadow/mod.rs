@@ -63,6 +63,11 @@ pub mod repair;
 pub mod rest_stats;
 pub mod runtime;
 pub mod schema;
+/// Full-text search over `messages` via the contentless FTS5 mirror
+/// `messages_fts` (audit KQ5 / §4 Phase 3 item 3.1, batch 9):
+/// Vietnamese-friendly folding (tone marks via the tokenizer, đ/Đ in
+/// Rust), raw user input never reaches MATCH, hits carry ids only.
+pub mod search;
 /// Shadow settings field validation (audit 1.3/KQ9 + 1.4/KQ2, batch 7
 /// G1): the pure checks `commands::set_settings` runs before the
 /// settings file is written.

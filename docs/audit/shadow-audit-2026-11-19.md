@@ -351,3 +351,51 @@ Trình tự deploy đề xuất (sáng 20-Nov, sau khi đọc probe soak V11 tr�
 4. Nếu sau khi mở chat E2EE mà `delivered=0` trong khi cmd 551 có chảy → đường plaintext nằm ở hàm bị loại; đọc dòng `decrypt inventory:` và nới `zrTapName` cho đúng tên đó (không bao giờ nới cho hàm key/cipher).
 
 Chưa làm (cần user quyết): sửa H1–H4, apply purge, deploy, merge vào `feat/shadow-db-rebuild`, push.
+
+### Batches 4–9 (GLM)
+
+Các batch build tiếp theo (trên branch audit, mỗi batch kết thúc bằng
+`cargo test --lib` xanh + golden PASS trên oracle đóng băng):
+
+- **Batch 4** (H3/H4 tail + D2): uid cấu hình thắng uid handshake (D1);
+  khoá WS theo từng connection trong map bounded (M4); rate-limit bridge
+  (M3); zeroize vật liệu khoá (L4); review fixes R0–R3 (pin hình dạng
+  `PRAGMA key`, kỷ luật BEGIN/COMMIT).
+- **Batch 5** (E0/E4): probe chỉ mở bản COPY temp của DB sống (READ_ONLY
+  WAL vẫn chạm `-shm`); hoàn thiện `repair_v1` + harness dry-run trên copy.
+- **Batch 6** (M2): skeleton import P2 chạy được: dispatch CLI, parse
+  fail-closed, unwrap D7 không entropy, mở DB Desktop dạng passphrase,
+  liệt kê đúng `Message\*.db`.
+- **Batch 7** (G1/G5 + KQ8): settings UI cho media_store/uid/uin_hash
+  (EN/VI, lỗi không echo giá trị); harness replay store Roaming sai vị
+  trí vào bản copy; công cụ soak.
+- **Batch 8** (audit 4.1/4.2/4.3, KQ6): backup DB `sqlcipher_export` +
+  verify + retention 7 daily/4 weekly; backup media incremental; guard
+  dung lượng D13 pause media (text capture không bị); backup thread OFF
+  mặc định; `probe_backup_restore`.
+- **Batch 9** (KQ5, §4 Phase 3 item 3.1): review fixes I0 (cleanup tmp
+  chỉ chạm `shadow-<yyyyMMdd-HHmmss>.db.tmp`; validate media_store từ
+  chối < 5 GiB trống, lỗi EN/VI chỉ in số GiB); I1 test năng lực FTS5
+  (build bundled SQLCipher = SQLite 3.46.1, `ENABLE_FTS5`,
+  `contentless_delete`); I2 schema v2: bảng contentless `messages_fts`
+  + 3 trigger đồng bộ (fold đ/Đ→d, `remove_diacritics 2`) + backfill
+  một transaction khi nâng cấp v1→v2 (stamp qua `schema_meta`); I3
+  `search.rs`: query fold+quote không bao giờ vào MATCH thô, thứ tự
+  bm25 → ts DESC, hit chỉ id+ts; I4 guard đơn vị overhead trigger
+  (<50%) + `probe_fts_bench` (reviewer chạy trên copy); §5 này.
+
+Chưa xác minh runtime (reviewer chạy):
+- golden replay trên oracle đóng băng với schema mới — replay DB đi qua
+  `schema::apply` nên trigger FTS chạy trong lúc replay; so sánh chỉ
+  đụng `messages`/`conversations` nên về nguyên tắc không đổi, nhưng
+  phải chạy lại để xác nhận (người implement không chạy được golden).
+- `probe_fts_bench` trên bản copy live: thời gian backfill, cỡ index,
+  p50/p95 search, và mục tiêu thực ≤ 20% overhead trigger (guard đơn
+  vị chỉ < 50%).
+- migration thật của DB sống v1→v2 khi build mới mở lần đầu (backfill
+  nằm trong một transaction).
+- AC search (§4 3.1: p95 < 1 s với ≥ 100 k tin) chỉ đo được sau P2
+  import; backup vẫn chưa chạy trên dữ liệu thật (batch 8).
+- Lưu ý: file spec `D:\.opencode\zalo-shadow-schema-v1.sql` KHÔNG được
+  cập nhật phần v2 (quy tắc worktree-only); nguồn chân lý của v2 là
+  `schema.rs`.

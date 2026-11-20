@@ -374,6 +374,7 @@
  "The backup folder does not exist.": "Thư mục sao lưu không tồn tại.",
  "The backup path is not a folder.": "Đường dẫn sao lưu không phải là một thư mục.",
  "The backup folder is not writable.": "Thư mục sao lưu không ghi được.",
+ "The storage folder needs at least {0} GB of free space.": "Thư mục lưu trữ cần ít nhất {0} GB dung lượng trống.",
  "Automatic shadow backup": "Tự động sao lưu shadow",
  "Copies the database and media files to the backup folder at regular intervals. Keeps 7 daily and 4 weekly backups.": "Sao lưu cơ sở dữ liệu và các tệp media vào thư mục sao lưu theo chu kỳ định kỳ. Giữ 7 bản sao lưu hằng ngày và 4 bản hằng tuần.",
  "Backup folder": "Thư mục sao lưu",

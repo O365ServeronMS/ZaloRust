@@ -1,5 +1,5 @@
 //! Shadow settings field validation (audit §4 items 1.3/KQ9 and
-//! 1.4/KQ2, batch 7 G1).
+//! 1.4/KQ2, batch 7 G1; free-space check added in batch 9 I0).
 //!
 //! `commands::set_settings` validates every user-entered shadow field
 //! BEFORE the settings file is written; the pure checks live here so
@@ -41,11 +41,32 @@ pub enum MediaStoreError {
     NotWritable,
     /// A different volume than the reference root (D9 hardlink).
     DifferentVolume,
-    // TODO (KQ9, audit 1.3): free space >= 5 GiB via GetDiskFreeSpaceExW.
-    // The `windows` crate's Win32_Storage_FileSystem feature (where
-    // that API lives) is NOT enabled in Cargo.toml and this batch must
-    // not add crates or features, so the check is SKIPPED here rather
-    // than approximated. Wire it when the feature is on.
+    // KQ9 free space is NOT a variant here: the check runs only in
+    // [`validate_media_store`] (the media-store entry point), not in
+    // [`check_media_store`], because `check_backup_dir` reuses that
+    // function and batch 8's backup-folder semantics must stay
+    // unchanged. The decision is the pure helper
+    // [`free_space_ok`] (unit-tested with fake numbers); the
+    // unmeasurable-volume case (`GetDiskFreeSpaceExW` → None) skips
+    // the check — see the module docs in `disk_space`.
+}
+
+/// Minimum free space the media-store volume must report (KQ9): the
+/// GiB number that may appear in the user-facing refusal — nothing
+/// else about the volume is ever echoed.
+pub const MIN_FREE_GIB: u64 = 5;
+
+/// [`MIN_FREE_GIB`] in bytes.
+pub const MIN_FREE_BYTES: u64 = MIN_FREE_GIB * 1024 * 1024 * 1024;
+
+/// Pure free-space decision (I0, batch 9 — tested with fake
+/// `(free, threshold)` pairs, never a real volume): refuse when the
+/// measured free space is strictly below the threshold; exactly at
+/// the threshold passes. The `None` (API failure / non-Windows) case
+/// never reaches this function — [`validate_media_store`] skips the
+/// whole check instead.
+fn free_space_ok(free: u64, threshold: u64) -> bool {
+    free >= threshold
 }
 
 /// Why an own-identity field was refused (KQ2).
@@ -89,8 +110,7 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
 /// The KQ9 media-store checks, in the brief's order: absolute; exists
 /// (never created here); is a dir; writable via a create+delete probe
 /// file `.zr-write-test-<pid>`; same volume as `reference_root` when a
-/// reference is given. Free space is NOT checked yet (see the TODO on
-/// [`MediaStoreError`]).
+/// reference is given.
 ///
 /// `reference_root` is a parameter so unit tests can use temp dirs;
 /// the production caller passes `DESKTOP_DATA_ROOT` only when it
@@ -128,13 +148,18 @@ pub fn check_media_store(
 }
 
 /// [`check_media_store`] with the classified error mapped to a
-/// translated, value-free message (the path itself is never echoed).
-/// This is the signature `set_settings` calls.
+/// translated, value-free message (the path itself is never echoed),
+/// PLUS the KQ9 free-space check (batch 9 I0): the store's volume must
+/// report at least [`MIN_FREE_GIB`] GiB free, measured with batch 8's
+/// `disk_space::disk_free_space`; when the API returns `None` the
+/// check is skipped entirely (an unmeasurable volume must not block a
+/// valid folder). The only value the refusal may echo is the GiB
+/// number itself. This is the signature `set_settings` calls.
 pub fn validate_media_store(
     path: &Path,
     reference_root: Option<&Path>,
 ) -> Result<(), String> {
-    use crate::i18n::tr;
+    use crate::i18n::{tr, trf};
     check_media_store(path, reference_root).map_err(|e| {
         tr(match e {
             MediaStoreError::NotAbsolute => {
@@ -150,7 +175,19 @@ pub fn validate_media_store(
             }
         })
         .into_owned()
-    })
+    })?;
+    // KQ9 free space (batch 9 I0): refuse below the threshold; `None`
+    // (API failure, non-Windows) skips the check. Only the GiB number
+    // is ever echoed back — never the measured bytes, never the path.
+    if let Some((free, _total)) = super::disk_space::disk_free_space(path) {
+        if !free_space_ok(free, MIN_FREE_BYTES) {
+            return Err(trf(
+                "A pasta de armazenamento precisa de pelo menos {0} GB de espaço livre.",
+                &[&MIN_FREE_GIB],
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `settings.shadow.backup_dir` checks (batch 8 H4): exactly the
@@ -380,6 +417,58 @@ mod tests {
         }
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // --- KQ9 free space (batch 9 I0) --------------------------------------
+
+    #[test]
+    fn free_space_ok_decides_on_the_threshold_edge() {
+        // The pure (free, threshold) decision — fake numbers, no IO.
+        // The API-failure case never reaches this helper:
+        // validate_media_store skips the whole check when
+        // disk_free_space returns None.
+        let t = MIN_FREE_BYTES;
+        assert!(free_space_ok(t, t), "exactly at the threshold passes");
+        assert!(free_space_ok(t + 1, t));
+        assert!(!free_space_ok(t - 1, t), "one byte under the threshold refuses");
+        assert!(!free_space_ok(0, t));
+        assert!(free_space_ok(u64::MAX, t));
+        assert!(free_space_ok(0, 0), "a zero threshold accepts anything");
+        assert_eq!(MIN_FREE_GIB, 5, "the documented KQ9 minimum");
+        assert_eq!(MIN_FREE_BYTES, 5 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn media_store_free_space_message_echoes_only_the_gib_number() {
+        // The refusal's translated strings carry the GiB threshold and
+        // nothing else — no measured bytes, no path, no volume label.
+        // Asserted through the i18n tables in both languages; the dev
+        // machine's real volume is never under test control.
+        for lang in [crate::i18n::Lang::Vi, crate::i18n::Lang::En] {
+            let msg = crate::i18n::trf_in(
+                lang,
+                "A pasta de armazenamento precisa de pelo menos {0} GB de espaço livre.",
+                &[&MIN_FREE_GIB],
+            );
+            assert!(msg.contains('5'), "{lang:?}: {msg}");
+            assert!(
+                !msg.contains("5368709120") && !msg.contains("1073741824"),
+                "no raw byte counts in the user-facing string: {msg}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn media_store_free_space_skipped_when_the_api_returns_none() {
+        // Off Windows `disk_free_space` is None by definition: a valid
+        // folder must pass validate_media_store with the check
+        // skipped (the skip is the `if let Some` in validate_media_store).
+        let d = scratch("space-none");
+        assert_eq!(validate_media_store(&d, None), Ok(()));
+        assert_eq!(validate_media_store(&d, Some(&scratch("space-ref"))), Ok(()));
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(scratch("space-ref")).unwrap();
     }
 
     // --- validate_media_store (user-facing strings) -----------------------

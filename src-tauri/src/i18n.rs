@@ -306,6 +306,9 @@ static EN_TABLE: &[(&str, &str)] = &[
     ("A pasta de backup não existe.", "The backup folder does not exist."),
     ("O caminho de backup não é uma pasta.", "The backup path is not a folder."),
     ("Não é possível gravar na pasta de backup.", "The backup folder is not writable."),
+    // media-store free-space refusal (audit KQ9, batch 9 I0; the only
+    // echoed value is the GiB number itself)
+    ("A pasta de armazenamento precisa de pelo menos {0} GB de espaço livre.", "The storage folder needs at least {0} GB of free space."),
     // window titles
     ("Zalo — Configurações", "Zalo — Settings"),
     ("Zalo — Conta destacada", "Zalo — Detached account"),

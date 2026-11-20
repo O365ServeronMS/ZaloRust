@@ -260,9 +260,12 @@ fn schema_version(conn: &Connection) -> i64 {
         .unwrap_or(0)
 }
 
-/// Leftover `*.db.tmp` files from a killed run (4.1 AC): removed at
-/// the start of the next [`backup_db`] so a partial export never
-/// lingers. Anything else in the folder is untouched.
+/// Leftover half-written exports from a killed run (4.1 AC): removed
+/// at the start of the next [`backup_db`] so a partial export never
+/// lingers. I0 (batch 9 review): the cleanup is restricted to OUR OWN
+/// naming pattern `shadow-<yyyyMMdd-HHmmss>.db.tmp` (stamp must
+/// parse); the folder is user-chosen, so a foreign `*.db.tmp` living
+/// there is never ours to delete. Anything else is untouched.
 fn cleanup_leftover_tmp(dest_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dest_dir) else {
         return 0;
@@ -270,7 +273,13 @@ fn cleanup_leftover_tmp(dest_dir: &Path) -> usize {
     let mut removed = 0usize;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".db.tmp") && std::fs::remove_file(e.path()).is_ok() {
+        let Some(stamp) = name
+            .strip_prefix("shadow-")
+            .and_then(|s| s.strip_suffix(".db.tmp"))
+        else {
+            continue; // foreign name — never ours to delete
+        };
+        if parse_stamp(stamp).is_some() && std::fs::remove_file(e.path()).is_ok() {
             removed += 1;
         }
     }
@@ -1217,7 +1226,11 @@ mod tests {
         assert_eq!(manifest.schema_version, schema::VERSION);
         // Counts for every user table, equal to the source's.
         assert_eq!(manifest.counts, user_table_counts(&conn).unwrap());
-        assert_eq!(manifest.counts.len(), 12, "schema v1 user tables");
+        assert_eq!(
+            manifest.counts.len(),
+            17,
+            "schema v2 user tables (12 v1 + messages_fts + 4 fts shadow tables)"
+        );
         assert_eq!(manifest.counts["messages"], 1);
         assert_eq!(manifest.counts["raw_events"], 1);
         assert_eq!(manifest.counts["conversations"], 1);
@@ -1244,22 +1257,30 @@ mod tests {
     fn backup_removes_leftover_tmp_from_a_killed_run() {
         let (conn, key) = db_with_rows();
         let dest = scratch("tmp-clean");
-        // Plant killed-run leftovers: two of OURS (shadow-*.db.tmp)
-        // and one foreign file that still matches the documented
-        // `*.db.tmp` leftover glob — all three go at the start of the
-        // next backup (the brief's rule is the glob, and a .db.tmp is
-        // by name a half-written export, never a keepsake). A file
-        // outside the glob must survive.
+        // Plant killed-run leftovers: three of OURS
+        // (shadow-<stamp>.db.tmp) plus a malformed-stamp near-miss —
+        // all four go at the start of the next backup. I0 (batch 9
+        // review): a FOREIGN `*.db.tmp` (a file that merely matches
+        // the leftover glob but not our naming pattern) must SURVIVE —
+        // the dir is user-chosen and that file is not ours.
         std::fs::write(dest.join("shadow-20261101-000000.db.tmp"), b"partial").unwrap();
         std::fs::write(dest.join("shadow-20261102-000000.db.tmp"), b"partial").unwrap();
-        std::fs::write(dest.join("unrelated.db.tmp"), b"half-written-too").unwrap();
+        std::fs::write(dest.join("shadow-20261399-999999.db.tmp"), b"bad-stamp").unwrap();
+        std::fs::write(dest.join("unrelated.db.tmp"), b"someone-elses").unwrap();
         std::fs::write(dest.join("notes.txt"), b"keep-me").unwrap();
 
         let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
         assert!(!dest.join("shadow-20261101-000000.db.tmp").exists());
         assert!(!dest.join("shadow-20261102-000000.db.tmp").exists());
-        assert!(!dest.join("unrelated.db.tmp").exists(), "matches *.db.tmp — goes too");
-        assert!(dest.join("notes.txt").is_file(), "outside the glob — stays");
+        assert!(
+            dest.join("shadow-20261399-999999.db.tmp").is_file(),
+            "shadow- prefix but unparsable stamp: fail-closed, never deleted (same rule as prune)"
+        );
+        assert!(
+            dest.join("unrelated.db.tmp").is_file(),
+            "foreign *.db.tmp must SURVIVE (I0: user-chosen folder)"
+        );
+        assert!(dest.join("notes.txt").is_file(), "outside the pattern — stays");
         // The fresh backup is complete.
         assert_eq!(
             verify_backup(&backup_db_path(&dest, manifest.ts), &key, &manifest),
