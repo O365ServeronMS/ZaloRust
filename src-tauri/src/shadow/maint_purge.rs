@@ -14,7 +14,6 @@
 //! a backup would preserve exactly the data being removed.
 
 use super::normalize::{e2ee_admit, E2eeRefusal};
-use crate::migrate::sqlcipher;
 
 fn app_running() -> bool {
     std::process::Command::new("tasklist")
@@ -31,15 +30,28 @@ fn maint_purge_e2ee_keyish() {
         .join("com.o365serveronms.zalors/shadow");
     let apply = std::env::var("ZR_PURGE_APPLY").as_deref() == Ok("1");
     // KQ10: the account helpers name the store files.
-    let key = sqlcipher::load_key(&super::key_file(&dir)).unwrap();
+    // Batch 18 (R4): this maintenance probe goes through the same rule
+    // as every non-app opener — a passphrase-mode store opens only via
+    // its remember file; without one it REFUSES (this probe never
+    // accepts a password). Fail-closed with the documented message
+    // instead of a panic on a missing key file.
+    let conn = match super::passphrase::open_store(&dir, !apply) {
+        Ok((c, _)) => c,
+        Err(super::passphrase::StoreOpenError::Locked) => {
+            eprintln!(
+                "the store is password-protected (passphrase mode) — unlock it in the app with \
+                 'Nhớ trên máy này' (remember on this machine) enabled, then re-run; this probe \
+                 never accepts passwords"
+            );
+            return;
+        }
+        Err(super::passphrase::StoreOpenError::Other(k)) => {
+            panic!("store open failed ({k}) — broken store dir?")
+        }
+    };
     if apply && app_running() {
         panic!("refusing to apply: zalors.exe is running (stop the app first — single writer)");
     }
-    let conn = if apply {
-        sqlcipher::open_with_key(&super::db_file(&dir), &key).unwrap()
-    } else {
-        sqlcipher::open_with_key_readonly(&super::db_file(&dir), &key).unwrap()
-    };
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     let msgs_before = count("SELECT COUNT(*) FROM messages");
 

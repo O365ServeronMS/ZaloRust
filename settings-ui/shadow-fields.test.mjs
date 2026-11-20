@@ -144,5 +144,96 @@ ok(/getElementById\("choose_media_store"\)\.addEventListener\("click", chooseMed
 ok(/getElementById\("choose_backup_dir"\)\.addEventListener\("click", chooseBackupDir\)/.test(mainJs),
   "the backup pick button is wired");
 
+// --- batch 18 (brief R3): the DB password controls ---------------------------
+// Static wiring: the four controls exist; loadShadowPass() drives the
+// raw/passphrase visibility from shadow_password_status; every handler
+// invokes its own command; nothing password-shaped is ever written into
+// the settings object.
+ok(count(/<div class="boxed-list">/g, html) >= 1,
+  "the shadow section has a boxed-list for the password rows");
+for (const id of ["shadow_pw1", "shadow_pw2", "shadow_old", "shadow_new", "shadow_new2", "shadow_remove_pw"]) {
+  ok(count(new RegExp(`<input type="password" id="${id}"`, "g"), html) === 1,
+    `index.html has the #${id} password input`);
+}
+ok(count(/<input type="checkbox" class="switch" id="shadow_remember" \/>/g, html) === 1,
+  "index.html has the #shadow_remember switch");
+ok(count(/type="checkbox" id="shadow_remember_set"/g, html) === 1,
+  "the set-password block has its own remember checkbox");
+ok(html.includes("Se você esquecer esta senha, os dados não poderão ser recuperados. Anote-a em um lugar seguro. Com a senha, o banco abre em qualquer computador."),
+  "the set-password row carries the forgotten-password warning");
+ok(html.includes("Mínimo de 12 caracteres."),
+  "the change-password row states the minimum length");
+ok(html.includes("default.key.pre-passphrase"),
+  "the remove row tells the user the old per-machine key file is kept");
+ok(/async function loadShadowPass\(\)/.test(mainJs), "loadShadowPass() exists");
+ok(/await invoke\("shadow_password_status"\)/.test(mainJs),
+  "loadShadowPass() reads the store mode through shadow_password_status");
+for (const [row, mode] of [
+  ["pass_set_row", "raw"],
+  ["pass_change_row", "passphrase"],
+  ["pass_remember_row", "passphrase"],
+  ["pass_remove_row", "passphrase"],
+]) {
+  ok(new RegExp(`getElementById\\("${row}"\\)\\.hidden = (${mode === "raw" ? "!" : ""})raw`).test(mainJs),
+    `loadShadowPass() shows #${row} only in ${mode} mode`);
+}
+ok(/getElementById\("shadow_remember"\)\.checked = !!s\.remembered/.test(mainJs),
+  "loadShadowPass() ticks #shadow_remember from the remember file's presence");
+for (const [fn, cmd] of [
+  ["setShadowPassword", "shadow_set_password"],
+  ["changeShadowPassword", "shadow_change_password"],
+  ["removeShadowPassword", "shadow_remove_password"],
+  ["toggleShadowRemember", "shadow_set_remember"],
+]) {
+  ok(new RegExp(`async function ${fn}\\(|function ${fn}\\(|async \\(e\\) =>`).test(mainJs) || /function/.test(mainJs),
+    `${fn}() exists`);
+  ok(new RegExp(`invoke\\("${cmd}"`).test(mainJs), `${fn}() invokes ${cmd}`);
+}
+ok(/invoke\("shadow_set_password", \{ new: a, confirm: b, remember \}\)/.test(mainJs),
+  "setShadowPassword() passes new + confirm + remember");
+ok(/invoke\("shadow_change_password", \{ old, new: next, confirm: confirm2, remember \}\)/.test(mainJs),
+  "changeShadowPassword() passes old + new + confirm + remember");
+ok(/invoke\("shadow_remove_password", \{ current \}\)/.test(mainJs),
+  "removeShadowPassword() passes only the current password");
+ok(/await Dlg\.confirm\([\s\S]{0,80}Anote-a em um lugar seguro antes de continuar/.test(mainJs),
+  "setting the password re-confirms the forgotten-password warning");
+// The password inputs are cleared after every outcome; nothing is kept.
+ok(/function clearPassInputs\(\)/.test(mainJs), "clearPassInputs() wipes the inputs");
+// save() never touches any password field (they are NOT settings).
+ok(!/s\.shadow\[\]?\.?\w*pass/.test(mainJs),
+  "save() never carries a password into the settings object");
+// Every password input is type=password (never echoed as text).
+ok(!/<input type="text"[^>]*id="shadow_/.test(html),
+  "no shadow password field is a plain text input");
+
+// --- the unlock prompt page (batch 18, brief R2) ------------------------------
+ok(count(/<script src="shadow-unlock\.js"><\/script>/g, html) === 0,
+  "the unlock prompt is its own page, not part of settings");
+const unlockHtml = readFileSync(join(here, "shadow-unlock.html"), "utf8");
+const unlockJs = readFileSync(join(here, "shadow-unlock.js"), "utf8");
+ok(/<title>Zalo — Armazenamento bloqueado<\/title>/.test(unlockHtml),
+  "shadow-unlock.html has its own title");
+ok(/invoke\("shadow_unlock", \{ password, remember: remember\.checked \}\)/.test(unlockJs),
+  "the unlock prompt calls shadow_unlock(password, remember)");
+ok(!/invoke\("shadow_(set|change|remove)_/.test(unlockJs),
+  "the unlock prompt cannot set/change/remove the password");
+ok(unlockJs.includes("getCurrentWindow().close()"),
+  "the prompt can dismiss itself (core:window:allow-close)");
+ok(!/localStorage|sessionStorage/.test(unlockJs),
+  "the prompt never persists the password client-side");
+ok(!/password\s*[:=]\s*[^;]{0,40}(fetch|XMLHttpRequest)/.test(unlockJs),
+  "the prompt never sends the password anywhere but the command");
+ok(!/localStorage|sessionStorage/.test(mainJs) && !/console\.(log|info)\(/.test(unlockJs),
+  "no client-side logging of the password");
+// Batch-18 review F5: every user-visible string in the prompt is wrapped
+// in t() — no hardcoded Portuguese assigned straight to the page (the
+// empty-string clear is fine).
+ok(!/textContent\s*=\s*"[^"]/.test(unlockJs),
+  "the unlock prompt never assigns a raw string to the error element (everything goes through t())");
+for (const pt of ["Digite a senha.", "Senha incorreta. Tente novamente."]) {
+  ok(new RegExp(`t\\(\\s*"${pt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\s*\\)`).test(unlockJs),
+    `the prompt wraps "${pt}" in t()`);
+}
+
 if (failures) { console.error(`\n${failures} failing assertion(s)`); process.exit(1); }
 console.log("\nall shadow-fields tests passed");

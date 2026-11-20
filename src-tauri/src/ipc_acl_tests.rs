@@ -68,6 +68,17 @@ const ARCHIVE_COMMANDS: &[&str] = &[
     "archive_list_messages",
     "archive_search",
 ];
+/// Shadow DB password commands (batch 18): the five settings-window
+/// ones plus the unlock prompt's own — the Zalo page must reach NONE
+/// of them (they carry passwords, and the page never sees the store).
+const SHADOW_PASS_COMMANDS: &[&str] = &[
+    "shadow_password_status",
+    "shadow_set_password",
+    "shadow_change_password",
+    "shadow_remove_password",
+    "shadow_set_remember",
+    "shadow_unlock",
+];
 
 fn allowed(app: &tauri::App<tauri::test::MockRuntime>, label: &str, url: &str, cmd: &str) -> bool {
     use tauri::Manager;
@@ -164,6 +175,7 @@ fn the_zalo_page_cannot_reach_settings_or_lock_commands() {
         .iter()
         .chain(LOCK_COMMANDS)
         .chain(ARCHIVE_COMMANDS)
+        .chain(SHADOW_PASS_COMMANDS)
         .chain(&["open_settings", "archive_open"])
     {
         assert!(

@@ -3,13 +3,14 @@
 //!
 //! Every function here is PURE w.r.t. the process: it takes a
 //! `&Connection` that the CALLER opened read-only (the archive session
-//! in `crate::archive_cmds`, opened with
-//! `migrate::sqlcipher::open_with_key_readonly` — which sets
-//! `query_only` + the H3 busy timeout — or the plain read-only open
-//! for an unencrypted store; NEVER the flusher's connection, A5
-//! single-writer). Nothing in this module writes, creates tables or
-//! touches settings; the unit tests run on in-memory SQLCipher DBs
-//! with FAKE rows.
+//! in `crate::archive_cmds`, opened in whichever key mode the store's
+//! marker says — `migrate::sqlcipher::open_with_key_readonly` (raw) or
+//! `open_with_passphrase_readonly` via the remember file (batch 18),
+//! both of which set `query_only` + the H3 busy timeout — or the plain
+//! read-only open for an unencrypted store; NEVER the flusher's
+//! connection, A5 single-writer). Nothing in this module writes,
+//! creates tables or touches settings; the unit tests run on in-memory
+//! SQLCipher DBs with FAKE rows.
 //!
 //! Pagination is KEYSET on `(ts, id)` cursors — no OFFSET on the big
 //! tables (a skipped/deleted row would make `OFFSET` pages drift).

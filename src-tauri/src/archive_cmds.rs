@@ -38,26 +38,66 @@ pub const ARCHIVE_LABEL: &str = "archive";
 /// Managed per-session state: the read-only connection, opened
 /// lazily by the first command and dropped when the window closes
 /// (`close()` on `WindowEvent::CloseRequested`, see window.rs).
+///
+/// F2 (batch-18 review): the slot also remembers the key-cell EPOCH
+/// the connection was opened under; when the epoch moves (the flusher
+/// just set/changed/removed the store password, or the store was just
+/// unlocked), the cached connection — which holds the OLD key — is
+/// dropped and the next use reopens with the CURRENT key.
 pub struct ArchiveState {
-    conn: std::sync::Mutex<Option<rusqlite::Connection>>,
+    slot: std::sync::Mutex<ArchiveSlot>,
+}
+
+#[derive(Default)]
+struct ArchiveSlot {
+    conn: Option<rusqlite::Connection>,
+    /// The shared key cell's epoch when `conn` was opened.
+    epoch: u64,
+}
+
+impl ArchiveSlot {
+    /// F2: reopen unless the cache holds a connection opened under the
+    /// CURRENT epoch.
+    fn needs_reopen(&self, current_epoch: u64) -> bool {
+        self.conn.is_none() || self.epoch != current_epoch
+    }
 }
 
 impl ArchiveState {
     pub fn new() -> Self {
         Self {
-            conn: std::sync::Mutex::new(None),
+            slot: std::sync::Mutex::new(ArchiveSlot::default()),
         }
     }
     /// End the session: the cached connection goes away with the
     /// window (a reopen reopens the DB).
     pub fn close(&self) {
-        *crate::lock::guard(&self.conn) = None;
+        self.drop_cache();
+    }
+    /// F2: drop the cached connection (the epoch stamp resets with the
+    /// next open). The command layer calls this — through
+    /// [`drop_cached_conn`] — right before sending a
+    /// Passphrase{Set,Change,Remove} job, so the conversion never has
+    /// to fight this connection's lock; a reopen racing the conversion
+    /// is caught by its `store-busy` refusal (F1).
+    pub fn drop_cache(&self) {
+        *crate::lock::guard(&self.slot) = ArchiveSlot::default();
     }
 }
 
 impl Default for ArchiveState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// F2: drop the archive window's cached connection, if the window's
+/// state is managed (the window may not be open at all). Called by the
+/// password commands right before they send the conversion job to the
+/// flusher.
+pub fn drop_cached_conn(app: &AppHandle) {
+    if let Some(state) = app.try_state::<ArchiveState>() {
+        state.drop_cache();
     }
 }
 
@@ -118,10 +158,13 @@ fn open_guard(window: &Webview) -> Result<(), String> {
 // --- the read-only session ----------------------------------------------------
 
 /// Open the archive session: a SEPARATE read-only connection, never
-/// the flusher's (A5). `open_with_key_readonly` sets `query_only` and
-/// the H3 busy timeout (verified in sqlcipher.rs); the unencrypted
-/// path mirrors both. Shadow disabled or key missing → a clean
-/// translated error.
+/// the flusher's (A5). `open_with_key_readonly` /
+/// `open_with_passphrase_readonly` set `query_only` and the H3 busy
+/// timeout (verified in sqlcipher.rs); the unencrypted path mirrors
+/// both. Shadow disabled, key missing, or a passphrase-mode store
+/// without its remember file → a clean translated error (batch 18: the
+/// archive window never asks for the password — it opens only what the
+/// "remember on this machine" file can).
 fn open_readonly(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     use std::time::Duration;
     let cfg = crate::settings::load(app).shadow;
@@ -129,24 +172,14 @@ fn open_readonly(app: &AppHandle) -> Result<rusqlite::Connection, String> {
         return Err(tr("O armazenamento shadow está desativado.").into_owned());
     }
     let dir = crate::shadow::runtime::shadow_dir(app);
-    let db_path = crate::shadow::db_file(&dir);
     // One clean translated error for every open failure — the kind
     // never reaches the UI (and the log stays free of paths/keys).
     fn fail<T>(_: T) -> String {
         tr("Não foi possível abrir o armazenamento de mensagens.").into_owned()
     }
-    if cfg.encrypt {
-        let key_path = crate::shadow::key_file(&dir);
-        if !key_path.exists() {
-            return Err(fail(()));
-        }
-        // L4/D4: the key bytes are wiped once the connection holds them.
-        let key =
-            zeroize::Zeroizing::new(crate::migrate::sqlcipher::load_key(&key_path).map_err(fail)?);
-        crate::migrate::sqlcipher::open_with_key_readonly(&db_path, &key).map_err(fail)
-    } else {
+    if !cfg.encrypt {
         let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
+            &crate::shadow::db_file(&dir),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(fail)?;
@@ -155,23 +188,54 @@ fn open_readonly(app: &AppHandle) -> Result<rusqlite::Connection, String> {
         ))
         .map_err(fail)?;
         conn.pragma_update(None, "query_only", true).map_err(fail)?;
-        Ok(conn)
+        return Ok(conn);
+    }
+    // Batch 18 (R4) + F2 (review): open in whichever mode the store's
+    // marker says — raw through the DPAPI key file, passphrase through
+    // the in-process shared key cell when it holds the CURRENT
+    // password (unlocking WITHOUT "remember" still opens the archive),
+    // falling back to the remember file. Locked (neither source) is
+    // its own message.
+    match crate::shadow::passphrase::open_store_with_cell(&dir, true) {
+        Ok((conn, _)) => Ok(conn),
+        Err(crate::shadow::passphrase::StoreOpenError::Locked) => Err(tr(
+            "O armazenamento está protegido por senha: ative “Lembrar neste computador” nas \
+             configurações ou abra o banco com a senha em um programa externo.",
+        )
+        .into_owned()),
+        Err(crate::shadow::passphrase::StoreOpenError::Other(_)) => Err(fail(())),
     }
 }
 
-/// Run `f` against the session connection, opening it lazily. The
-/// guard is a short-lived lock; query fns are bounded by the page
-/// clamp.
+/// Run `f` against the session connection, opening it lazily and
+/// REOPENING it whenever the key cell's epoch moved since it was
+/// cached (F2: the flusher published a new key — the cached connection
+/// holds the old one). The guard is a short-lived lock; query fns are
+/// bounded by the page clamp.
 fn with_conn<T>(
     app: &AppHandle,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let state = app.state::<ArchiveState>();
-    let mut slot = crate::lock::guard(&state.conn);
-    if slot.is_none() {
-        *slot = Some(open_readonly(app)?);
+    with_conn_slot(&state, || open_readonly(app), f)
+}
+
+/// The cache-staleness half of [`with_conn`], split out so the reopen
+/// rule is unit-testable without an app: no connection, or one opened
+/// under an older epoch → reopen through `open` and stamp the current
+/// epoch.
+fn with_conn_slot<T>(
+    state: &ArchiveState,
+    open: impl FnOnce() -> Result<rusqlite::Connection, String>,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut slot = crate::lock::guard(&state.slot);
+    let current = crate::shadow::passphrase::cell_epoch();
+    if slot.needs_reopen(current) {
+        let conn = open()?;
+        *slot = ArchiveSlot { conn: Some(conn), epoch: current };
     }
-    f(slot.as_ref().expect("opened above"))
+    f(slot.conn.as_ref().expect("opened above"))
 }
 
 /// A query failure: log the SQLite KIND only (the pure layer already
@@ -367,9 +431,10 @@ pub(crate) fn serve_media(
     builder.body(body).unwrap_or_else(|_| not_found())
 }
 
-/// Resolve one media row through the session connection (opening it
-/// best-effort; a refusal is a plain 404 — the window's own list
-/// command surfaces the real open error to the user).
+/// Resolve one media row through the session connection — the same
+/// epoch-aware cache as the query commands (`with_conn_slot`).
+/// Opening or querying failures are a plain 404 — the window's own
+/// list command surfaces the real open error to the user.
 fn media_row(
     app: &AppHandle,
     cfg: &crate::settings::ShadowSettings,
@@ -377,15 +442,12 @@ fn media_row(
     idx: i64,
 ) -> Option<(PathBuf, Option<String>)> {
     let state = app.try_state::<ArchiveState>()?;
-    let mut slot = crate::lock::guard(&state.conn);
-    if slot.is_none() {
-        match open_readonly(app) {
-            Ok(c) => *slot = Some(c),
-            Err(_) => return None,
-        }
+    match with_conn_slot(&state, || open_readonly(app), |conn| {
+        Ok(archive::attachment_media(conn, cfg, msg_id, idx))
+    }) {
+        Ok(found) => found,
+        Err(_) => None,
     }
-    let conn = slot.as_ref()?;
-    archive::attachment_media(conn, cfg, msg_id, idx)
 }
 
 #[cfg(test)]
@@ -415,6 +477,52 @@ mod tests {
         // not the data. Pure decision, tested without app state.
         assert_eq!(open_decision(true), OpenDecision::Open);
         assert_eq!(open_decision(false), OpenDecision::Locked);
+    }
+
+    #[test]
+    fn the_archive_cache_reopens_after_an_epoch_bump() {
+        // F2 (batch-18 review): a cached connection opened under an
+        // older key-cell epoch holds a key the store no longer accepts
+        // — it must be dropped and reopened. Exercised through the
+        // same slot helper `with_conn` uses, with a counting opener
+        // instead of the AppHandle (no app launch). Serialized with
+        // the other cell-mutating tests through the cell test lock.
+        let _g = crate::shadow::passphrase::CELL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = ArchiveState::new();
+        let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mk_open = || {
+            let opens = opens.clone();
+            move || {
+                opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<rusqlite::Connection, String>(
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            }
+        };
+        let ping = |c: &rusqlite::Connection| -> Result<i64, String> {
+            c.query_row("SELECT 1", [], |r| r.get(0))
+                .map_err(|e| e.to_string())
+        };
+        // First use: the slot is empty → opens, stamps the epoch.
+        with_conn_slot(&state, mk_open(), |c| ping(c)).unwrap();
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Same epoch: the cached connection is reused (no reopen).
+        with_conn_slot(&state, mk_open(), |c| ping(c)).unwrap();
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Epoch bump — the flusher just converted the store: the cache
+        // is dropped and the next use reopens under the new epoch.
+        crate::shadow::passphrase::publish_key(None);
+        with_conn_slot(&state, mk_open(), |c| ping(c)).unwrap();
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // drop_cache (the command layer's pre-conversion step) forces
+        // a reopen too.
+        state.drop_cache();
+        with_conn_slot(&state, mk_open(), |c| ping(c)).unwrap();
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // Leave the cell neutral for whichever test runs next.
+        crate::shadow::passphrase::publish_key(None);
     }
 
     // --- the capability files, platform-independently ------------------------

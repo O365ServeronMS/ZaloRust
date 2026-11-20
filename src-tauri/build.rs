@@ -66,6 +66,14 @@ fn main() {
             "archive_list_messages",
             "archive_search",
             "archive_open",
+            // shadow DB passphrase mode (batch 18): settings window +
+            // the shadow-unlock prompt
+            "shadow_password_status",
+            "shadow_set_password",
+            "shadow_change_password",
+            "shadow_remove_password",
+            "shadow_set_remember",
+            "shadow_unlock",
         ]),
     ))
     .expect("failed to run tauri-build");

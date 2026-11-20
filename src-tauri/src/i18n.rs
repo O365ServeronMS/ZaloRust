@@ -322,6 +322,33 @@ static EN_TABLE: &[(&str, &str)] = &[
     ("O armazenamento shadow está desativado.", "Shadow storage is turned off."),
     ("Não foi possível abrir o armazenamento de mensagens.", "The message archive could not be opened."),
     ("Não foi possível consultar o armazenamento.", "The archive query failed."),
+    // Shadow DB passphrase mode (batch 18, brief R1-R3; PT keys only —
+    // the settings window and the unlock prompt live in settings-ui/)
+    ("Zalo — Armazenamento bloqueado", "Zalo — Storage locked"),
+    ("A senha do banco de dados deve ter pelo menos {0} caracteres.",
+     "The database password must be at least {0} characters long."),
+    ("A senha do banco de dados contém caracteres inválidos.",
+     "The database password contains characters that are not allowed."),
+    ("O armazenamento já tem uma senha.", "The storage already has a password."),
+    ("O armazenamento não tem uma senha.", "The storage has no password."),
+    ("O armazenamento shadow está desativado ou bloqueado.",
+     "Shadow storage is turned off or locked."),
+    ("O backup antes da alteração falhou; nada foi alterado. Tente novamente.",
+     "The backup taken before the change failed; nothing was changed. Try again."),
+    ("Não foi possível alterar a senha do armazenamento.",
+     "The storage password could not be changed."),
+    ("Não foi possível esquecer a senha neste computador.",
+     "The remembered password could not be removed on this computer."),
+    ("Não foi possível lembrar a senha neste computador.",
+     "The password could not be remembered on this computer."),
+    ("É preciso abrir o armazenamento primeiro: desbloqueie a senha dele e tente de novo.",
+     "The storage must be opened first: unlock its password and try again."),
+    ("O armazenamento está protegido por senha: ative “Lembrar neste computador” nas configurações ou abra o banco com a senha em um programa externo.",
+     "The storage is password-protected: turn on \"Remember on this computer\" in the settings, or open the database with your password in an external program."),
+    // Batch 18 review F1: the journal could not leave WAL because
+    // another connection holds the store (close the archive window).
+    ("O armazenamento está em uso: feche a janela do arquivo e tente novamente. Nada foi alterado.",
+     "The storage is in use: close the archive window and try again. Nothing was changed."),
     // window titles
     ("Zalo — Configurações", "Zalo — Settings"),
     ("Zalo — Conta destacada", "Zalo — Detached account"),

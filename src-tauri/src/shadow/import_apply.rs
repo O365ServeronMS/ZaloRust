@@ -78,7 +78,6 @@ use super::import_map::{self, CodedWrite, ImportCursor, MapDb, Verdict};
 use super::pipeline::sqlite_kind;
 use super::schema;
 use super::{db_file, key_file, Write};
-use crate::migrate::sqlcipher;
 
 /// Rows per write transaction (the brief's batch size).
 pub const APPLY_BATCH_ROWS: usize = 500;
@@ -764,25 +763,33 @@ pub fn run_apply_with_limit(
 
     // The target store (no default; the user passed it).
     let db_path = db_file(&target);
-    let key_path = key_file(&target);
     if !db_path.is_file() {
         return Err(format!(
             "--target: no {} — not a shadow store dir?",
             db_path.display()
         ));
     }
-    if !key_path.is_file() {
-        return Err(format!(
-            "--target: no {} — broken store?",
-            key_path.display()
-        ));
-    }
-    let key = Zeroizing::new(
-        sqlcipher::load_key(&key_path)
-            .map_err(|e| format!("--target: key load failed: {e}"))?,
-    );
-    let conn = sqlcipher::open_with_key(&db_path, &key)
-        .map_err(|e| format!("--target: open failed: {e}"))?;
+    // Batch 18 (R4): the target opens in whichever mode its marker says
+    // — raw through the DPAPI key file, passphrase through the remember
+    // file ONLY. The import CLI never accepts a password (argv/env are
+    // out by hard rule), so a passphrase-mode store without a usable
+    // remember file refuses with the documented message.
+    let (conn, store_key) = match super::passphrase::open_store(&target, false) {
+        Ok((c, k)) => (c, k),
+        Err(super::passphrase::StoreOpenError::Locked) => {
+            return Err(
+                "the target store is password-protected (passphrase mode): unlock it in the app \
+                 with 'Nhớ trên máy này' (remember on this machine) enabled, then re-run — the \
+                 import CLI never accepts passwords"
+                    .into(),
+            );
+        }
+        Err(super::passphrase::StoreOpenError::Other(k)) => {
+            return Err(format!(
+                "--target: store open failed ({k}) — no key file / broken store?"
+            ));
+        }
+    };
 
     // Precondition 6 (batch 16 fix F4): the store's schema version
     // must equal this binary's. The live store of the soaking build is
@@ -815,10 +822,10 @@ pub fn run_apply_with_limit(
     while super::backup::backup_db_path(&backup_dir, now).exists() {
         now += 1_000;
     }
-    let manifest = super::backup::backup_db(&conn, &key, &backup_dir, now)
+    let manifest = super::backup::backup_db(&conn, &store_key.backup_key(), &backup_dir, now)
         .map_err(|kind| format!("pre-import backup failed ({kind}) — no writes were performed"))?;
     let backup_db_path = super::backup::backup_db_path(&backup_dir, now);
-    super::backup::verify_backup(&backup_db_path, &key, &manifest)
+    super::backup::verify_backup(&backup_db_path, &store_key.backup_key(), &manifest)
         .map_err(|kind| format!("pre-import backup verify failed ({kind}) — no writes were performed"))?;
     let manifest_path = backup_db_path.with_extension("json");
     out(&format!(

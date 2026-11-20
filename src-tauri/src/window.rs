@@ -1779,6 +1779,57 @@ fn open_archive_window_inner(app: &AppHandle) {
     }
 }
 
+/// The shadow unlock window's label (batch 18, brief R2): the small
+/// LOCAL prompt shown at startup when the store is in passphrase mode
+/// with no usable remember file. Its capability
+/// (`capabilities/shadow-unlock.json`) grants ONLY `shadow-unlock`
+/// (plus core:default); Rust re-checks the label and the local URL in
+/// the command itself, exactly like the app-lock pattern.
+pub const SHADOW_UNLOCK_LABEL: &str = "shadow-unlock";
+
+/// Open (or focus) the shadow unlock window (batch 18 R2): reuse the
+/// app-lock window's shape — small, undecorated, content-protected,
+/// always on top, a single password field — but for the STORE password,
+/// with an optional "remember on this machine" checkbox. Closing it is
+/// allowed: the pipeline simply stays off until the next unlock.
+/// Same creation discipline as the settings/archive windows (blocking
+/// worker + serialized creation) — it is called from the Tauri setup
+/// thread.
+pub fn open_shadow_unlock_window(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CREATE.lock().unwrap_or_else(|e| e.into_inner());
+        // Single instance: focus the open window.
+        if let Some(w) = app.get_webview_window(SHADOW_UNLOCK_LABEL) {
+            let _ = w.show();
+            let _ = w.set_focus();
+            return;
+        }
+        let built = WebviewWindowBuilder::new(
+            &app,
+            SHADOW_UNLOCK_LABEL,
+            WebviewUrl::App("shadow-unlock.html".into()),
+        )
+        .initialization_script(crate::i18n::init_script())
+        .title(tr("Zalo — Armazenamento bloqueado"))
+        .inner_size(420.0, 420.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .content_protected(true)
+        .center()
+        .focused(true)
+        .build();
+        match built {
+            Ok(_) => {}
+            Err(e) => {
+                crate::dlog::log(&format!("shadow unlock window creation failed: {e}"))
+            }
+        }
+    });
+}
+
 fn open_settings_window_inner(app: &AppHandle) {
     #[cfg(windows)]
     {

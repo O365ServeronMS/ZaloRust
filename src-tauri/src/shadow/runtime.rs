@@ -5,8 +5,11 @@
 //! ```text
 //! %LOCALAPPDATA%\com.o365serveronms.zalors\shadow\
 //!   default.db        SQLCipher shadow DB (WAL)
-//!   default.key       DPAPI-wrapped 32-byte key
+//!   default.key       DPAPI-wrapped 32-byte key (raw mode)
 //!   default.uin       account marker (legacy file, kept untouched)
+//!   default.keymode.json     passphrase-mode marker, batch 18 (no secrets)
+//!   default.pass.dpapi       DPAPI "remember on this machine" wrap, batch 18
+//!   default.key.pre-passphrase  the renamed raw key after a conversion
 //! ```
 //!
 //! Delivery paths (all end on the SAME mpsc queue; the flusher thread is
@@ -35,10 +38,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tauri::Manager;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::account::{self, UidEvent};
 use super::bounded::{BoundedMap, Inserted};
+use super::passphrase::StoreKeyMode;
 use super::pipeline;
 use super::rest_stats::{self, RestStage};
 use super::ws_stats::{self, WsStage};
@@ -66,6 +70,16 @@ pub struct Shadow {
 /// thread can log the run's single line and do the media half itself
 /// (batch 10 J4: the on-exit backup drives the same variant through
 /// `runtime::request_backup`).
+///
+/// The four `Passphrase*` jobs (batch 18, brief R2/R3) run the store's
+/// key-mode conversions on the flusher — it is the single writer, so a
+/// rekey is naturally serialized with every batch write. The passwords
+/// ride the queue in `Zeroizing<String>` (RAM only), the replies are
+/// kind-only error strings, and a wrong password never gets this far
+/// (the command layer proves it first). On a SUCCESSFUL set/change/
+/// remove the flusher also publishes the new key into the shared key
+/// cell (F2, `shadow::passphrase::publish_key`) so the media thread's
+/// next cycle and the archive window's cached session re-open with it.
 pub(crate) enum Job {
     WsFrame { bytes: Vec<u8>, conn: String, direction: &'static str },
     /// A tracked WS connection closed: wipe its per-connection key.
@@ -79,6 +93,33 @@ pub(crate) enum Job {
     /// reloads the key file itself; the outcome comes back on the
     /// one-shot `respond` channel.
     Backup { respond: Sender<super::backup::DbBackupOutcome> },
+    /// Convert the store raw → passphrase (batch 18 R3). Requires raw
+    /// mode + a running flusher; the engine pre-backs-up with the OLD
+    /// raw key, journals down, rekeys, verifies, then flips the marker.
+    PassphraseSet {
+        passphrase: Zeroizing<String>,
+        remember: bool,
+        respond: Sender<Result<(), String>>,
+    },
+    /// Change the passphrase. The command layer already proved `old`
+    /// opens the DB; `old` rides along for the engine's recovery path.
+    PassphraseChange {
+        old: Zeroizing<String>,
+        new: Zeroizing<String>,
+        remember: bool,
+        respond: Sender<Result<(), String>>,
+    },
+    /// Remove the password: rekey back to a fresh random raw key.
+    PassphraseRemove {
+        current: Zeroizing<String>,
+        respond: Sender<Result<(), String>>,
+    },
+    /// "Nhớ trên máy này" toggle: save (needs the flusher's RAM copy of
+    /// the passphrase) or delete the remember file.
+    PassphraseRemember {
+        on: bool,
+        respond: Sender<Result<(), String>>,
+    },
 }
 
 /// Resolve the shadow directory for this install.
@@ -97,6 +138,12 @@ pub fn shadow_dir(app: &tauri::AppHandle) -> PathBuf {
 
 /// Boot the pipeline if enabled in settings. Idempotent: a second call is
 /// a no-op (the running state is already managed).
+///
+/// Batch 18 (R2): raw mode is unchanged. In passphrase mode the store
+/// boots only when the remember file exists AND opens the DB; otherwise
+/// the pipeline does NOT start — the log says the store is locked and
+/// the shadow-unlock window asks for the password (capture while locked
+/// is dropped by design: without a DB there is nowhere to land).
 pub fn start(app: &tauri::AppHandle) {
     if app.try_state::<Shadow>().is_some() {
         return;
@@ -107,35 +154,11 @@ pub fn start(app: &tauri::AppHandle) {
         return;
     }
     let dir = shadow_dir(app);
-    let (tx, rx) = channel::<Job>();
     match open_db(&dir, &s.shadow) {
-        Ok(conn) => {
-            let media_cfg = s.shadow.clone();
-            // H4 (batch 8): the backup thread starts ONLY when the user
-            // turned backups on AND chose a folder — the feature is
-            // OFF by default (`backup_enabled: false`).
-            let backup_cfg = s.shadow.clone();
-            let flusher_dir = dir.clone();
-            std::thread::Builder::new()
-                .name("shadow-flusher".into())
-                .spawn(move || flusher(conn, flusher_dir, rx, s.shadow))
-                .ok();
-            let media_tx = tx.clone();
-            let backup_tx = tx.clone();
-            app.manage(Shadow { tx });
-            // P1b/T3: media auto-download on a READ-ONLY connection;
-            // every status flip it triggers flows back through the same
-            // job queue so the flusher stays the only DB writer.
-            super::media::start(dir.clone(), media_cfg, media_tx);
-            // P4/H4: scheduled backups — the flusher owns the only RW
-            // connection (A5), so the DB half arrives as `Job::Backup`
-            // and the media half runs on the backup thread (read-only
-            // on the store).
-            if backup_cfg.backup_enabled && backup_cfg.backup_dir.is_some() {
-                super::backup::start_backup_thread(backup_cfg, backup_tx);
-                crate::dlog::log("shadow: backup thread started");
-            }
-            crate::dlog::log("shadow: pipeline started (capture mode cdp)");
+        Ok(Some(opened)) => boot_pipeline(app, dir, s, opened),
+        Ok(None) => {
+            crate::dlog::log("shadow: store locked (passphrase mode) — waiting for unlock");
+            crate::window::open_shadow_unlock_window(app);
         }
         Err(e) => {
             crate::dlog::log(&format!("shadow: FAILED to start ({e})"));
@@ -143,36 +166,154 @@ pub fn start(app: &tauri::AppHandle) {
     }
 }
 
+/// Boot the pipeline after a successful `shadow_unlock` (R2). The
+/// command layer already PROVED `passphrase` opens the DB; this opens it
+/// again as the flusher's connection, optionally saving the remember
+/// file first, and reuses every start step (media, backup thread,
+/// managed state). Idempotent like [`start`].
+pub fn start_unlocked(
+    app: &tauri::AppHandle,
+    passphrase: Zeroizing<String>,
+    remember: bool,
+) -> Result<(), String> {
+    if app.try_state::<Shadow>().is_some() {
+        return Ok(());
+    }
+    let s = crate::settings::load(app);
+    if !s.shadow.enabled {
+        return Err("disabled".into());
+    }
+    let dir = shadow_dir(app);
+    if super::passphrase::read_mode(&dir) != StoreKeyMode::Passphrase {
+        // Someone removed the password while the prompt was open, or
+        // the marker vanished: refuse rather than open a store whose
+        // mode disagrees with the prompt.
+        return Err("not-passphrase".into());
+    }
+    if remember {
+        super::passphrase::save_remembered(&dir, &passphrase)
+            .map_err(|_| "remember".to_string())?;
+    }
+    let db_path = super::db_file(&dir);
+    let conn = sqlcipher::open_with_passphrase(&db_path, &passphrase)
+        .map_err(|e| e.to_string())?;
+    schema::apply(&conn).map_err(|e| e.to_string())?;
+    boot_pipeline(
+        app,
+        dir,
+        s,
+        OpenedDb { conn, pass_ram: Some(passphrase) },
+    );
+    Ok(())
+}
+
+/// Everything after the DB is open (identical for both key modes): the
+/// flusher thread, the media downloader, the managed queue handle, the
+/// optional backup thread.
+fn boot_pipeline(app: &tauri::AppHandle, dir: PathBuf, s: Settings, opened: OpenedDb) {
+    let (tx, rx) = channel::<Job>();
+    let media_cfg = s.shadow.clone();
+    // H4 (batch 8): the backup thread starts ONLY when the user
+    // turned backups on AND chose a folder — the feature is
+    // OFF by default (`backup_enabled: false`).
+    let backup_cfg = s.shadow.clone();
+    let flusher_dir = dir.clone();
+    let flusher_pass = opened.pass_ram.clone();
+    let flusher_cfg = s.shadow.clone();
+    std::thread::Builder::new()
+        .name("shadow-flusher".into())
+        .spawn(move || flusher(opened.conn, flusher_dir, flusher_pass, rx, flusher_cfg))
+        .ok();
+    let media_tx = tx.clone();
+    let backup_tx = tx.clone();
+    app.manage(Shadow { tx });
+    // P1b/T3: media auto-download on a READ-ONLY connection;
+    // every status flip it triggers flows back through the same
+    // job queue so the flusher stays the only DB writer. F2 (batch
+    // 18 review): the thread opens its connection per CYCLE with the
+    // shared key cell's CURRENT value — after a set/change/remove it
+    // picks the new key up without an app restart.
+    super::media::start(dir.clone(), media_cfg, media_tx);
+    // P4/H4: scheduled backups — the flusher owns the only RW
+    // connection (A5), so the DB half arrives as `Job::Backup`
+    // and the media half runs on the backup thread (read-only
+    // on the store).
+    if backup_cfg.backup_enabled && backup_cfg.backup_dir.is_some() {
+        super::backup::start_backup_thread(backup_cfg, backup_tx);
+        crate::dlog::log("shadow: backup thread started");
+    }
+    crate::dlog::log(if opened.pass_ram.is_some() {
+        "shadow: pipeline started (capture mode cdp, passphrase mode)"
+    } else {
+        "shadow: pipeline started (capture mode cdp)"
+    });
+}
+
+/// An open shadow DB plus the RAM copy of the passphrase when the mode
+/// is `passphrase` (the flusher keeps it for backups and the remember
+/// toggle; raw mode wipes its key bytes after open per L4/D4).
+struct OpenedDb {
+    conn: rusqlite::Connection,
+    pass_ram: Option<Zeroizing<String>>,
+}
+
 /// Open (or create) the encrypted shadow DB and apply the schema.
-fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<rusqlite::Connection, String> {
+///
+/// `Ok(None)` = passphrase mode with no usable remember file: the store
+/// is LOCKED (the caller logs and shows the unlock prompt). Raw mode is
+/// byte-for-byte the pre-batch-18 path.
+fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<Option<OpenedDb>, String> {
     let _ = std::fs::create_dir_all(dir);
     // KQ10: every path through the shadow store goes through the
     // account helpers — nothing hardcodes "default" here anymore.
     let db_path = super::db_file(dir);
     let key_path = super::key_file(dir);
-    if cfg.encrypt {
-        if !key_path.exists() {
-            // L4/D4: the generated key bytes are wiped after the
-            // DPAPI wrap; the wrapped file never holds the raw key.
-            let key =
-                zeroize::Zeroizing::new(sqlcipher::generate_key().map_err(|e| e.to_string())?);
-            sqlcipher::save_key(&key, &key_path).map_err(|e| e.to_string())?;
-        }
-        // L4/D4: the loaded key bytes are wiped once the connection
-        // holds them (SQLCipher keeps its own copy; the Rust-side Vec
-        // must not linger).
-        let key =
-            zeroize::Zeroizing::new(sqlcipher::load_key(&key_path).map_err(|e| e.to_string())?);
-        let conn = sqlcipher::open_with_key(&db_path, &key).map_err(|e| e.to_string())?;
-        schema::apply(&conn).map_err(|e| e.to_string())?;
-        Ok(conn)
-    } else {
+    if !cfg.encrypt {
         let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
         // H3: every connection waits instead of erroring on a busy DB.
         conn.busy_timeout(Duration::from_millis(sqlcipher::BUSY_TIMEOUT_MS))
             .map_err(|e| e.to_string())?;
         schema::apply(&conn).map_err(|e| e.to_string())?;
-        Ok(conn)
+        return Ok(Some(OpenedDb { conn, pass_ram: None }));
+    }
+    match super::passphrase::read_mode(dir) {
+        StoreKeyMode::Raw => {
+            if !key_path.exists() {
+                // L4/D4: the generated key bytes are wiped after the
+                // DPAPI wrap; the wrapped file never holds the raw key.
+                let key = Zeroizing::new(
+                    sqlcipher::generate_key().map_err(|e| e.to_string())?,
+                );
+                sqlcipher::save_key(&key, &key_path).map_err(|e| e.to_string())?;
+            }
+            // L4/D4: the loaded key bytes are wiped once the connection
+            // holds them (SQLCipher keeps its own copy; the Rust-side Vec
+            // must not linger).
+            let key =
+                Zeroizing::new(sqlcipher::load_key(&key_path).map_err(|e| e.to_string())?);
+            let conn = sqlcipher::open_with_key(&db_path, &key).map_err(|e| e.to_string())?;
+            schema::apply(&conn).map_err(|e| e.to_string())?;
+            Ok(Some(OpenedDb { conn, pass_ram: None }))
+        }
+        StoreKeyMode::Passphrase => {
+            // R2: the remember file is the only unattended source. A
+            // missing file or one that no longer opens (the password
+            // changed) is the same user situation: locked, ask again.
+            let pw = match super::passphrase::load_remembered(dir) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            };
+            match sqlcipher::open_with_passphrase(&db_path, &pw) {
+                Ok(conn) => {
+                    schema::apply(&conn).map_err(|e| e.to_string())?;
+                    Ok(Some(OpenedDb { conn, pass_ram: Some(pw) }))
+                }
+                // A stale remember wrap behaves like no remember file.
+                Err(sqlcipher::KeyError::WrongPassword) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        StoreKeyMode::Unknown => Err("unknown key mode marker".into()),
     }
 }
 
@@ -190,8 +331,27 @@ const WS_KEYS_CAP: usize = 16;
 
 /// The flusher thread: owns the DB connection and both runtime keys.
 /// `dir` is the shadow store dir (the `Job::Backup` handler needs it
-/// for the DPAPI key file — batch 8 H4).
-fn flusher(conn: rusqlite::Connection, dir: PathBuf, rx: Receiver<Job>, cfg: ShadowSettings) {
+/// for the DPAPI key file — batch 8 H4). `pass_ram` (batch 18) is the
+/// RAM copy of the passphrase in passphrase mode — held only for
+/// passphrase-mode backups and the remember toggle, never logged, and
+/// wiped on shutdown with every other key.
+fn flusher(
+    conn: rusqlite::Connection,
+    dir: PathBuf,
+    pass_ram_init: Option<Zeroizing<String>>,
+    rx: Receiver<Job>,
+    cfg: ShadowSettings,
+) {
+    // Batch 18: the passphrase the flusher holds in RAM (None in raw
+    // mode; set on unlock, kept in step with the conversion jobs).
+    let mut pass_ram = pass_ram_init;
+    // F2 (batch-18 review): publish the boot key into the process-wide
+    // shared key cell. The cell is written ONLY on this thread (the
+    // single writer): here at boot — which covers the unlock path,
+    // `start_unlocked` boots through here — and after every successful
+    // conversion below. Every publish bumps the epoch, so the media
+    // cycle and the archive window re-open with the CURRENT key.
+    super::passphrase::publish_key(pass_ram.clone());
     // D2 (audit M4): one key PER CONNECTION, not one global —
     // overlapping reconnects used to decode with the wrong key.
     // R1: insertion-ordered bounded map — the OLDEST key is evicted
@@ -368,8 +528,82 @@ fn flusher(conn: rusqlite::Connection, dir: PathBuf, rx: Receiver<Job>, cfg: Sha
                 // the run is the backup thread's (read-only on the
                 // store); the outcome goes back on the one-shot channel
                 // so that thread can log the run's single line.
+                // Batch 18: in passphrase mode the export key is the
+                // flusher's RAM passphrase (backup = portable, opened
+                // by the password alone).
                 Job::Backup { respond } => {
-                    let outcome = super::backup::run_db_backup(&conn, &dir, &cfg);
+                    let outcome = super::backup::run_db_backup(
+                        &conn,
+                        &dir,
+                        &cfg,
+                        pass_ram.as_ref().map(|p| p.as_str()),
+                    );
+                    let _ = respond.send(outcome);
+                }
+                // Batch 18 R3: the key-mode conversions run here (the
+                // single writer) — batch writes simply queue behind the
+                // job. Replies are kind-only; the passwords themselves
+                // never reach a log line or an error string.
+                Job::PassphraseSet { passphrase, remember, respond } => {
+                    let now = schema::now_ms();
+                    let outcome = super::passphrase::set_passphrase(
+                        &conn,
+                        &dir,
+                        &passphrase,
+                        remember,
+                        now,
+                    );
+                    if outcome.is_ok() {
+                        pass_ram = Some(passphrase);
+                        // F2: the epoch bump makes every in-process
+                        // reader re-open with the new key.
+                        super::passphrase::publish_key(pass_ram.clone());
+                    }
+                    let _ = respond.send(outcome);
+                }
+                Job::PassphraseChange { old, new, remember, respond } => {
+                    // `old` (the flusher's own RAM copy, handed back by
+                    // the command for exactly this) is the recovery key
+                    // the engine rekeys back to when verification fails.
+                    let outcome = super::passphrase::change_passphrase(
+                        &conn,
+                        &dir,
+                        Some(old.as_str()),
+                        &new,
+                        remember,
+                    );
+                    if outcome.is_ok() {
+                        pass_ram = Some(new);
+                        super::passphrase::publish_key(pass_ram.clone());
+                    }
+                    let _ = respond.send(outcome);
+                }
+                Job::PassphraseRemove { current, respond } => {
+                    let outcome =
+                        super::passphrase::remove_passphrase(&conn, &dir, &current);
+                    if outcome.is_ok() {
+                        pass_ram = None;
+                        // F2: raw mode is the cell's None value — the
+                        // media cycle's next open reads default.key.
+                        super::passphrase::publish_key(None);
+                    }
+                    let _ = respond.send(outcome);
+                }
+                Job::PassphraseRemember { on, respond } => {
+                    let outcome = if on {
+                        match pass_ram.as_deref() {
+                            Some(pw) => {
+                                super::passphrase::save_remembered(&dir, pw)
+                                    .map_err(|_| "remember".to_string())
+                            }
+                            // No RAM copy (raw mode, or locked): the
+                            // toggle cannot save what it does not hold.
+                            None => Err("not-running".to_string()),
+                        }
+                    } else {
+                        super::passphrase::forget_remembered(&dir)
+                            .map_err(|_| "forget".to_string())
+                    };
                     let _ = respond.send(outcome);
                 }
             }
@@ -404,6 +638,10 @@ fn flusher(conn: rusqlite::Connection, dir: PathBuf, rx: Receiver<Job>, cfg: Sha
     }
     if let Some(mut k) = rest_key.take() {
         k.zeroize();
+    }
+    // Batch 18: the RAM passphrase dies with the flusher, wiped.
+    if let Some(mut p) = pass_ram.take() {
+        p.zeroize();
     }
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 }
@@ -505,6 +743,22 @@ pub(crate) fn request_backup(
     let sh = app.try_state::<Shadow>()?;
     let (rtx, rrx) = std::sync::mpsc::channel();
     sh.tx.send(Job::Backup { respond: rtx }).ok()?;
+    Some(rrx)
+}
+
+/// Batch 18: send one `Passphrase*` job to the flusher and hand back the
+/// reply receiver (the command awaits it off its own thread with a
+/// generous timeout — a conversion of a large store is a full rekey).
+/// `None` when the pipeline is not running (locked, disabled, or the
+/// shutdown race): the caller translates that into its own clean
+/// refusal, never a password prompt of the CLI's.
+pub(crate) fn send_passphrase(
+    app: &tauri::AppHandle,
+    build: impl FnOnce(Sender<Result<(), String>>) -> Job,
+) -> Option<std::sync::mpsc::Receiver<Result<(), String>>> {
+    let sh = app.try_state::<Shadow>()?;
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    sh.tx.send(build(rtx)).ok()?;
     Some(rrx)
 }
 

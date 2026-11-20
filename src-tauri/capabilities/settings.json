@@ -36,7 +36,12 @@
     "allow-notification-diagnostics",
     "allow-test-notification",
     "allow-open-notification-settings",
-    "allow-archive-open"
+    "allow-archive-open",
+    "allow-shadow-password-status",
+    "allow-shadow-set-password",
+    "allow-shadow-change-password",
+    "allow-shadow-remove-password",
+    "allow-shadow-set-remember"
   ],
   "webviews": [
     "settings"

@@ -221,6 +221,401 @@ pub fn shadow_handshake(window: tauri::Webview, key: String, uid: Option<String>
     crate::shadow::runtime::set_rest_key(&window.app_handle(), key, uid);
 }
 
+// --- Shadow DB passphrase mode (batch 18, brief R1-R3) -----------------------
+//
+// The store password commands. ACL: the settings window only (`settings`
+// label + local URL — the same two-layer rule as the archive commands,
+// with the capability in capabilities/settings.json); `shadow_unlock`
+// is the one exception, living in the shadow-unlock window's own
+// capability and guarded exactly like the app-lock commands.
+//
+// Passwords arrive as IPC payloads, live in `Zeroizing<String>` for the
+// ride to the flusher, and are never: logged, echoed in an error string,
+// stored in settings.json, or written anywhere but the DPAPI remember
+// file. Every failure the user sees is a generic translated message;
+// the flusher's kind strings are for the log file (kinds only).
+
+/// How long a settings command waits for the flusher's conversion reply.
+/// A conversion pre-backs-up and then rekeys every page of the store —
+/// seconds for the documented store, bounded so the UI can never hang.
+const PASSPHRASE_JOB_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The settings-window guard shared by the password commands (R3:
+/// "ACL limited to the settings window").
+fn shadow_settings_guard(window: &tauri::Webview) -> Result<(), String> {
+    if window.label() != "settings" || !crate::integration::trusted_local(window) {
+        return Err("forbidden".into());
+    }
+    Ok(())
+}
+
+/// The shadow-unlock window guard (R2, the app-lock pattern: exact label
+/// + local URL; the capability grants only `shadow-unlock`).
+fn is_shadow_unlock_window(window: &tauri::Webview) -> bool {
+    window.label() == crate::window::SHADOW_UNLOCK_LABEL
+        && crate::integration::trusted_local(window)
+}
+
+/// The store status the shadow settings section shows (R3): which key
+/// mode, whether a remember file exists, whether the capture pipeline is
+/// running (and therefore whether the store is passphrase-locked).
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowPassStatus {
+    /// "raw" | "passphrase" | "unknown" — the marker's word, no secrets.
+    pub mode: String,
+    /// A `default.pass.dpapi` remember file exists on this machine.
+    pub remembered: bool,
+    /// The capture pipeline booted (the flusher is alive).
+    pub running: bool,
+    /// Passphrase mode and NOT running: the store waits for an unlock.
+    pub locked: bool,
+}
+
+/// `ShadowPassStatus` for the settings window (R3). Never reports any
+/// secret — the marker is plaintext mode metadata by design.
+#[tauri::command]
+pub fn shadow_password_status(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+) -> Result<ShadowPassStatus, String> {
+    shadow_settings_guard(&window)?;
+    lock::require_unlocked(&app)?;
+    use crate::shadow::passphrase::{read_mode, remembered_present, StoreKeyMode};
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    let mode = match read_mode(&dir) {
+        StoreKeyMode::Raw => "raw",
+        StoreKeyMode::Passphrase => "passphrase",
+        StoreKeyMode::Unknown => "unknown",
+    };
+    let running = app.try_state::<crate::shadow::runtime::Shadow>().is_some();
+    Ok(ShadowPassStatus {
+        mode: mode.into(),
+        remembered: remembered_present(&dir),
+        running,
+        locked: mode == "passphrase" && !running,
+    })
+}
+
+/// Await one flusher passphrase job off the command's async context.
+/// `Err(kind)` messages are already log-safe (kinds only).
+async fn await_passphrase_job(
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(PASSPHRASE_JOB_WAIT)
+            .map_err(|_| "flusher-gone".to_string())
+            .and_then(|r| r)
+    })
+    .await
+    .map_err(|_| "flusher-gone".to_string())?
+}
+
+/// Prove `password` opens the passphrase-mode store at `dir`, under the
+/// shared wrong-password throttle (R2: 5 tries, then 30 s).
+/// `Ok(())` = proven (throttle reset). `Err(Some(secs))` = blocked.
+/// `Err(None)` = wrong password (counted).
+fn prove_passphrase(dir: &std::path::Path, password: &str) -> Result<(), Option<u64>> {
+    let db_path = crate::shadow::db_file(dir);
+    crate::shadow::passphrase::throttled_probe(std::time::Instant::now(), || {
+        match crate::migrate::sqlcipher::open_with_passphrase_readonly(&db_path, password) {
+            Ok(_) => true,
+            Err(crate::migrate::sqlcipher::KeyError::WrongPassword) => false,
+            // Any other failure (io, corrupt marker era) is "not
+            // proven": fail closed and count it.
+            Err(_) => false,
+        }
+    })
+    .map_err(|secs| if secs > 0 { Some(secs) } else { None })
+}
+
+/// "Đặt mật khẩu DB" (R3): convert the raw-keyed store to the user's
+/// passphrase. The flusher (single writer) pre-backs-up with the OLD raw
+/// key, journals down, rekeys, verifies, then flips the marker — any
+/// failure leaves the store raw and usable.
+#[tauri::command]
+pub async fn shadow_set_password(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    new: String,
+    confirm: String,
+    remember: bool,
+) -> Result<(), String> {
+    // F5 (review): wipe every password copy from the moment it enters
+    // Rust — the deserialized String IS the Zeroizing's buffer, so
+    // there is exactly one copy and it dies zeroized.
+    let new = zeroize::Zeroizing::new(new);
+    let confirm = zeroize::Zeroizing::new(confirm);
+    shadow_settings_guard(&window)?;
+    lock::require_unlocked(&app)?;
+    use crate::shadow::passphrase::{read_mode, validate_passphrase, PassInvalid, StoreKeyMode};
+    if new.as_str() != confirm.as_str() {
+        return Err(tr("As senhas não coincidem.").into());
+    }
+    match validate_passphrase(new.as_str()) {
+        Ok(()) => {}
+        Err(PassInvalid::TooShort) => {
+            return Err(trf(
+                "A senha do banco de dados deve ter pelo menos {0} caracteres.",
+                &[&crate::shadow::passphrase::MIN_PASS_LEN],
+            ))
+        }
+        Err(_) => return Err(tr("A senha do banco de dados contém caracteres inválidos.").into()),
+    }
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    if read_mode(&dir) != StoreKeyMode::Raw {
+        return Err(tr("O armazenamento já tem uma senha.").into());
+    }
+    if !crate::shadow::key_file(&dir).is_file() {
+        return Err(tr("Não foi possível abrir o armazenamento de mensagens.").into());
+    }
+    // F2: the archive window's cached connection holds the OLD key —
+    // drop it before the conversion job runs (a reopen racing the job
+    // is caught by the conversion's own `store-busy` refusal).
+    crate::archive_cmds::drop_cached_conn(&app);
+    // The flusher must be running (it is the single writer that rekeys).
+    let Some(rx) = crate::shadow::runtime::send_passphrase(&app, |respond| {
+        crate::shadow::runtime::Job::PassphraseSet {
+            passphrase: new,
+            remember,
+            respond,
+        }
+    }) else {
+        return Err(tr("O armazenamento shadow está desativado ou bloqueado.").into());
+    };
+    match await_passphrase_job(rx).await {
+        Ok(()) => Ok(()),
+        Err(kind) => {
+            crate::dlog::log(&format!("shadow: set-password FAILED ({kind})"));
+            Err(pass_failure_message(&kind))
+        }
+    }
+}
+
+/// Generic, translated failure for a conversion job (never the kind's
+/// internals — kinds are log-only; a couple of specific kinds get their
+/// own clearer message).
+fn pass_failure_message(kind: &str) -> String {
+    if kind.starts_with("backup") {
+        tr("O backup antes da alteração falhou; nada foi alterado. Tente novamente.")
+            .into_owned()
+    } else if kind == "store-busy" {
+        // F1: the journal could not leave WAL — another connection
+        // (the archive window's cached session reopened, an external
+        // tool) still holds the store. Nothing was changed.
+        tr("O armazenamento está em uso: feche a janela do arquivo e tente novamente. Nada foi alterado.")
+            .into_owned()
+    } else if kind == "flusher-gone" {
+        tr("O armazenamento shadow está desativado ou bloqueado.").into_owned()
+    } else {
+        tr("Não foi possível alterar a senha do armazenamento.").into_owned()
+    }
+}
+
+/// "Đổi mật khẩu" (R3): change the store passphrase. Requires the OLD
+/// password (proven here under the throttle), then the flusher rekeys
+/// and re-verifies. `remember: Option<bool>` — `None` keeps the
+/// current remember state; the UI sends the toggle's state so the
+/// remember file is updated atomically with the key.
+#[tauri::command]
+pub async fn shadow_change_password(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    old: String,
+    new: String,
+    confirm: String,
+    remember: Option<bool>,
+) -> Result<(), String> {
+    // F5 (review): wipe every password copy from entry (until it rides
+    // the job queue in the same `Zeroizing`).
+    let old = zeroize::Zeroizing::new(old);
+    let new = zeroize::Zeroizing::new(new);
+    let confirm = zeroize::Zeroizing::new(confirm);
+    shadow_settings_guard(&window)?;
+    lock::require_unlocked(&app)?;
+    use crate::shadow::passphrase::{read_mode, validate_passphrase, PassInvalid, StoreKeyMode};
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    if read_mode(&dir) != StoreKeyMode::Passphrase {
+        return Err(tr("O armazenamento não tem uma senha.").into());
+    }
+    if new.as_str() != confirm.as_str() {
+        return Err(tr("As senhas não coincidem.").into());
+    }
+    match validate_passphrase(new.as_str()) {
+        Ok(()) => {}
+        Err(PassInvalid::TooShort) => {
+            return Err(trf(
+                "A senha do banco de dados deve ter pelo menos {0} caracteres.",
+                &[&crate::shadow::passphrase::MIN_PASS_LEN],
+            ))
+        }
+        Err(_) => return Err(tr("A senha do banco de dados contém caracteres inválidos.").into()),
+    }
+    // Prove the OLD password under the throttle — one generic message,
+    // never which part failed.
+    match prove_passphrase(&dir, old.as_str()) {
+        Ok(()) => {}
+        Err(Some(secs)) => return Err(format!("throttled:{secs}")),
+        Err(None) => return Err(tr("A senha atual está incorreta.").into()),
+    }
+    let remember = remember.unwrap_or_else(|| crate::shadow::passphrase::remembered_present(&dir));
+    // F2: the archive window's cached connection holds the OLD key —
+    // drop it before the conversion job runs.
+    crate::archive_cmds::drop_cached_conn(&app);
+    let Some(rx) = crate::shadow::runtime::send_passphrase(&app, |respond| {
+        crate::shadow::runtime::Job::PassphraseChange {
+            old,
+            new,
+            remember,
+            respond,
+        }
+    }) else {
+        return Err(tr("O armazenamento shadow está desativado ou bloqueado.").into());
+    };
+    match await_passphrase_job(rx).await {
+        Ok(()) => Ok(()),
+        Err(kind) => {
+            crate::dlog::log(&format!("shadow: change-password FAILED ({kind})"));
+            Err(pass_failure_message(&kind))
+        }
+    }
+}
+
+/// "Bỏ mật khẩu (quay về khóa theo máy)" (R3): remove the password,
+/// rekeying back to a fresh random raw key saved DPAPI. Requires the
+/// current password, proven under the throttle.
+#[tauri::command]
+pub async fn shadow_remove_password(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    current: String,
+) -> Result<(), String> {
+    // F5 (review): wipe the password copy from entry.
+    let current = zeroize::Zeroizing::new(current);
+    shadow_settings_guard(&window)?;
+    lock::require_unlocked(&app)?;
+    use crate::shadow::passphrase::{read_mode, StoreKeyMode};
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    if read_mode(&dir) != StoreKeyMode::Passphrase {
+        return Err(tr("O armazenamento não tem uma senha.").into());
+    }
+    match prove_passphrase(&dir, current.as_str()) {
+        Ok(()) => {}
+        Err(Some(secs)) => return Err(format!("throttled:{secs}")),
+        Err(None) => return Err(tr("A senha atual está incorreta.").into()),
+    }
+    // F2: the archive window's cached connection holds the OLD key —
+    // drop it before the conversion job runs.
+    crate::archive_cmds::drop_cached_conn(&app);
+    let Some(rx) = crate::shadow::runtime::send_passphrase(&app, |respond| {
+        crate::shadow::runtime::Job::PassphraseRemove {
+            current,
+            respond,
+        }
+    }) else {
+        return Err(tr("O armazenamento shadow está desativado ou bloqueado.").into());
+    };
+    match await_passphrase_job(rx).await {
+        Ok(()) => Ok(()),
+        Err(kind) => {
+            crate::dlog::log(&format!("shadow: remove-password FAILED ({kind})"));
+            Err(pass_failure_message(&kind))
+        }
+    }
+}
+
+/// "Nhớ trên máy này" toggle (R3). ON needs the flusher's RAM copy of
+/// the passphrase (the pipeline must be running in passphrase mode);
+/// OFF only deletes the remember file and works regardless.
+#[tauri::command]
+pub async fn shadow_set_remember(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    remember: bool,
+) -> Result<(), String> {
+    shadow_settings_guard(&window)?;
+    lock::require_unlocked(&app)?;
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    if !remember {
+        // Deleting never needs the pipeline.
+        return crate::shadow::passphrase::forget_remembered(&dir)
+            .map_err(|_| tr("Não foi possível esquecer a senha neste computador.").into_owned());
+    }
+    let Some(rx) = crate::shadow::runtime::send_passphrase(&app, |respond| {
+        crate::shadow::runtime::Job::PassphraseRemember { on: true, respond }
+    }) else {
+        return Err(tr(
+            "É preciso abrir o armazenamento primeiro: desbloqueie a senha dele e tente de novo.",
+        )
+        .into());
+    };
+    match await_passphrase_job(rx).await {
+        Ok(()) => Ok(()),
+        Err(kind) => {
+            crate::dlog::log(&format!("shadow: set-remember FAILED ({kind})"));
+            Err(tr("Não foi possível lembrar a senha neste computador.").into())
+        }
+    }
+}
+
+/// The shadow-unlock prompt (R2, the app-lock window pattern): prove the
+/// password under the throttle, optionally write the remember file,
+/// boot the pipeline, close the prompt. Works while the app is locked
+/// (the store's password is a separate secret). `Ok(false)` = wrong
+/// password; `Err("throttled:N")` while rate-limited.
+#[tauri::command]
+pub async fn shadow_unlock(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    password: String,
+    remember: bool,
+) -> Result<bool, String> {
+    if !is_shadow_unlock_window(&window) {
+        return Err("forbidden".into());
+    }
+    let pw = zeroize::Zeroizing::new(password);
+    let dir = crate::shadow::runtime::shadow_dir(&app);
+    // A stale prompt (the user removed the password while it was open,
+    // or the marker vanished): nothing to unlock.
+    if crate::shadow::passphrase::read_mode(&dir)
+        != crate::shadow::passphrase::StoreKeyMode::Passphrase
+    {
+        close_shadow_unlock_window(&app);
+        return Ok(true);
+    }
+    match prove_passphrase(&dir, &pw) {
+        Ok(()) => {}
+        Err(Some(secs)) => return Err(format!("throttled:{secs}")),
+        Err(None) => return Ok(false),
+    }
+    // Proven: boot the pipeline (opens with the passphrase again as the
+    // flusher's connection) and close the prompt on the main thread,
+    // after this IPC reply is on its way back.
+    let boot = crate::shadow::runtime::start_unlocked(&app, pw, remember);
+    if let Err(kind) = boot {
+        // Kinds only (H-rule) — the user sees one generic line.
+        crate::dlog::log(&format!("shadow: unlock FAILED ({kind})"));
+        return Err(tr("Não foi possível abrir o armazenamento de mensagens.").into());
+    }
+    crate::dlog::log("shadow: store unlocked (passphrase mode)");
+    close_shadow_unlock_window(&app);
+    Ok(true)
+}
+
+/// Close the shadow-unlock window from outside its own IPC callback
+/// (the lock window's discipline: the reply must return before the
+/// webview dies).
+fn close_shadow_unlock_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let inner = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(w) = inner.get_webview_window(crate::window::SHADOW_UNLOCK_LABEL) {
+                let _ = w.destroy();
+            }
+        });
+    });
+}
+
 #[tauri::command(async)]
 pub fn set_unread(
     window: tauri::Webview,
@@ -1220,5 +1615,136 @@ mod tests {
                 "{key:?} falls back to the download title"
             );
         }
+    }
+
+    // --- batch 18: the shadow-password command surface -------------------
+    //
+    // The mock-runtime ACL tests in ipc_acl_tests.rs run on Linux only;
+    // these parse the same capability JSON on every platform (the
+    // archive-batch-11 pattern) so a capability regression fails on
+    // this Windows machine too.
+
+    fn capability(name: &str) -> serde_json::Value {
+        let path = format!("{}/capabilities/{name}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {name}: {e}"))
+    }
+
+    fn permissions(cap: &serde_json::Value) -> Vec<String> {
+        cap["permissions"]
+            .as_array()
+            .expect("permissions array")
+            .iter()
+            .map(|p| p.as_str().expect("permission string").to_string())
+            .collect()
+    }
+
+    /// The five settings-window commands + the one unlock command.
+    const SHADOW_SETTINGS_PASS_COMMANDS: &[&str] = &[
+        "allow-shadow-password-status",
+        "allow-shadow-set-password",
+        "allow-shadow-change-password",
+        "allow-shadow-remove-password",
+        "allow-shadow-set-remember",
+    ];
+
+    #[test]
+    fn the_unlock_capability_grants_exactly_the_unlock_window() {
+        let cap = capability("shadow-unlock.json");
+        assert_eq!(cap["identifier"], "shadow-unlock-local");
+        let webviews: Vec<&str> = cap["webviews"]
+            .as_array()
+            .expect("webviews array")
+            .iter()
+            .map(|w| w.as_str().expect("webview string"))
+            .collect();
+        assert_eq!(webviews, vec!["shadow-unlock"], "the unlock webview only");
+        let perms = permissions(&cap);
+        assert!(perms.contains(&"core:default".to_string()));
+        assert!(perms.contains(&"core:window:allow-close".to_string()));
+        assert!(
+            perms.contains(&"allow-shadow-unlock".to_string()),
+            "its ONE command"
+        );
+        // NOTHING else: no remote, no account/lock/notification, none
+        // of the settings-window password commands.
+        for p in &perms {
+            let allowed = p == "core:default"
+                || p == "core:window:allow-close"
+                || p == "allow-shadow-unlock";
+            assert!(allowed, "shadow-unlock.json grants an unexpected permission: {p}");
+        }
+    }
+
+    #[test]
+    fn the_settings_capability_grants_exactly_the_five_password_commands() {
+        let perms = permissions(&capability("settings.json"));
+        let mut pass: Vec<String> = perms
+            .iter()
+            .filter(|p| p.starts_with("allow-shadow-"))
+            .cloned()
+            .collect();
+        pass.sort();
+        let mut want: Vec<String> =
+            SHADOW_SETTINGS_PASS_COMMANDS.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(pass, want, "exactly the five, never allow-shadow-unlock");
+    }
+
+    #[test]
+    fn no_other_capability_grants_a_shadow_password_command() {
+        // The bridge's `allow-shadow-e2ee-message` / `allow-shadow-handshake`
+        // (main-remote) are pre-existing page commands, NOT password
+        // commands — check the exact six names instead of a prefix.
+        let all: Vec<String> = SHADOW_SETTINGS_PASS_COMMANDS
+            .iter()
+            .chain(std::iter::once(&"allow-shadow-unlock"))
+            .map(|s| s.to_string())
+            .collect();
+        for name in ["main-remote.json", "lock.json", "shell.json", "archive.json"] {
+            for p in permissions(&capability(name)) {
+                assert!(
+                    !all.contains(&p),
+                    "{name} must not carry a shadow password permission: {p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shadow_password_commands_are_registered_in_the_app_manifest() {
+        // C3's lesson: a capability granting an unregistered command
+        // panics tauri-build on a clean clone. The six names must be in
+        // build.rs's app manifest exactly once each.
+        let path = format!("{}/build.rs", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap();
+        for cmd in [
+            "shadow_password_status",
+            "shadow_set_password",
+            "shadow_change_password",
+            "shadow_remove_password",
+            "shadow_set_remember",
+            "shadow_unlock",
+        ] {
+            let quoted = format!("\"{cmd}\"");
+            let n = src.matches(&quoted).count();
+            assert_eq!(n, 1, "build.rs must register {cmd} exactly once");
+        }
+    }
+
+    #[test]
+    fn the_shadow_guards_match_exactly_one_label_each() {
+        // The unlock window guard is the exact-label rule of the lock
+        // window (a `shadow-unlock-evil` prefix must NOT pass).
+        for label in ["shadow-unlock", "Shadow-Unlock", "shadow-unlockx"] {
+            let is = label == crate::window::SHADOW_UNLOCK_LABEL;
+            assert_eq!(
+                is,
+                label == "shadow-unlock",
+                "{label} must not count as the unlock window"
+            );
+        }
+        assert_eq!(crate::window::SHADOW_UNLOCK_LABEL, "shadow-unlock");
     }
 }

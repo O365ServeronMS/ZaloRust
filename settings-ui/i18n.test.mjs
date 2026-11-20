@@ -63,7 +63,7 @@ check("placeholders match between Portuguese and English", () => {
 
 check("every static string in the HTML pages has an English entry", () => {
   const missing = [];
-  for (const f of ["index.html", "lock.html", "shell.html", "archive.html"]) {
+  for (const f of ["index.html", "lock.html", "shell.html", "archive.html", "shadow-unlock.html"]) {
     for (const s of visibleTexts(read(f))) {
       if (!(s in EN) && !SAME.has(s)) missing.push(`${f}: ${s}`);
     }
@@ -73,7 +73,7 @@ check("every static string in the HTML pages has an English entry", () => {
 
 check("every t(\"…\") literal in the scripts has an English entry", () => {
   const missing = [];
-  for (const f of ["main.js", "panel.js", "lock.js", "shell.js", "dialog.js", "hotkey.js", "updates.js", "archive.js"]) {
+  for (const f of ["main.js", "panel.js", "lock.js", "shell.js", "dialog.js", "hotkey.js", "updates.js", "archive.js", "shadow-unlock.js"]) {
     for (const m of read(f).matchAll(/\bt\(\s*(["'])((?:\\.|(?!\1).)*)\1/g)) {
       const s = norm(m[2].replace(/\\(.)/g, "$1"));
       if (!(s in EN)) missing.push(`${f}: ${s}`);
@@ -86,7 +86,7 @@ check("strings assigned to the page by the scripts have an English entry", () =>
   // textContent = "…" / Dlg.*("…", {title: "…", okLabel: "…"}) literals.
   const missing = [];
   const re = /(?:textContent\s*=\s*|title\s*:\s*|okLabel\s*:\s*|requiredMessage\s*:\s*|Dlg\.(?:alert|confirm|prompt)\(\s*)(["'])((?:\\.|(?!\1).)*[A-Za-zÀ-ú](?:\\.|(?!\1).)*)\1/g;
-  for (const f of ["main.js", "lock.js", "panel.js", "updates.js", "archive.js"]) {
+  for (const f of ["main.js", "lock.js", "panel.js", "updates.js", "archive.js", "shadow-unlock.js"]) {
     for (const m of read(f).matchAll(re)) {
       const s = norm(m[2].replace(/\\(.)/g, "$1"));
       if (!/[À-ú]|\s/.test(s) && !(s in EN)) {

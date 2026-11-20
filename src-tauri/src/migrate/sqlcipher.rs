@@ -11,6 +11,16 @@
 //! - `open_with_key_readonly` is the probe/import path: it must never
 //!   create or modify the source DB (see the P2 acceptance "0 ghi").
 //!
+//! Batch 18 (passphrase mode, "Option A"): a store may instead be keyed
+//! by a USER-chosen passphrase via SQLCipher's own passphrase mode —
+//! SQLCipher 4 defaults (PBKDF2-HMAC-SHA512, 256,000 iterations, per-DB
+//! salt in the header), no other pragmas, so `default.db` + the password
+//! open the store on ANY machine with any SQLCipher-4 tool. The mode is
+//! marked by `shadow::passphrase` (`default.keymode.json`); the optional
+//! machine-local convenience is a DPAPI-wrapped remember file
+//! (`default.pass.dpapi`, entropy [`PASSPHRASE_ENTROPY`]). The passphrase
+//! PRAGMAs always go through rusqlite's quoting, never `format!()`.
+//!
 //! The previous implementation (lost with the temp clone on 2026-11-14,
 //! rebuilt 2026-11-19) exposed exactly `load_key` and
 //! `open_with_key_readonly`; those signatures are preserved because the
@@ -35,6 +45,13 @@ pub enum KeyError {
     Io(io::Error),
     /// The DB refused the key (wrong key, corrupt file, or a plaintext DB).
     Db(String),
+    /// Batch 18 (passphrase mode): the store IS in passphrase mode, the
+    /// DB is there, but this exact passphrase did not open it — the
+    /// first page read failed with SQLITE_NOTADB, SQLCipher's signature
+    /// for a key that derives the wrong page-1 key. A TYPED error so the
+    /// command layer can rate-limit and answer with a generic message,
+    /// never a panic, and never the passphrase itself in the error text.
+    WrongPassword,
 }
 
 impl std::fmt::Display for KeyError {
@@ -42,6 +59,10 @@ impl std::fmt::Display for KeyError {
         match self {
             KeyError::Io(e) => write!(f, "key file I/O error: {e}"),
             KeyError::Db(s) => write!(f, "sqlcipher error: {s}"),
+            // Never any detail that could echo the rejected passphrase.
+            KeyError::WrongPassword => {
+                write!(f, "wrong password (the database refused the key)")
+            }
         }
     }
 }
@@ -165,6 +186,145 @@ pub fn open_with_key_readonly(path: &Path, key: &[u8]) -> Result<Connection, Key
     open_with_key_opts(path, key, true)
 }
 
+// --- batch 18: SQLCipher passphrase mode ("Option A") -----------------------
+//
+// A passphrase-mode store uses SQLCipher's OWN defaults — PBKDF2-HMAC-SHA512,
+// 256,000 iterations, per-DB salt in the file header — and NOTHING else, so
+// third-party tools (DB Browser for SQLCipher) open it with the password and
+// default settings on any machine. That is the whole point of the mode: no
+// key file, no DPAPI, not machine-bound.
+//
+// Hard rules obeyed here:
+// - the passphrase PRAGMAs go through rusqlite's quoting
+//   (`pragma_update(None, "key"|"rekey", &pw)`), never `format!()` —
+//   verified against rusqlite 0.34's pragma.rs, `pragma_update` renders the
+//   value as a SQLite string literal with `''` escaping;
+// - kdf_iter/cipher_* PRAGMAs are NEVER set (portability = SQLCipher 4
+//   defaults);
+// - a wrong password is the TYPED [`KeyError::WrongPassword`] (first page
+//   read failing with SQLITE_NOTADB), never a panic, never a message that
+//   echoes the password.
+
+/// Is this rusqlite error SQLCipher's "this key did not open the DB"
+/// signature? The primary signal is the error CODE (SQLITE_NOTADB = 26);
+/// the message text ("file is not a database") is only a fallback for
+/// builds that map the code oddly.
+fn is_notadb(e: &rusqlite::Error) -> bool {
+    use rusqlite::ffi::{ErrorCode, Error as FfiError};
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            FfiError { code: ErrorCode::NotADatabase, .. },
+            ..
+        )
+    ) || e.to_string().contains("not a database")
+}
+
+/// Open `path` (a SQLCipher DB keyed as a PASSPHRASE) with `passphrase`.
+///
+/// No `kdf_iter`/`cipher_*` pragmas are set: SQLCipher 4 defaults ARE the
+/// portable format. `readonly` adds `query_only` like the raw-key path.
+pub fn open_with_passphrase_opts(
+    path: &Path,
+    passphrase: &str,
+    readonly: bool,
+) -> Result<Connection, KeyError> {
+    let flags = if readonly {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+    };
+    let conn = Connection::open_with_flags(path, flags)?;
+    // Injection-safe by construction: rusqlite quotes the value as a
+    // SQLite string literal (`PRAGMA key = '<pw with '' escaped>';`).
+    conn.pragma_update(None, "key", passphrase)
+        .map_err(|e| KeyError::Db(format!("pragma key failed: {e}")))?;
+    conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+    // A wrong password only surfaces on the first page read; force one
+    // now and classify it.
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())) {
+        Ok(()) => {}
+        Err(e) if is_notadb(&e) => return Err(KeyError::WrongPassword),
+        Err(e) => {
+            return Err(KeyError::Db(format!("key rejected or unreadable DB: {e}")));
+        }
+    }
+    if readonly {
+        conn.pragma_update(None, "query_only", true)?;
+    }
+    Ok(conn)
+}
+
+/// Read/write open with a passphrase (the unlock/verification paths).
+pub fn open_with_passphrase(path: &Path, passphrase: &str) -> Result<Connection, KeyError> {
+    open_with_passphrase_opts(path, passphrase, false)
+}
+
+/// Read-only open with a passphrase (the shadow-unlock command's proof,
+/// the archive/maintenance remember-file path).
+pub fn open_with_passphrase_readonly(
+    path: &Path,
+    passphrase: &str,
+) -> Result<Connection, KeyError> {
+    open_with_passphrase_opts(path, passphrase, true)
+}
+
+/// Re-key an OPEN connection to `passphrase` (SQLCipher defaults apply).
+/// Injection-safe via rusqlite's quoting, same as the key pragma.
+///
+/// THE REKEY-OK FACT (batch-18 review, verified in the vendored SQLCipher
+/// `libsqlite3-sys-0.32.0/sqlcipher/sqlite3.c`, `sqlite3_rekey_v2`): rekey
+/// sets the WRITE key first (`codec_set_pass_key(.., CIPHER_WRITE_CTX)`),
+/// then rewrites every page in ONE write transaction; if that transaction
+/// fails (e.g. another connection's lock makes it busy), it ROLLS BACK
+/// and STILL RETURNS SQLITE_OK — the database keeps its OLD key while the
+/// pragma "succeeded". No caller here may trust the rekey's return value
+/// alone: every conversion re-opens and VERIFIES with the intended key
+/// (`shadow::passphrase::verify_rekeyed`), and every failure after a
+/// rekey rekeys BACK (the `rekey_landed` rule). Same for [`rekey_raw`].
+pub fn rekey_passphrase(conn: &Connection, passphrase: &str) -> Result<(), KeyError> {
+    conn.pragma_update(None, "rekey", passphrase)
+        .map_err(|e| KeyError::Db(format!("pragma rekey failed: {e}")))?;
+    Ok(())
+}
+
+/// Re-key an OPEN connection back to a 32-byte RAW key. Same statement
+/// shape as [`apply_key`] (`PRAGMA rekey = "x'<64 hex chars>'";`) — the
+/// raw-key form and its trailing-`;` shape are pinned by the R0 test;
+/// this shares the builder so the two pragmas can never drift apart.
+///
+/// Subject to the same REKEY-OK FACT as [`rekey_passphrase`] (see the
+/// comment there): a busy write transaction rolls back and the pragma
+/// still answers SQLITE_OK — verify after every rekey, never trust it.
+pub fn rekey_raw(conn: &Connection, key: &[u8]) -> Result<(), KeyError> {
+    use zeroize::Zeroize;
+    let mut stmt = raw_hex_pragma_stmt("rekey", key);
+    let r = conn
+        .execute_batch(stmt.as_str())
+        .map_err(|e| KeyError::Db(format!("pragma rekey failed: {e}")));
+    // Wipe the assembled statement now rather than waiting for its drop.
+    stmt.zeroize();
+    r?;
+    Ok(())
+}
+
+/// Build `PRAGMA <name> = "x'<64 hex chars>'";` for a raw key. `name` is
+/// only ever the `"key"`/`"rekey"` literals (not user input). The hex
+/// form of the key and the assembled statement are key material: both
+/// are zeroized by the caller after the pragma lands (L4/D4).
+fn raw_hex_pragma_stmt(name: &str, key: &[u8]) -> zeroize::Zeroizing<String> {
+    use std::fmt::Write as _;
+    use zeroize::{Zeroize, Zeroizing};
+    let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
+    for b in key {
+        let _ = write!(&mut *hex, "{b:02x}");
+    }
+    let stmt = Zeroizing::new(format!("PRAGMA {name} = \"x'{}'\";", hex.as_str()));
+    hex.zeroize();
+    stmt
+}
+
 /// Encrypted in-memory DB for tests (every schema/writer/probe test
 /// module opens its fake stores through this — nothing in the app
 /// binary needs it, so it compiles with the tests only).
@@ -194,19 +354,49 @@ pub fn open_in_memory(key: &[u8]) -> Result<Connection, KeyError> {
 /// L4/D4 (batch 4): both the hex form of the key and the assembled
 /// statement carry raw key material; both are zeroized after the
 /// pragma lands instead of lingering in freed heap until reuse.
+///
+/// Batch 18: the statement itself comes from [`raw_hex_pragma_stmt`] so
+/// `apply_key` ("key") and [`rekey_raw`] ("rekey") can never drift
+/// apart; the built statement is BYTE-IDENTICAL to the pre-batch-18
+/// form, which the R0 pin test below checks from the outside anyway.
 fn apply_key(conn: &Connection, key: &[u8]) -> Result<(), KeyError> {
-    use std::fmt::Write as _;
-    use zeroize::{Zeroize, Zeroizing};
-    let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
-    for b in key {
-        let _ = write!(&mut *hex, "{b:02x}");
-    }
-    let stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
-    // Wipe the hex copy now rather than waiting for its drop.
-    hex.zeroize();
-    conn.execute_batch(stmt.as_str())
-        .map_err(|e| KeyError::Db(format!("pragma key failed: {e}")))?;
+    use zeroize::Zeroize;
+    let mut stmt = raw_hex_pragma_stmt("key", key);
+    let r = conn
+        .execute_batch(stmt.as_str())
+        .map_err(|e| KeyError::Db(format!("pragma key failed: {e}")));
+    // Wipe the assembled statement now rather than waiting for its drop.
+    stmt.zeroize();
+    r?;
     Ok(())
+}
+
+// --- batch 18: labeled DPAPI wraps ------------------------------------------
+//
+// The raw key file (`default.key`) is DPAPI-wrapped with NO entropy (the
+// legacy-compat fact documented at the top of this module, verified
+// 2026-11-19). The passphrase "remember on this machine" file
+// (`default.pass.dpapi`) uses a FIXED, distinct entropy label so the two
+// blobs can never be confused for one another, and the wrap of the
+// passphrase can never be unwrapped by code that expects a raw key.
+
+/// The fixed DPAPI entropy label of the passphrase remember-file —
+/// distinct from the key file's (none). Not a secret (entropy labels are
+/// a compatibility requirement, not a key).
+pub const PASSPHRASE_ENTROPY: &str = "zalors.shadow.pass";
+
+/// DPAPI (CurrentUser) wrap of `data` with the FIXED entropy `label`.
+/// Batch 18: the remember-file path. Labeled so a `default.pass.dpapi`
+/// blob can never unwrap through the no-entropy raw-key path and vice
+/// versa. Non-Windows: identity (the documented dev placeholder for the
+/// same reason `save_key` has one).
+pub(crate) fn wrap_labeled(data: &[u8], label: &str) -> Result<Vec<u8>, KeyError> {
+    wrap(data, Some(label))
+}
+
+/// The unwrap counterpart of [`wrap_labeled`]. Fail-closed on non-Windows.
+pub(crate) fn unwrap_labeled(blob: &[u8], label: &str) -> Result<Vec<u8>, KeyError> {
+    unwrap(blob, Some(label))
 }
 
 #[cfg(windows)]
@@ -418,6 +608,153 @@ mod tests {
         let bad = generate_key().unwrap();
         assert!(open_with_key_readonly(&db, &bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 18: passphrase mode -------------------------------------------
+
+    /// An OBVIOUSLY FAKE passphrase (H-rule: tests never carry anything
+    /// that looks like a real secret). >= 12 chars, no quotes, no NUL.
+    const FAKE_PASS: &str = "fake-pass-phrase-0123456789";
+    const FAKE_PASS_2: &str = "fake-other-pass-abcdefghij";
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zalors-pass-{}-{tag}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn passphrase_open_roundtrip_and_wrong_password_is_typed() {
+        let dir = scratch("open");
+        let db = dir.join("t.db");
+        {
+            let conn = open_with_passphrase(&db, FAKE_PASS).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t (v) VALUES ('ok');",
+            )
+            .unwrap();
+        }
+        {
+            let conn = open_with_passphrase_readonly(&db, FAKE_PASS).unwrap();
+            let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, "ok");
+            // readonly really is query_only.
+            assert!(conn.execute_batch("CREATE TABLE x (v TEXT)").is_err());
+        }
+        // A wrong passphrase is the TYPED error, never a panic, and the
+        // error text never echoes the passphrase (H-rule).
+        let err = open_with_passphrase_readonly(&db, FAKE_PASS_2).unwrap_err();
+        assert!(matches!(err, KeyError::WrongPassword), "got: {err:?}");
+        let text = err.to_string();
+        assert!(!text.contains(FAKE_PASS_2));
+        // A raw-key open must NOT open a passphrase DB (the modes are
+        // distinct key material by construction).
+        let raw = generate_key().unwrap();
+        assert!(open_with_key_readonly(&db, &raw).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn passphrase_db_opens_with_a_plain_third_party_pragma() {
+        // The portability contract (brief R5): a PLAIN connection that
+        // only runs `PRAGMA key = '<pw>';` — the exact statement DB
+        // Browser for SQLCipher / the sqlite3 shell issue, with NO other
+        // pragmas — must read the DB. That proves SQLCipher 4 defaults,
+        // not a private parameter set.
+        let dir = scratch("thirdparty");
+        let db = dir.join("t.db");
+        {
+            let conn = open_with_passphrase(&db, FAKE_PASS).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t (v) VALUES ('default-settings');",
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        conn.execute_batch(&format!("PRAGMA key = '{FAKE_PASS}';")).unwrap();
+        let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "default-settings");
+        // And NO other pragmas were needed: cipher_version exists with
+        // the default profile (the KDF settings were never overridden).
+        let ver: String = conn
+            .query_row("PRAGMA cipher_version;", [], |r| r.get(0))
+            .unwrap();
+        assert!(!ver.is_empty());
+        // Windows cannot delete a file an open connection still holds.
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rekey_between_passphrases_and_back_to_raw() {
+        let dir = scratch("rekey");
+        let db = dir.join("t.db");
+        // Start raw-keyed, with rows.
+        let raw = generate_key().unwrap();
+        {
+            let conn = open_with_key(&db, &raw).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t (v) VALUES ('v1');",
+            )
+            .unwrap();
+            // Convert to a passphrase on the OPEN connection (rekey).
+            rekey_passphrase(&conn, FAKE_PASS).unwrap();
+        }
+        // The passphrase alone reopens it (raw key no longer works).
+        assert!(open_with_key_readonly(&db, &raw).is_err());
+        {
+            let conn = open_with_passphrase(&db, FAKE_PASS).unwrap();
+            let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, "v1");
+            // Change to a second passphrase.
+            rekey_passphrase(&conn, FAKE_PASS_2).unwrap();
+        }
+        assert!(open_with_passphrase_readonly(&db, FAKE_PASS).is_err());
+        {
+            let conn = open_with_passphrase(&db, FAKE_PASS_2).unwrap();
+            let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, "v1");
+            // Remove: rekey back to a FRESH raw key.
+            let raw2 = generate_key().unwrap();
+            rekey_raw(&conn, &raw2).unwrap();
+            assert!(open_with_passphrase_readonly(&db, FAKE_PASS_2).is_err());
+            let check = open_with_key_readonly(&db, &raw2).unwrap();
+            let v: String = check.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, "v1");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn labeled_wraps_never_cross_the_no_entropy_key_file_path() {
+        // The remember-file blob must unwrap ONLY through the labeled
+        // path — the no-entropy (key-file) path must refuse it, and a
+        // key-file blob must refuse the labeled unwrap. Distinct
+        // entropies, distinct blobs, no confusion in either direction.
+        let pw = FAKE_PASS.as_bytes();
+        let blob = wrap_labeled(pw, PASSPHRASE_ENTROPY).unwrap();
+        assert_eq!(unwrap_labeled(&blob, PASSPHRASE_ENTROPY).unwrap(), pw);
+        assert!(unwrap_labeled(&blob, "some.other.label").is_err());
+        assert!(
+            unwrap_no_entropy(&blob).is_err(),
+            "the remember blob must not open through the key-file unwrap"
+        );
+        let key_blob = wrap(pw, None).unwrap();
+        assert!(
+            unwrap_labeled(&key_blob, PASSPHRASE_ENTROPY).is_err(),
+            "a key-file blob must not open through the labeled unwrap"
+        );
     }
 
     #[test]

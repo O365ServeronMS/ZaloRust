@@ -105,6 +105,12 @@ select option { background: var(--bg); color: var(--fg); }
 /* Shadow storage (batch 7): a folder path needs more room than a key
    combination; the pick button sits beside it in the same row. */
 .hotkey-row input.wide { width: min(340px, 60vw); }
+/* Shadow DB password (batch 18): a stack of password inputs + the
+   remember checkbox + the action button, kept on the row's right side. */
+.shadow-pass-controls { display: grid; gap: 8px; width: min(330px, 52vw); }
+.shadow-pass-controls input[type=password] { min-width: 0; border-radius: 8px; border: 1px solid var(--border); background: var(--hover); padding: 10px 12px; }
+.remember-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--dim); cursor: pointer; }
+.shadow-pass-controls button { justify-self: end; }
 .recording { outline: 2px dashed var(--green); }
 .hotkey-hint { font-size: 13px; color: var(--warn); }
 .footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 24px; border-top: 1px solid var(--border); }

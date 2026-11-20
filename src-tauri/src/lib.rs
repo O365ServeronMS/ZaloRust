@@ -272,6 +272,15 @@ pub fn run() {
             archive_cmds::archive_list_messages,
             archive_cmds::archive_search,
             archive_cmds::archive_open,
+            // Shadow DB passphrase mode (batch 18): the first five live
+            // in the settings window's capability, `shadow_unlock` in
+            // the shadow-unlock window's own.
+            commands::shadow_password_status,
+            commands::shadow_set_password,
+            commands::shadow_change_password,
+            commands::shadow_remove_password,
+            commands::shadow_set_remember,
+            commands::shadow_unlock,
         ])
         .setup(move |app| {
             // Menu-bar-only on macOS: load settings early (the rest of setup needs them

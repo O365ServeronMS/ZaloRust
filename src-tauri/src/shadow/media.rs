@@ -21,7 +21,11 @@
 //! - A5 single writer (T3): this thread opens a READ-ONLY connection to
 //!   pick pending refs and reports every outcome back to the flusher
 //!   through the job queue (`Job::MediaDone`); it never writes the DB
-//!   itself.
+//!   itself. F2 (batch-18 review): the connection lives for ONE cycle
+//!   only — opened with the shared key cell's CURRENT value at the start
+//!   and dropped at the end — so a key-mode conversion (which holds the
+//!   store gate's WRITE guard) never sees it, and the next cycle opens
+//!   with the new key without an app restart.
 //! - Rows whose outcome is still with the flusher are tracked in an
 //!   in-memory set and stay in it until the flusher's transaction
 //!   actually lands (F1): a slow flusher cannot cause a duplicate
@@ -80,6 +84,14 @@ impl CycleCounts {
 /// Start the downloader thread (call once per process, after the DB
 /// exists). `done` is the flusher's job queue: every download outcome is
 /// reported through it. Best-effort: failures are retried next cycle.
+///
+/// F2 (batch-18 review): there is NO long-lived connection anymore. Each
+/// cycle opens one with the key the shared key cell holds RIGHT THEN
+/// (raw: `default.key`; passphrase: the cell's value, else the remember
+/// file) and drops it at the end of the cycle, holding the store gate's
+/// READ guard for exactly that span — so a conversion's WRITE guard
+/// never competes with this connection, and a set/change/remove is
+/// picked up on the very next cycle.
 /// Crate-internal: only `runtime::start` wires this up.
 pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
     std::thread::Builder::new()
@@ -88,8 +100,6 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
             let root = media_store_root(&cfg);
             let _ = std::fs::create_dir_all(&root);
             crate::dlog::log(&format!("shadow media: store at {}", root.display()));
-            // READ-ONLY connection (T3); reopen if it dies.
-            let mut conn = open(&dir, &cfg);
             // Rows whose outcome is still in the flusher's queue/hands.
             let mut in_flight: HashSet<i64> = HashSet::new();
             let mut backoff = 30u64;
@@ -98,10 +108,12 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
             let mut disk_state = super::disk_space::SpaceVerdict::Ok;
             loop {
                 std::thread::sleep(Duration::from_secs(backoff.max(5)));
-                if conn.is_none() {
-                    conn = open(&dir, &cfg);
-                    continue;
-                }
+                // F2: the store gate's READ guard spans exactly this
+                // cycle's DB use — the connection's whole life. A
+                // conversion waiting on the WRITE guard finishes before
+                // this open runs, and the open below then uses the
+                // cell's CURRENT key.
+                let _gate = super::passphrase::store_gate_read();
                 // H3/D13: check the store volume BEFORE each cycle. An
                 // unmeasurable volume (API failure, non-Windows) maps to
                 // Ok — downloads are never paused on missing data. The
@@ -126,8 +138,12 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
                     // never affected. Re-checked every cycle.
                     continue;
                 }
-                let c = conn.as_ref().unwrap();
-                match download_one_cycle(c, &root, &done, &mut in_flight) {
+                // F2: open per cycle with the CURRENT key; a locked
+                // store (no cell value, no remember file) simply idles.
+                let Some(conn) = open(&dir, &cfg) else {
+                    continue;
+                };
+                match download_one_cycle(&conn, &root, &done, &mut in_flight) {
                     Ok(counts) if counts.total() == 0 => backoff = 30,
                     Ok(counts) => {
                         backoff = 10;
@@ -143,12 +159,13 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
                     }
                     Err(CycleError::Db(e)) => {
                         // Log the error KIND only: sqlite messages can
-                        // quote SQL/params.
+                        // quote SQL/params. The connection is dropped at
+                        // the end of this cycle anyway (F2) — the next
+                        // cycle opens a fresh one.
                         crate::dlog::log(&format!(
-                            "shadow media: DB error ({}), reopening",
+                            "shadow media: DB error ({}), retrying next cycle",
                             pipeline::sqlite_kind(&e)
                         ));
-                        conn = None;
                     }
                     Err(CycleError::FlusherGone) => {
                         // Flusher exited (shutdown): stop. Pending rows
@@ -162,8 +179,16 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
         .ok();
 }
 
-/// READ-ONLY open (T3: the media thread never writes; the flusher owns
-/// every write). Both paths set the H3 busy timeout.
+/// READ-ONLY open for one media cycle (T3: the media thread never
+/// writes; the flusher owns every write). Both paths set the H3 busy
+/// timeout.
+///
+/// F2 (batch-18 review): in passphrase mode the key is the shared key
+/// cell's CURRENT value first (the flusher's RAM passphrase, bumped on
+/// every successful set/change/remove and on unlock), else the
+/// remember file (a restarted process, or a store locked pending
+/// unlock). With neither, the cycle stays idle rather than opening
+/// with a wrong key; no password input ever happens here.
 fn open(dir: &Path, cfg: &ShadowSettings) -> Option<Connection> {
     // KQ10: the account helpers name the store files.
     let db_path = super::db_file(dir);
@@ -177,14 +202,26 @@ fn open(dir: &Path, cfg: &ShadowSettings) -> Option<Connection> {
         conn.busy_timeout(Duration::from_millis(sqlcipher::BUSY_TIMEOUT_MS)).ok()?;
         return Some(conn);
     }
-    let Ok(key) = sqlcipher::load_key(&key_path) else {
-        return None;
-    };
-    // L4/D4: the loaded key bytes are wiped once the connection holds
-    // them (SQLCipher keeps its own copy; this Vec must not linger).
-    let key = zeroize::Zeroizing::new(key);
-    // Sets busy_timeout (T1) and query_only.
-    sqlcipher::open_with_key_readonly(&db_path, &key).ok()
+    match super::passphrase::read_mode(dir) {
+        super::passphrase::StoreKeyMode::Raw => {
+            let key = sqlcipher::load_key(&key_path).ok()?;
+            // L4/D4: the loaded key bytes are wiped once the connection
+            // holds them (SQLCipher keeps its own copy; this Vec must
+            // not linger).
+            let key = zeroize::Zeroizing::new(key);
+            // Sets busy_timeout (T1) and query_only.
+            sqlcipher::open_with_key_readonly(&db_path, &key).ok()
+        }
+        super::passphrase::StoreKeyMode::Passphrase => {
+            // F2: the shared key cell first (a value the flusher
+            // published for THIS mode), the remember file second.
+            let pw = super::passphrase::cell_passphrase()
+                .or_else(|| super::passphrase::load_remembered(dir).ok())?;
+            sqlcipher::open_with_passphrase_readonly(&db_path, &pw).ok()
+        }
+        // An unreadable/future marker: never open with a guessed key.
+        super::passphrase::StoreKeyMode::Unknown => None,
+    }
 }
 
 /// Cap for the in-flight set (F1): a flusher stuck for hours must not
@@ -1088,5 +1125,84 @@ mod tests {
         let counts =
             download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight).unwrap();
         assert_eq!(counts.total(), 0, "in-flight row must not be re-picked");
+    }
+
+    // --- F2 (batch-18 review): the per-cycle open follows the key cell ----
+
+    /// OBVIOUSLY FAKE passphrases (H-rule: never anything resembling a
+    /// real secret; both >= the 12-char minimum).
+    const FAKE_PASS: &str = "fake-pass-phrase-0123456789";
+    const FAKE_PASS_2: &str = "fake-other-pass-abcdefghij";
+
+    #[test]
+    fn the_media_open_picks_up_a_changed_key_from_the_cell() {
+        // The media-style open helper must consult the shared key cell
+        // FRESH on every cycle — after a set/change the flusher
+        // publishes the new key and the very next cycle opens with it,
+        // no restart needed. Serialized with the other cell tests.
+        let _g = crate::shadow::passphrase::CELL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch();
+        let cfg = ShadowSettings::default(); // encrypt = true
+        let key = sqlcipher::generate_key().unwrap();
+        sqlcipher::save_key(&key, &super::super::key_file(&dir)).unwrap();
+        {
+            let conn = sqlcipher::open_with_key(&super::super::db_file(&dir), &key).unwrap();
+            schema::apply(&conn).unwrap();
+        }
+        // raw mode: the open goes through default.key.
+        crate::shadow::passphrase::publish_key(None);
+        assert!(open(&dir, &cfg).is_some(), "raw mode opens via default.key");
+        // convert (remember=false → no remember file, so ONLY the cell
+        // can open it): the cell's value must open it.
+        {
+            let conn = sqlcipher::open_with_key(&super::super::db_file(&dir), &key).unwrap();
+            crate::shadow::passphrase::set_passphrase(&conn, &dir, FAKE_PASS, false, 1).unwrap();
+        }
+        crate::shadow::passphrase::publish_key(Some(zeroize::Zeroizing::new(
+            FAKE_PASS.to_string(),
+        )));
+        assert!(open(&dir, &cfg).is_some(), "the cell's passphrase opens it");
+        // change: publishing the new password is ALL the thread needs.
+        {
+            let conn = sqlcipher::open_with_passphrase(&super::super::db_file(&dir), FAKE_PASS)
+                .unwrap();
+            crate::shadow::passphrase::change_passphrase(
+                &conn,
+                &dir,
+                Some(FAKE_PASS),
+                FAKE_PASS_2,
+                false,
+            )
+            .unwrap();
+        }
+        crate::shadow::passphrase::publish_key(Some(zeroize::Zeroizing::new(
+            FAKE_PASS_2.to_string(),
+        )));
+        assert!(
+            open(&dir, &cfg).is_some(),
+            "a changed key is picked up via the cell"
+        );
+        // an OUTDATED cell value idles the cycle instead of erroring.
+        crate::shadow::passphrase::publish_key(Some(zeroize::Zeroizing::new(
+            FAKE_PASS.to_string(),
+        )));
+        assert!(
+            open(&dir, &cfg).is_none(),
+            "a stale cell value must not open the store"
+        );
+        // no cell value + no remember file: the locked-store idle.
+        crate::shadow::passphrase::publish_key(None);
+        assert!(open(&dir, &cfg).is_none());
+        // remember file fallback (a restarted process).
+        crate::shadow::passphrase::save_remembered(&dir, FAKE_PASS_2).unwrap();
+        assert!(
+            open(&dir, &cfg).is_some(),
+            "the remember file opens it without a cell value"
+        );
+        // leave the cell neutral for whichever test runs next.
+        crate::shadow::passphrase::publish_key(None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

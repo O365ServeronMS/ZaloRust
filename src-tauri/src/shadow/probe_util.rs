@@ -24,8 +24,6 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::migrate::sqlcipher;
-
 /// The live store dir the probes copy from (`ZR_PROBE_DIR` override,
 /// else the documented Roaming path).
 pub fn probe_dir() -> PathBuf {
@@ -46,8 +44,11 @@ fn default_probe_dir(local: std::ffi::OsString) -> PathBuf {
 }
 
 /// The file set copied for one probe: `<account>.db` + `-wal`/`-shm`
-/// (when present) + `<account>.key`. The KQ10 account helpers own the
-/// names — nothing here hardcodes "default".
+/// (when present) + `<account>.key` + the batch-18 mode files
+/// (`default.keymode.json`, `default.pass.dpapi`) when present. The
+/// KQ10 account helpers own the names — nothing here hardcodes
+/// "default". A passphrase-mode store opens through its remember file
+/// or refuses clearly (see [`open_at`]).
 fn live_set(dir: &Path) -> Vec<PathBuf> {
     let db = super::db_file(dir);
     let mut out = vec![db.clone()];
@@ -56,6 +57,8 @@ fn live_set(dir: &Path) -> Vec<PathBuf> {
         out.push(dir.join(name));
     }
     out.push(super::key_file(dir));
+    out.push(super::keymode_file(dir));
+    out.push(super::pass_dpapi_file(dir));
     out
 }
 
@@ -113,12 +116,23 @@ pub fn copy_live_set_from(dir: &Path) -> PathBuf {
 }
 
 fn open_at(tmp: &Path, readonly: bool) -> Connection {
-    let key = sqlcipher::load_key(&super::key_file(tmp)).unwrap();
-    let db = super::db_file(tmp);
-    if readonly {
-        sqlcipher::open_with_key_readonly(&db, &key).unwrap()
-    } else {
-        sqlcipher::open_with_key(&db, &key).unwrap()
+    // Batch 18: whichever mode the copied store is in — raw through the
+    // copied key file, passphrase through the copied remember file. A
+    // passphrase-mode store WITHOUT a usable remember file refuses with
+    // the documented message (R4); the CLI/probe side never asks for a
+    // password.
+    match super::passphrase::open_store(tmp, readonly) {
+        Ok((conn, _)) => conn,
+        Err(super::passphrase::StoreOpenError::Locked) => {
+            panic!(
+                "the store is password-protected (passphrase mode) — unlock it in the app with \
+                 'Nhớ trên máy này' (remember on this machine) enabled, then re-run this probe; \
+                 the CLI never accepts passwords"
+            );
+        }
+        Err(super::passphrase::StoreOpenError::Other(k)) => {
+            panic!("store open failed ({k}) — not a shadow store dir, or a broken one?")
+        }
     }
 }
 
@@ -417,8 +431,9 @@ mod tests {
 
     #[test]
     fn live_set_names_follow_the_account_helpers() {
-        // Pure: the copy set is exactly db + -wal + -shm + key as the
-        // KQ10 account helpers name them.
+        // Pure: the copy set is exactly db + -wal + -shm + key + the two
+        // batch-18 mode files as the KQ10 account helpers name them (the
+        // marker/remember entries are skipped at copy time when absent).
         let dir = Path::new(r"D:\shadow");
         assert_eq!(
             live_set(dir),
@@ -427,6 +442,8 @@ mod tests {
                 dir.join("default.db-wal"),
                 dir.join("default.db-shm"),
                 super::super::key_file(dir),
+                super::super::keymode_file(dir),
+                super::super::pass_dpapi_file(dir),
             ]
         );
     }

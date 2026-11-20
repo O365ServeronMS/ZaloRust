@@ -72,6 +72,12 @@ pub mod import_apply;
 pub mod import_map;
 pub mod media;
 pub mod normalize;
+/// Batch 18 (portable password-protected store, "Option A"): the
+/// `passphrase` key mode — mode marker, DPAPI remember file, validation,
+/// wrong-password throttle, the single-writer conversion engine (set /
+/// change / remove) and the shared mode-aware store open used by
+/// everything that opens the store without the app runtime behind it.
+pub mod passphrase;
 pub mod pipeline;
 /// Pure token bucket bounding the bridge IPC commands (audit M3/D3).
 pub mod rate_limit;
@@ -118,6 +124,30 @@ pub fn key_file(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(format!("{SHADOW_ACCOUNT}.key"))
 }
 
+/// The passphrase-mode marker `<dir>/default.keymode.json` (batch 18):
+/// plaintext JSON `{"mode":"passphrase","kdf":"sqlcipher4-default",
+/// "since_ms":…}` — NO secrets. Absent + `default.key` present = raw
+/// mode (backward compatible).
+pub fn keymode_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{SHADOW_ACCOUNT}.keymode.json"))
+}
+
+/// The DPAPI "remember on this machine" wrap of the passphrase
+/// (`<dir>/default.pass.dpapi`, batch 18): CurrentUser scope, fixed
+/// entropy label DISTINCT from the key file's (see
+/// `migrate::sqlcipher::PASSPHRASE_ENTROPY`). Deleting it just means the
+/// app asks for the password again.
+pub fn pass_dpapi_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{SHADOW_ACCOUNT}.pass.dpapi"))
+}
+
+/// Where a raw→passphrase conversion RENAMES the old raw key file
+/// (`<dir>/default.key.pre-passphrase`): kept, never deleted — the
+/// settings UI tells the user it can be deleted later.
+pub fn pre_passphrase_key_file(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{SHADOW_ACCOUNT}.key.pre-passphrase"))
+}
+
 #[cfg(test)]
 mod account_path_tests {
     use super::{db_file, key_file, SHADOW_ACCOUNT};
@@ -129,6 +159,25 @@ mod account_path_tests {
         assert_eq!(SHADOW_ACCOUNT, "default");
         assert_eq!(db_file(dir), dir.join("default.db"));
         assert_eq!(key_file(dir), dir.join("default.key"));
+    }
+
+    #[test]
+    fn batch18_store_files_follow_the_account_naming() {
+        // The marker / remember / pre-passphrase names stay in the KQ10
+        // family — nothing hardcodes "default" outside these helpers.
+        let dir = Path::new(r"D:\shadow");
+        assert_eq!(
+            super::keymode_file(dir),
+            dir.join("default.keymode.json")
+        );
+        assert_eq!(
+            super::pass_dpapi_file(dir),
+            dir.join("default.pass.dpapi")
+        );
+        assert_eq!(
+            super::pre_passphrase_key_file(dir),
+            dir.join("default.key.pre-passphrase")
+        );
     }
 }
 

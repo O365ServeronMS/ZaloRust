@@ -1968,7 +1968,13 @@ pub fn open_shadow_copy(store_dir: &Path) -> Result<(Connection, PathBuf), Strin
             db.display()
         ));
     }
-    if !key.is_file() {
+    // Batch 18 (R4): a passphrase-mode store refuses without its
+    // remember file — the CLI never accepts passwords — so the copy
+    // carries the mode files and opens in whichever mode the marker
+    // says. A missing key file is only fatal in raw mode.
+    if super::passphrase::read_mode(store_dir) == super::passphrase::StoreKeyMode::Raw
+        && !key.is_file()
+    {
         return Err(format!("--shadow-copy: no {} — broken store?", key.display()));
     }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1982,7 +1988,6 @@ pub fn open_shadow_copy(store_dir: &Path) -> Result<(Connection, PathBuf), Strin
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir {}: {e}", tmp.display()))?;
     assert!(tmp.starts_with(std::env::temp_dir()), "the copy must live under the OS temp dir");
     assert_ne!(tmp, store_dir, "the copy must never be the store dir itself");
-    let mut copied = Vec::new();
     for from in [
         db.clone(),
         db.with_file_name(format!(
@@ -1994,6 +1999,8 @@ pub fn open_shadow_copy(store_dir: &Path) -> Result<(Connection, PathBuf), Strin
             db.file_name().unwrap().to_string_lossy()
         )),
         key.clone(),
+        super::keymode_file(store_dir),
+        super::pass_dpapi_file(store_dir),
     ] {
         if !from.exists() {
             continue; // a checkpointed store has no sidecars
@@ -2008,15 +2015,19 @@ pub fn open_shadow_copy(store_dir: &Path) -> Result<(Connection, PathBuf), Strin
         perm.set_readonly(false);
         std::fs::set_permissions(&to, perm)
             .map_err(|e| format!("copying {}: {e}", from.display()))?;
-        copied.push(to);
     }
-    let db_copy = tmp.join(db.file_name().unwrap());
-    let key_copy = tmp.join(key.file_name().unwrap());
-    let k = crate::migrate::sqlcipher::load_key(&key_copy)
-        .map_err(|e| format!("--shadow-copy: key load failed: {e}"))?;
-    let conn = crate::migrate::sqlcipher::open_with_key_readonly(&db_copy, &k)
-        .map_err(|e| format!("--shadow-copy: open failed: {e}"))?;
-    Ok((conn, tmp))
+    match super::passphrase::open_store(&tmp, true) {
+        Ok((conn, _)) => Ok((conn, tmp)),
+        Err(super::passphrase::StoreOpenError::Locked) => Err(
+            "the shadow store is password-protected (passphrase mode): unlock it in the app with \
+             'Nhớ trên máy này' (remember on this machine) enabled, then re-run — the CLI never \
+             accepts passwords"
+                .into(),
+        ),
+        Err(super::passphrase::StoreOpenError::Other(k)) => {
+            Err(format!("--shadow-copy: open failed ({k})"))
+        }
+    }
 }
 
 #[cfg(test)]

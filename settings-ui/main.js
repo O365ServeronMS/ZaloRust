@@ -410,6 +410,90 @@ async function addAccount() {
   });
 }
 
+// --- Shadow DB password (batch 18, brief R3) ---
+// Four controls, all driven by shadow_password_status: the set block
+// appears in raw mode; change / remember / remove in passphrase mode.
+// Passwords are only ever in the IPC payload (memory); the backend
+// errors are generic and never echo them.
+
+async function loadShadowPass() {
+  let s;
+  try {
+    s = await invoke("shadow_password_status");
+  } catch {
+    return; // window opened while locked / status unavailable
+  }
+  const raw = s.mode === "raw";
+  document.getElementById("pass_set_row").hidden = !raw;
+  document.getElementById("pass_change_row").hidden = raw;
+  document.getElementById("pass_remember_row").hidden = raw;
+  document.getElementById("pass_remove_row").hidden = raw;
+  document.getElementById("shadow_remember").checked = !!s.remembered;
+}
+
+function clearPassInputs() {
+  for (const id of ["shadow_pw1", "shadow_pw2", "shadow_old", "shadow_new", "shadow_new2", "shadow_remove_pw"]) {
+    document.getElementById(id).value = "";
+  }
+}
+
+async function setShadowPassword() {
+  const a = document.getElementById("shadow_pw1").value;
+  const b = document.getElementById("shadow_pw2").value;
+  const remember = document.getElementById("shadow_remember_set").checked;
+  const ok = await Dlg.confirm(
+    "Se você esquecer esta senha, os dados não poderão ser recuperados. Anote-a em um lugar seguro antes de continuar.",
+    { title: "Definir senha do banco de dados?", okLabel: "Definir", danger: true },
+  );
+  if (!ok) return;
+  try {
+    await invoke("shadow_set_password", { new: a, confirm: b, remember });
+    clearPassInputs();
+    await loadShadowPass();
+    flash("Senha do banco de dados definida ✓", 4000);
+  } catch (e) { flash(String(e), 8000); }
+}
+
+async function changeShadowPassword() {
+  const old = document.getElementById("shadow_old").value;
+  const next = document.getElementById("shadow_new").value;
+  const confirm2 = document.getElementById("shadow_new2").value;
+  // The remember toggle rides along so the stored wrap is updated or
+  // dropped atomically with the key.
+  const remember = document.getElementById("shadow_remember").checked;
+  try {
+    await invoke("shadow_change_password", { old, new: next, confirm: confirm2, remember });
+    clearPassInputs();
+    flash("Senha do banco de dados alterada ✓", 4000);
+  } catch (e) { flash(String(e), 8000); }
+}
+
+async function removeShadowPassword() {
+  const current = document.getElementById("shadow_remove_pw").value;
+  if (!current) { flash("Informe a senha atual para remover."); return; }
+  const ok = await Dlg.confirm(
+    "A proteção por senha será removida e o banco volta a usar uma chave exclusiva deste computador.",
+    { title: "Remover senha do banco de dados?", okLabel: "Remover", danger: true },
+  );
+  if (!ok) return;
+  try {
+    await invoke("shadow_remove_password", { current });
+    clearPassInputs();
+    await loadShadowPass();
+    flash("Senha do banco de dados removida ✓", 4000);
+  } catch (e) { flash(String(e), 8000); }
+}
+
+async function toggleShadowRemember(e) {
+  try {
+    await invoke("shadow_set_remember", { remember: e.target.checked });
+    flash(e.target.checked ? "Senha lembrada neste computador ✓" : "Senha esquecida neste computador ✓", 4000);
+  } catch (err) {
+    e.target.checked = !e.target.checked; // revert on failure
+    flash(String(err), 8000);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   // The macOS rows stay hidden until load() knows the platform.
   document.getElementById("menubar_only").addEventListener("change", syncMenuBarIconRow);
@@ -417,6 +501,7 @@ window.addEventListener("DOMContentLoaded", () => {
   load();
   loadAccounts();
   loadLock();
+  loadShadowPass();
   wireLock();
   document.getElementById("save").addEventListener("click", save);
   // The update switches apply at once, like zoom and language.
@@ -445,6 +530,11 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("reset_download_dir").addEventListener("click", resetDownloadDir);
   document.getElementById("choose_media_store").addEventListener("click", chooseMediaStore);
   document.getElementById("choose_backup_dir").addEventListener("click", chooseBackupDir);
+  // Shadow DB password (batch 18 R3): the four controls.
+  document.getElementById("shadow_set_password").addEventListener("click", setShadowPassword);
+  document.getElementById("shadow_change_password").addEventListener("click", changeShadowPassword);
+  document.getElementById("shadow_remove_password").addEventListener("click", removeShadowPassword);
+  document.getElementById("shadow_remember").addEventListener("change", toggleShadowRemember);
   // Batch 11 (audit §4 3.2): the shadow section's button opens the
   // Lưu trữ window. The capability grants settings only
   // `archive_open`; Rust re-checks the caller label and the app lock.

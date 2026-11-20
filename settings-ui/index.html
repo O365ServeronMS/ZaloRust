@@ -196,6 +196,41 @@
             <input type="text" id="disk_stop_pct" inputmode="numeric" autocomplete="off" aria-label="Pausar download de mídia (%)" />
           </label>
         </div>
+        <div class="boxed-list">
+          <div class="row" id="pass_set_row">
+            <span class="row-text"><span class="row-title">Definir senha do banco de dados</span>
+              <span class="row-subtitle">Se você esquecer esta senha, os dados não poderão ser recuperados. Anote-a em um lugar seguro. Com a senha, o banco abre em qualquer computador.</span></span>
+            <div class="shadow-pass-controls">
+              <input type="password" id="shadow_pw1" autocomplete="new-password" placeholder="Nova senha (mínimo de 12 caracteres)" aria-label="Nova senha" />
+              <input type="password" id="shadow_pw2" autocomplete="new-password" placeholder="Confirmar senha" aria-label="Confirmar senha" />
+              <label class="remember-line"><input type="checkbox" id="shadow_remember_set" /> Lembrar neste computador</label>
+              <button type="button" id="shadow_set_password">Definir senha</button>
+            </div>
+          </div>
+          <div class="row" id="pass_change_row" hidden>
+            <span class="row-text"><span class="row-title">Alterar senha do banco de dados</span>
+              <span class="row-subtitle">Mínimo de 12 caracteres.</span></span>
+            <div class="shadow-pass-controls">
+              <input type="password" id="shadow_old" autocomplete="current-password" placeholder="Senha atual" aria-label="Senha atual" />
+              <input type="password" id="shadow_new" autocomplete="new-password" placeholder="Nova senha" aria-label="Nova senha" />
+              <input type="password" id="shadow_new2" autocomplete="new-password" placeholder="Confirmar senha" aria-label="Confirmar senha" />
+              <button type="button" id="shadow_change_password">Alterar</button>
+            </div>
+          </div>
+          <label class="row" id="pass_remember_row" hidden>
+            <span class="row-text"><span class="row-title">Lembrar neste computador</span>
+              <span class="row-subtitle">Grava a senha protegida pelo Windows neste computador. Desativado, o aplicativo pede a senha a cada inicialização.</span></span>
+            <input type="checkbox" class="switch" id="shadow_remember" />
+          </label>
+          <div class="row" id="pass_remove_row" hidden>
+            <span class="row-text"><span class="row-title">Remover senha (voltar à chave por máquina)</span>
+              <span class="row-subtitle">A chave antiga por máquina (default.key.pre-passphrase) continua guardada; você pode apagá-la depois.</span></span>
+            <div class="shadow-pass-controls">
+              <input type="password" id="shadow_remove_pw" autocomplete="current-password" placeholder="Senha atual" aria-label="Senha atual" />
+              <button type="button" id="shadow_remove_password" class="secondary">Remover senha</button>
+            </div>
+          </div>
+        </div>
         <p class="group-note">As alterações desta seção são aplicadas após reiniciar o Zalo.</p>
       </section>
 

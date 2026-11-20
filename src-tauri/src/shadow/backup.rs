@@ -198,6 +198,12 @@ fn iso_week_key(days: i64) -> String {
 /// The sibling manifest of one DB backup (4.1). Row counts for EVERY
 /// user table, the file's sha256 and size — exactly what
 /// [`verify_backup`] re-checks after a restore.
+///
+/// Batch 18: `mode` records which KEY MODE the backup file is encrypted
+/// in — `raw` (machine-bound: opens only through the DPAPI key file),
+/// `passphrase` (portable: the password alone opens it anywhere) or
+/// `plain` (`encrypt=false`). No secrets, and old manifests (written
+/// before the field existed) deserialize as `raw`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackupManifest {
     /// Epoch ms the backup was taken (renders the file stamp).
@@ -210,6 +216,37 @@ pub struct BackupManifest {
     pub sha256: String,
     /// Size of the `.db` file in bytes.
     pub size: u64,
+    /// The key mode of the backup file: `raw` / `passphrase` / `plain`.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+/// Manifest default for pre-batch-18 manifests: they were all raw-key
+/// exports, so `raw` is both the compatible and the truthful value.
+fn default_mode() -> String {
+    "raw".to_string()
+}
+
+/// Which key a backup/export is keyed with (batch 18). `Plain` is the
+/// `encrypt=false` store. The passphrase travels by reference and is
+/// never copied, never logged, never written anywhere but the ATTACH
+/// statement (bound parameter — never `format!()`ed into SQL).
+#[derive(Debug, Clone, Copy)]
+pub enum BackupKey<'a> {
+    Plain,
+    Raw(&'a [u8]),
+    Passphrase(&'a str),
+}
+
+impl BackupKey<'_> {
+    /// The manifest `mode` label (no secrets).
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackupKey::Plain => "plain",
+            BackupKey::Raw(_) => "raw",
+            BackupKey::Passphrase(_) => "passphrase",
+        }
+    }
 }
 
 /// Log-safe io error kind (H-rule: never the path, never the raw text).
@@ -236,7 +273,10 @@ fn file_sha256(path: &Path) -> Result<String, std::io::Error> {
 /// Identifiers are validated before interpolation — a `sqlite_master`
 /// name is schema, not data, but the query is still assembled, so only
 /// `[A-Za-z0-9_]` names are ever counted.
-fn user_table_counts(conn: &Connection) -> rusqlite::Result<BTreeMap<String, i64>> {
+///
+/// Batch 18: `pub(crate)` — the passphrase conversion's before/after
+/// count comparison uses exactly this set (see `shadow::passphrase`).
+pub(crate) fn user_table_counts(conn: &Connection) -> rusqlite::Result<BTreeMap<String, i64>> {
     let mut st = conn.prepare(
         "SELECT name FROM sqlite_master \
          WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -296,35 +336,59 @@ fn cleanup_leftover_tmp(dest_dir: &Path) -> usize {
 
 // --- H1: the export ---------------------------------------------------------
 
-/// The SQLCipher-documented export (KQ6): ATTACH the dest (raw-key
-/// hex form — the same shape [`crate::migrate::sqlcipher`] uses for
-/// `PRAGMA key`; that statement itself stays untouched), run
-/// `sqlcipher_export('b')`, DETACH. The hex and the assembled statement
-/// carry raw key material — both zeroized after use (L4/D4). An empty
-/// `key` attaches a plaintext dest (the `encrypt=false` store).
-fn export_to(src: &Connection, key: &[u8], tmp: &Path) -> Result<(), String> {
+/// The SQLCipher-documented export (KQ6): ATTACH the dest, run
+/// `sqlcipher_export('b')`, DETACH.
+///
+/// - `BackupKey::Raw` keeps the ORIGINAL literal form
+///   `ATTACH '<path>' AS b KEY "x'<hex>'";` — the same shape
+///   [`crate::migrate::sqlcipher`] uses for `PRAGMA key`; that statement
+///   itself stays untouched (hard rule: raw mode byte-for-byte).
+/// - `BackupKey::Passphrase` (batch 18) binds BOTH the path and the
+///   password as statement parameters (`ATTACH DATABASE ?1 AS b KEY ?2`)
+///   — verified against this build's vendored SQLCipher (`attachFunc`
+///   reads the key from the evaluated argv), so the passphrase never
+///   enters assembled SQL. The exported backup then opens with the
+///   password ALONE on any machine: SQLCipher 4 defaults.
+/// - `BackupKey::Plain` attaches a plaintext dest (`encrypt=false`).
+fn export_to(src: &Connection, key: &BackupKey<'_>, tmp: &Path) -> Result<(), String> {
     use std::fmt::Write as _;
-    // A single quote in the path is escaped the SQLite way.
-    let path_sql = tmp.to_string_lossy().replace('\'', "''");
-    let attach = if key.is_empty() {
-        Zeroizing::new(format!("ATTACH DATABASE '{path_sql}' AS b;"))
-    } else {
-        let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
-        for b in key {
-            let _ = write!(&mut *hex, "{b:02x}");
-        }
-        let stmt = Zeroizing::new(format!(
-            "ATTACH DATABASE '{path_sql}' AS b KEY \"x'{}'\";",
-            hex.as_str()
-        ));
-        hex.zeroize();
-        stmt
-    };
     let detach = |src: &Connection| {
         // Best-effort: a failed ATTACH never left the schema attached.
         let _ = src.execute_batch("DETACH DATABASE b;");
     };
-    if let Err(e) = src.execute_batch(attach.as_str()) {
+    let attach_result = match key {
+        BackupKey::Plain => {
+            // A single quote in the path is escaped the SQLite way.
+            let path_sql = tmp.to_string_lossy().replace('\'', "''");
+            src.execute_batch(&format!("ATTACH DATABASE '{path_sql}' AS b;"))
+        }
+        BackupKey::Raw(raw) => {
+            // A single quote in the path is escaped the SQLite way.
+            let path_sql = tmp.to_string_lossy().replace('\'', "''");
+            let mut hex = Zeroizing::new(String::with_capacity(raw.len() * 2));
+            for b in raw.iter() {
+                let _ = write!(&mut *hex, "{b:02x}");
+            }
+            let stmt = Zeroizing::new(format!(
+                "ATTACH DATABASE '{path_sql}' AS b KEY \"x'{}'\";",
+                hex.as_str()
+            ));
+            hex.zeroize();
+            src.execute_batch(stmt.as_str())
+        }
+        // Batch 18: the passphrase is a BOUND parameter, never assembled
+        // into the SQL text (H-rule; verified against the vendored
+        // SQLCipher's attachFunc, which consumes the evaluated argv[2]).
+        BackupKey::Passphrase(pw) => {
+            let path = tmp.to_string_lossy();
+            src.execute(
+                "ATTACH DATABASE ?1 AS b KEY ?2;",
+                rusqlite::params![path, pw],
+            )
+            .map(|_| ())
+        }
+    };
+    if let Err(e) = attach_result {
         detach(src);
         return Err(format!("attach:{}", sqlite_kind(&e)));
     }
@@ -344,12 +408,13 @@ fn export_to(src: &Connection, key: &[u8], tmp: &Path) -> Result<(), String> {
 /// Steps: clean leftover `*.db.tmp`; ATTACH+export+DETACH into
 /// `shadow-<stamp>.db.tmp`; fsync; rename to `shadow-<stamp>.db`
 /// (atomic — same directory); write the manifest
-/// `shadow-<stamp>.json`. On ANY error the tmp file is removed (and a
-/// `.db` this run just renamed — a half-done run never masquerades as
-/// a complete one) and a kind-only error string is returned.
+/// `shadow-<stamp>.json` (carrying the key `mode`, batch 18). On ANY
+/// error the tmp file is removed (and a `.db` this run just renamed — a
+/// half-done run never masquerades as a complete one) and a kind-only
+/// error string is returned.
 pub fn backup_db(
     src: &Connection,
-    key: &[u8],
+    key: &BackupKey<'_>,
     dest_dir: &Path,
     now_ms: i64,
 ) -> Result<BackupManifest, String> {
@@ -388,6 +453,7 @@ pub fn backup_db(
             counts,
             sha256,
             size,
+            mode: key.label().to_string(),
         };
         let json = serde_json::to_vec(&manifest).map_err(|_| "manifest:json".to_string())?;
         std::fs::write(&manifest_path, json).map_err(|e| format!("write-manifest:{}", io_kind(&e)))?;
@@ -404,17 +470,24 @@ pub fn backup_db(
 
 // --- H1: verification -------------------------------------------------------
 
-/// Open a backup read-only: keyed (SQLCipher) or plaintext.
-fn open_ro(path: &Path, key: &[u8]) -> Result<Connection, String> {
+/// Open a backup read-only with its key (batch 18: either mode — raw or
+/// passphrase — or plaintext).
+fn open_ro(path: &Path, key: &BackupKey<'_>) -> Result<Connection, String> {
     // Kind-only: sqlite/DPAPI error text can quote paths and params.
-    if key.is_empty() {
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| "open".to_string())?;
-        conn.busy_timeout(Duration::from_millis(sqlcipher::BUSY_TIMEOUT_MS))
-            .map_err(|_| "open".to_string())?;
-        Ok(conn)
-    } else {
-        sqlcipher::open_with_key_readonly(path, key).map_err(|_| "open".to_string())
+    match key {
+        BackupKey::Plain => {
+            let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| "open".to_string())?;
+            conn.busy_timeout(Duration::from_millis(sqlcipher::BUSY_TIMEOUT_MS))
+                .map_err(|_| "open".to_string())?;
+            Ok(conn)
+        }
+        BackupKey::Raw(raw) => {
+            sqlcipher::open_with_key_readonly(path, raw).map_err(|_| "open".to_string())
+        }
+        BackupKey::Passphrase(pw) => {
+            sqlcipher::open_with_passphrase_readonly(path, pw).map_err(|_| "open".to_string())
+        }
     }
 }
 
@@ -423,8 +496,14 @@ fn open_ro(path: &Path, key: &[u8]) -> Result<Connection, String> {
 /// without the pragma or an empty result never fails the verify, any
 /// non-"ok" row does); `PRAGMA integrity_check` must be exactly "ok";
 /// every user table's row count must equal the manifest's; the file's
-/// sha256 must equal the manifest's. Kind-only errors.
-pub fn verify_backup(path: &Path, key: &[u8], manifest: &BackupManifest) -> Result<(), String> {
+/// sha256 must equal the manifest's. Kind-only errors. Batch 18: the
+/// key is a [`BackupKey`], so a passphrase-mode backup verifies with the
+/// password alone — exactly how any third-party tool would open it.
+pub fn verify_backup(
+    path: &Path,
+    key: &BackupKey<'_>,
+    manifest: &BackupManifest,
+) -> Result<(), String> {
     let sha = file_sha256(path).map_err(|e| format!("sha:{}", io_kind(&e)))?;
     if !sha.eq_ignore_ascii_case(&manifest.sha256) {
         return Err("sha256-mismatch".into());
@@ -871,10 +950,17 @@ impl DbBackupOutcome {
 /// own RW connection, serialized with every batch write): export via
 /// [`backup_db`], then [`verify_backup`], then [`prune_backups`]. The
 /// media half is the backup thread's, read-only on the store.
+///
+/// Batch 18: in passphrase mode the export key is the flusher's RAM
+/// copy of the passphrase (`pass_ram`) — the backup then opens with the
+/// password ALONE on any machine and its manifest says
+/// `mode: passphrase`. Raw mode is unchanged (the DPAPI key file; the
+/// backup stays machine-bound, manifest `mode: raw`).
 pub(crate) fn run_db_backup(
     conn: &Connection,
     dir: &Path,
     cfg: &ShadowSettings,
+    pass_ram: Option<&str>,
 ) -> DbBackupOutcome {
     let Some(dest) = cfg.backup_dir.as_deref() else {
         return DbBackupOutcome::failed("no-dir");
@@ -883,16 +969,37 @@ pub(crate) fn run_db_backup(
     if let Err(e) = std::fs::create_dir_all(&dest_dir) {
         return DbBackupOutcome::failed(&format!("mkdir:{}", io_kind(&e)));
     }
-    // L4/D4: the key bytes are reloaded here (the flusher's open path
-    // wiped its copy) and wiped again once this backup holds them.
-    let key = if cfg.encrypt {
-        match sqlcipher::load_key(&super::key_file(dir)) {
-            Ok(k) => Zeroizing::new(k),
-            Err(_) => return DbBackupOutcome::failed("key"),
-        }
+    // The export key, by store mode. L4/D4: the key bytes are reloaded
+    // here (the flusher's open path wiped its copy) and wiped again
+    // once this backup holds them; the passphrase is only ever the
+    // RAM copy the flusher already holds.
+    let _raw_hold: Zeroizing<Vec<u8>>;
+    let key: BackupKey<'_>;
+    if !cfg.encrypt {
+        key = BackupKey::Plain;
     } else {
-        Zeroizing::new(Vec::new())
-    };
+        match super::passphrase::read_mode(dir) {
+            super::passphrase::StoreKeyMode::Passphrase => match pass_ram {
+                Some(pw) => key = BackupKey::Passphrase(pw),
+                // The flusher runs in passphrase mode only after a
+                // successful unlock, so this is unreachable; fail
+                // closed rather than export with a wrong key.
+                None => return DbBackupOutcome::failed("locked"),
+            },
+            super::passphrase::StoreKeyMode::Raw => {
+                match sqlcipher::load_key(&super::key_file(dir)) {
+                    Ok(k) => {
+                        _raw_hold = Zeroizing::new(k);
+                        key = BackupKey::Raw(_raw_hold.as_slice());
+                    }
+                    Err(_) => return DbBackupOutcome::failed("key"),
+                }
+            }
+            super::passphrase::StoreKeyMode::Unknown => {
+                return DbBackupOutcome::failed("marker-unknown");
+            }
+        }
+    }
     let now = schema::now_ms();
     let manifest = match backup_db(conn, &key, &dest_dir, now) {
         Ok(m) => m,
@@ -1348,10 +1455,12 @@ mod tests {
     #[test]
     fn backup_then_verify_ok_counts_match() {
         let (conn, key) = db_with_rows();
+        let bkey = BackupKey::Raw(&key);
         let dest = scratch("roundtrip");
-        let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &bkey, &dest, MS_2026_11_20).unwrap();
         assert_eq!(manifest.ts, MS_2026_11_20);
         assert_eq!(manifest.schema_version, schema::VERSION);
+        assert_eq!(manifest.mode, "raw", "batch 18: the key mode is recorded (no secret)");
         // Counts for every user table, equal to the source's.
         assert_eq!(manifest.counts, user_table_counts(&conn).unwrap());
         assert_eq!(
@@ -1377,13 +1486,14 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
         assert_eq!(on_disk, manifest);
         // And the full verify passes.
-        assert_eq!(verify_backup(&db_path, &key, &manifest), Ok(()));
+        assert_eq!(verify_backup(&db_path, &bkey, &manifest), Ok(()));
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
     fn backup_removes_leftover_tmp_from_a_killed_run() {
         let (conn, key) = db_with_rows();
+        let bkey = BackupKey::Raw(&key);
         let dest = scratch("tmp-clean");
         // Plant killed-run leftovers: three of OURS
         // (shadow-<stamp>.db.tmp) plus a malformed-stamp near-miss —
@@ -1397,7 +1507,7 @@ mod tests {
         std::fs::write(dest.join("unrelated.db.tmp"), b"someone-elses").unwrap();
         std::fs::write(dest.join("notes.txt"), b"keep-me").unwrap();
 
-        let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &bkey, &dest, MS_2026_11_20).unwrap();
         assert!(!dest.join("shadow-20261101-000000.db.tmp").exists());
         assert!(!dest.join("shadow-20261102-000000.db.tmp").exists());
         assert!(
@@ -1411,7 +1521,7 @@ mod tests {
         assert!(dest.join("notes.txt").is_file(), "outside the pattern — stays");
         // The fresh backup is complete.
         assert_eq!(
-            verify_backup(&backup_db_path(&dest, manifest.ts), &key, &manifest),
+            verify_backup(&backup_db_path(&dest, manifest.ts), &bkey, &manifest),
             Ok(())
         );
         std::fs::remove_dir_all(&dest).unwrap();
@@ -1420,8 +1530,9 @@ mod tests {
     #[test]
     fn corrupt_one_byte_fails_the_verify() {
         let (conn, key) = db_with_rows();
+        let bkey = BackupKey::Raw(&key);
         let dest = scratch("corrupt");
-        let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &bkey, &dest, MS_2026_11_20).unwrap();
         let db_path = backup_db_path(&dest, MS_2026_11_20);
         // Flip one byte mid-file.
         let mut bytes = std::fs::read(&db_path).unwrap();
@@ -1432,14 +1543,14 @@ mod tests {
         // sha256 is checked first: the manifest no longer describes
         // the file.
         assert_eq!(
-            verify_backup(&db_path, &key, &manifest),
+            verify_backup(&db_path, &bkey, &manifest),
             Err("sha256-mismatch".into())
         );
         // With the sha papered over, the open/integrity layer must
         // still refuse the corrupt file.
         let mut fixed = manifest.clone();
         fixed.sha256 = file_sha256(&db_path).unwrap();
-        let err = verify_backup(&db_path, &key, &fixed).unwrap_err();
+        let err = verify_backup(&db_path, &bkey, &fixed).unwrap_err();
         assert!(
             err != "sha256-mismatch" && err != "count-mismatch",
             "the corruption must be caught below the sha layer, got {err}"
@@ -1450,8 +1561,9 @@ mod tests {
     #[test]
     fn restore_open_with_wrong_key_fails() {
         let (conn, key) = db_with_rows();
+        let bkey = BackupKey::Raw(&key);
         let dest = scratch("wrong-key");
-        let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &bkey, &dest, MS_2026_11_20).unwrap();
         let db_path = backup_db_path(&dest, MS_2026_11_20);
         let wrong = sqlcipher::generate_key().unwrap();
         assert!(
@@ -1460,42 +1572,119 @@ mod tests {
         );
         // verify_backup fails with the open kind (sha passes first —
         // it is key-independent; the keyed open then refuses).
-        assert_eq!(verify_backup(&db_path, &wrong, &manifest), Err("open".into()));
+        assert_eq!(
+            verify_backup(&db_path, &BackupKey::Raw(&wrong), &manifest),
+            Err("open".into())
+        );
         // And the right key still passes.
-        assert_eq!(verify_backup(&db_path, &key, &manifest), Ok(()));
+        assert_eq!(verify_backup(&db_path, &bkey, &manifest), Ok(()));
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
     fn count_mismatch_fails_the_verify() {
         let (conn, key) = db_with_rows();
+        let bkey = BackupKey::Raw(&key);
         let dest = scratch("counts");
-        let manifest = backup_db(&conn, &key, &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &bkey, &dest, MS_2026_11_20).unwrap();
         let db_path = backup_db_path(&dest, MS_2026_11_20);
         let mut forged = manifest.clone();
         *forged.counts.get_mut("messages").unwrap() += 1;
-        assert_eq!(verify_backup(&db_path, &key, &forged), Err("count-mismatch".into()));
+        assert_eq!(verify_backup(&db_path, &bkey, &forged), Err("count-mismatch".into()));
         // A missing table in the manifest is a mismatch too.
         let mut stripped = manifest.clone();
         stripped.counts.remove("messages");
-        assert_eq!(verify_backup(&db_path, &key, &stripped), Err("count-mismatch".into()));
+        assert_eq!(verify_backup(&db_path, &bkey, &stripped), Err("count-mismatch".into()));
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
     fn plaintext_backup_when_key_is_empty() {
         // The encrypt=false store: an unencrypted source exports to an
-        // unencrypted backup that verifies with an empty key.
+        // unencrypted backup that verifies with the plain key.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         schema::apply(&conn).unwrap();
         let dest = scratch("plain");
-        let manifest = backup_db(&conn, &[], &dest, MS_2026_11_20).unwrap();
+        let manifest = backup_db(&conn, &BackupKey::Plain, &dest, MS_2026_11_20).unwrap();
         let db_path = backup_db_path(&dest, MS_2026_11_20);
-        assert_eq!(verify_backup(&db_path, &[], &manifest), Ok(()));
+        assert_eq!(manifest.mode, "plain");
+        assert_eq!(verify_backup(&db_path, &BackupKey::Plain, &manifest), Ok(()));
         // A keyed open must NOT work on the plaintext backup.
         let wrong = sqlcipher::generate_key().unwrap();
-        assert!(verify_backup(&db_path, &wrong, &manifest).is_err());
+        assert!(verify_backup(&db_path, &BackupKey::Raw(&wrong), &manifest).is_err());
         std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    /// An OBVIOUSLY FAKE passphrase (H-rule: tests never carry anything
+    /// that resembles a real secret).
+    const FAKE_PASS: &str = "fake-pass-phrase-0123456789";
+
+    #[test]
+    fn passphrase_backup_opens_with_the_password_alone_in_a_fresh_dir() {
+        // Batch 18 R4/R5: a passphrase-mode store exports through the
+        // BOUND-parameter ATTACH; the backup file opens with the
+        // password ALONE (no key file, no DPAPI, no other pragmas) in a
+        // FRESH dir — the portability contract of the mode. The
+        // manifest records `mode: passphrase` and no secret.
+        let dir = scratch("passbackup-src");
+        let db = dir.join("store.db");
+        {
+            let conn = sqlcipher::open_with_passphrase(&db, FAKE_PASS).unwrap();
+            schema::apply(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO messages (msg_id, conv_id, sender_id, ts, type, text, payload_json, source)
+                 VALUES ('m1', 'c1', 'u1', 42, 1, 'fake', '{}', 'capture')",
+                [],
+            )
+            .unwrap();
+        }
+        // The "flusher's" connection (passphrase-keyed).
+        let src = sqlcipher::open_with_passphrase(&db, FAKE_PASS).unwrap();
+        let dest = scratch("passbackup-dest");
+        let manifest = backup_db(&src, &BackupKey::Passphrase(FAKE_PASS), &dest, MS_2026_11_20)
+            .expect("passphrase export");
+        assert_eq!(manifest.mode, "passphrase");
+        let backup_path = backup_db_path(&dest, MS_2026_11_20);
+        assert_eq!(
+            verify_backup(&backup_path, &BackupKey::Passphrase(FAKE_PASS), &manifest),
+            Ok(()),
+            "verify handles passphrase mode (R4)"
+        );
+        // Windows: release the store's file handle before the cleanup
+        // deletes it (nothing else holds it open at this point).
+        drop(src);
+        // The FRESH-dir, password-alone restore: copy ONLY the .db file
+        // into a brand-new dir (as if moved to another machine) and open
+        // it with the plain third-party statement.
+        let fresh = scratch("passbackup-fresh");
+        std::fs::copy(&backup_path, fresh.join("restore.db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(fresh.join("restore.db")).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = '{FAKE_PASS}';")).unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        // A wrong password is TYPED-refused on the backup too.
+        assert!(matches!(
+            sqlcipher::open_with_passphrase_readonly(&backup_path, "fake-wrong-pass-12345"),
+            Err(sqlcipher::KeyError::WrongPassword)
+        ));
+        // And the manifest's sha/counts match what landed (the verify
+        // above already proves it; the parse-back keeps the disk form
+        // honest, same as the raw test).
+        let json_path = dest.join("shadow-20261120-075614.json");
+        let on_disk: BackupManifest =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(on_disk, manifest);
+        assert!(
+            !std::fs::read(&json_path).unwrap().windows(FAKE_PASS.len()).any(|w| w == FAKE_PASS.as_bytes()),
+            "the manifest never contains the passphrase"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
+        std::fs::remove_dir_all(&fresh).unwrap();
     }
 
     // --- H2: media backup --------------------------------------------------
@@ -1812,13 +2001,19 @@ mod probe_backup_restore {
 
         // A temp COPY of the live set, opened read-write (the copy
         // plays the flusher's connection; the live dir is never
-        // opened — probe_util's structural guarantee).
+        // opened — probe_util's structural guarantee). Batch 18: the
+        // copy keeps whatever mode the live store has (raw today).
         let (src, tmp) = probe_util::open_copy_rw();
         let key_path = super::super::key_file(&tmp);
-        let key = if key_path.exists() {
+        let key: Zeroizing<Vec<u8>> = if key_path.exists() {
             Zeroizing::new(sqlcipher::load_key(&key_path).expect("load the copy's key"))
         } else {
             Zeroizing::new(Vec::new())
+        };
+        let bkey = if key.is_empty() {
+            BackupKey::Plain
+        } else {
+            BackupKey::Raw(key.as_slice())
         };
 
         // A fresh dest under the OS temp dir.
@@ -1831,12 +2026,12 @@ mod probe_backup_restore {
 
         let now = schema::now_ms();
         let t0 = Instant::now();
-        let manifest = backup_db(&src, &key, &dest, now).expect("backup_db on the copy");
+        let manifest = backup_db(&src, &bkey, &dest, now).expect("backup_db on the copy");
         let export_ms = t0.elapsed().as_millis();
         let db_path = backup_db_path(&dest, manifest.ts);
 
         let t1 = Instant::now();
-        let verdict = verify_backup(&db_path, &key, &manifest);
+        let verdict = verify_backup(&db_path, &bkey, &manifest);
         let verify_ms = t1.elapsed().as_millis();
         let pruned = prune_backups(&dest, manifest.ts);
 

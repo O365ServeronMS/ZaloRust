@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "shadow-unlock-local",
+  "description": "IPC for the shadow store unlock prompt (batch 18): core:default for invoke, allow-close so the undecorated prompt can dismiss itself, plus exactly one command, shadow_unlock. No remote, no account/notification permissions. Per-command authorization is also enforced in Rust (is_shadow_unlock_window: exact label + local URL, the app-lock pattern).",
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "allow-shadow-unlock"
+  ],
+  "webviews": [
+    "shadow-unlock"
+  ]
+}
