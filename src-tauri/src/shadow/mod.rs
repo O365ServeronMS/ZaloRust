@@ -37,6 +37,12 @@
 //!     called from runtime)
 
 pub mod account;
+/// Read-only query layer for the "Lưu trữ" window (audit §4 Phase 3
+/// item 3.2, batch 11): keyset-paginated lists over the shadow DB,
+/// search join-back, media-path resolution and the pure halves of the
+/// `zrarchive://` media scheme. The archive session connection is
+/// opened by `crate::archive_cmds`, never the flusher's.
+pub mod archive;
 /// Insertion-ordered bounded set/map — eviction of the OLDEST entry
 /// only (R1, batch 4 review: clear-all eviction killed live capture
 /// state in `capture.rs` and `runtime.rs`).

@@ -1711,6 +1711,74 @@ pub fn open_settings_window(app: &AppHandle) {
     });
 }
 
+/// Opens (or focuses) the "Lưu trữ" window (audit §4 Phase 3 item
+/// 3.2). Local `archive.html`, single instance, same creation
+/// discipline as the settings window. The caller is responsible for
+/// the lock rule (`archive_cmds::archive_open` decides it).
+pub fn open_archive_window(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CREATE.lock().unwrap_or_else(|e| e.into_inner());
+        open_archive_window_inner(&app);
+    });
+}
+
+fn open_archive_window_inner(app: &AppHandle) {
+    // Single instance: focus the open window.
+    if let Some(w) = app.get_webview_window(crate::archive_cmds::ARCHIVE_LABEL) {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    // K3: tell the page which media-scheme URL form this engine uses
+    // (WebView2 maps custom schemes onto http://<scheme>.localhost;
+    // macOS/Linux keep scheme://localhost — see the handler in lib.rs).
+    let media_base = if cfg!(windows) {
+        "http://zrarchive.localhost"
+    } else {
+        "zrarchive://localhost"
+    };
+    let built = WebviewWindowBuilder::new(
+        app,
+        crate::archive_cmds::ARCHIVE_LABEL,
+        WebviewUrl::App("archive.html".into()),
+    )
+    .initialization_script(crate::i18n::init_script())
+    .initialization_script(format!("window.__ZR_ARCHIVE_MEDIA__={media_base:?};"))
+    .title(tr("Zalo — Arquivo"))
+    .inner_size(1000.0, 700.0)
+    .min_inner_size(700.0, 460.0)
+    .resizable(true)
+    .visible(false)
+    // A local page: never let it navigate anywhere else.
+    .on_navigation(crate::integration::local_url)
+    .build();
+    match built {
+        Ok(w) => {
+            // The archive session ends with its window: drop the cached
+            // read-only connection when it closes.
+            let app_handle = app.clone();
+            w.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    if let Some(state) = app_handle.try_state::<crate::archive_cmds::ArchiveState>() {
+                        state.close();
+                    }
+                }
+            });
+            // Built hidden; only show while unlocked (the lock screen
+            // takes over otherwise — same rule as the settings window).
+            if crate::lock::is_unlocked(app) {
+                let _ = w.show();
+                let _ = w.set_focus();
+            } else {
+                crate::lock::show_lock_window(app);
+            }
+        }
+        Err(e) => crate::dlog::log(&format!("archive window creation failed: {e}")),
+    }
+}
+
 fn open_settings_window_inner(app: &AppHandle) {
     #[cfg(windows)]
     {

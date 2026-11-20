@@ -61,6 +61,11 @@ fn main() {
             "unlock_password",
             "unlock_biometric",
             "reset_app_lock",
+            // Lưu trữ (archive) window (audit §4 Phase 3 item 3.2)
+            "archive_list_conversations",
+            "archive_list_messages",
+            "archive_search",
+            "archive_open",
         ]),
     ))
     .expect("failed to run tauri-build");

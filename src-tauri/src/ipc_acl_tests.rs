@@ -61,6 +61,13 @@ const LOCK_COMMANDS: &[&str] = &[
     "unlock_biometric",
     "reset_app_lock",
 ];
+/// Commands only the Lưu trữ (archive) window may use (batch 11,
+/// audit §4 3.2). `archive_open` is additionally granted to settings.
+const ARCHIVE_COMMANDS: &[&str] = &[
+    "archive_list_conversations",
+    "archive_list_messages",
+    "archive_search",
+];
 
 fn allowed(app: &tauri::App<tauri::test::MockRuntime>, label: &str, url: &str, cmd: &str) -> bool {
     use tauri::Manager;
@@ -156,7 +163,8 @@ fn the_zalo_page_cannot_reach_settings_or_lock_commands() {
     for cmd in SETTINGS_COMMANDS
         .iter()
         .chain(LOCK_COMMANDS)
-        .chain(&["open_settings"])
+        .chain(ARCHIVE_COMMANDS)
+        .chain(&["open_settings", "archive_open"])
     {
         assert!(
             !allowed(&app, "wa-default", PAGE, cmd),
@@ -239,6 +247,55 @@ fn local_windows_keep_exactly_their_own_commands() {
         assert!(
             !allowed(&app, "lock", local, cmd),
             "lock must not reach {cmd}"
+        );
+    }
+}
+
+// --- Lưu trữ (archive) isolation (batch 11, audit §4 3.2) -------------------
+//
+// The archive window reads the shadow DB through its own capability
+// (`archive-local`): the four archive commands are granted to the
+// `archive` webview only, settings gains only `archive_open`, and the
+// remote Zalo page gets none of them.
+
+#[test]
+fn the_archive_window_reaches_exactly_the_archive_commands() {
+    let app = app();
+    let local = "tauri://localhost/";
+    for cmd in ARCHIVE_COMMANDS.iter().chain(std::iter::once(&"archive_open")) {
+        assert!(
+            allowed(&app, "archive", local, cmd),
+            "archive must be allowed {cmd}"
+        );
+    }
+    // And nothing else of the other windows' commands.
+    for cmd in [
+        "get_settings",
+        "set_settings",
+        "add_account",
+        "unlock_password",
+        "notify",
+        "open_settings",
+    ] {
+        assert!(
+            !allowed(&app, "archive", local, cmd),
+            "archive must not reach {cmd}"
+        );
+    }
+}
+
+#[test]
+fn the_settings_window_can_only_open_not_read_the_archive() {
+    let app = app();
+    let local = "tauri://localhost/";
+    assert!(
+        allowed(&app, "settings", local, "archive_open"),
+        "settings must be allowed archive_open (the shadow-section button)"
+    );
+    for cmd in ARCHIVE_COMMANDS {
+        assert!(
+            !allowed(&app, "settings", local, cmd),
+            "settings must not read the archive: {cmd}"
         );
     }
 }

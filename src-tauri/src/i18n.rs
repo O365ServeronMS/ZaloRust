@@ -122,6 +122,9 @@ pub fn refresh(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.set_title(&tr("Zalo — Configurações"));
     }
+    if let Some(w) = app.get_webview_window(crate::archive_cmds::ARCHIVE_LABEL) {
+        let _ = w.set_title(&tr("Zalo — Arquivo"));
+    }
     crate::tray::rebuild_menu(app);
     let total = app
         .try_state::<crate::accounts::UnreadMap>()
@@ -313,6 +316,12 @@ static EN_TABLE: &[(&str, &str)] = &[
     // media-store free-space refusal (audit KQ9, batch 9 I0; the only
     // echoed value is the GiB number itself)
     ("A pasta de armazenamento precisa de pelo menos {0} GB de espaço livre.", "The storage folder needs at least {0} GB of free space."),
+    // Lưu trữ (archive) window (audit §4 Phase 3 item 3.2, batch 11)
+    ("Arquivo", "Archive"),
+    ("Zalo — Arquivo", "Zalo — Archive"),
+    ("O armazenamento shadow está desativado.", "Shadow storage is turned off."),
+    ("Não foi possível abrir o armazenamento de mensagens.", "The message archive could not be opened."),
+    ("Não foi possível consultar o armazenamento.", "The archive query failed."),
     // window titles
     ("Zalo — Configurações", "Zalo — Settings"),
     ("Zalo — Conta destacada", "Zalo — Detached account"),
@@ -400,6 +409,7 @@ mod tests {
         let sources = [
             include_str!("accounts.rs"),
             include_str!("applock.rs"),
+            include_str!("archive_cmds.rs"),
             include_str!("commands.rs"),
             include_str!("integration.rs"),
             include_str!("lock.rs"),

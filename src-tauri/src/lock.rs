@@ -87,11 +87,13 @@ pub fn validate_new_password(new: &str, confirm: &str) -> Result<(), String> {
 }
 
 /// Whether a window label should be hidden behind the lock screen. Pure, unit-tested.
-/// The lock window itself is never hidden; everything user-facing (`wa-*` + settings) is.
+/// The lock window itself is never hidden; everything user-facing (`wa-*` +
+/// settings + the archive window + `main`/`detached-*`) is.
 pub fn should_hide(label: &str) -> bool {
     label != "lock"
         && (label.starts_with("wa-")
             || label == "settings"
+            || label == "archive"
             || label == "main"
             || label.starts_with("detached-"))
 }
@@ -301,10 +303,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_hide_covers_accounts_and_settings() {
+    fn should_hide_covers_accounts_settings_and_archive() {
         assert!(should_hide("wa-default"));
         assert!(should_hide("wa-acct-3"));
         assert!(should_hide("settings"));
+        // The Lưu trữ window holds the same data the lock protects.
+        assert!(should_hide("archive"));
     }
 
     #[test]

@@ -35,7 +35,8 @@
     "allow-reorder-accounts",
     "allow-notification-diagnostics",
     "allow-test-notification",
-    "allow-open-notification-settings"
+    "allow-open-notification-settings",
+    "allow-archive-open"
   ],
   "webviews": [
     "settings"

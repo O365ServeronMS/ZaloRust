@@ -445,6 +445,12 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("reset_download_dir").addEventListener("click", resetDownloadDir);
   document.getElementById("choose_media_store").addEventListener("click", chooseMediaStore);
   document.getElementById("choose_backup_dir").addEventListener("click", chooseBackupDir);
+  // Batch 11 (audit §4 3.2): the shadow section's button opens the
+  // Lưu trữ window. The capability grants settings only
+  // `archive_open`; Rust re-checks the caller label and the app lock.
+  document.getElementById("open_archive").addEventListener("click", async () => {
+    try { await invoke("archive_open"); } catch (e) { flash(String(e)); }
+  });
   document.getElementById("choose_icon").addEventListener("click", chooseIcon);
   document.getElementById("reset_icon").addEventListener("click", resetIcon);
   // Zoom saves on change rather than on Save: picking a size you cannot see the

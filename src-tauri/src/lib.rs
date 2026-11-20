@@ -1,6 +1,7 @@
 mod accounts;
 mod appicon;
 mod applock;
+mod archive_cmds;
 mod aumid;
 mod badge;
 mod biometric;
@@ -190,7 +191,28 @@ pub fn run() {
 
     let builder = builder.manage(sessions::Sessions::default());
 
+    // K3 (audit §4 Phase 3 item 3.2): the media scheme for the Lưu trữ
+    // window. `zrarchive://localhost/media/<msg_id>/<idx>` (macOS/Linux)
+    // and `http://zrarchive.localhost/...` (WebView2 maps custom schemes
+    // onto http) both land here with the same PATH. The handler answers
+    // the archive webview only, resolves the file through the DB row
+    // (never a path from the URL) and sets the content type from the
+    // magic bytes — see archive_cmds::serve_media. Blocking file/DB work
+    // happens off the main thread (the async responder).
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        "zrarchive",
+        |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            let label = ctx.webview_label().to_string();
+            std::thread::spawn(move || {
+                let response = archive_cmds::serve_media(&app, &label, &request);
+                responder.respond(response);
+            });
+        },
+    );
+
     builder
+        .manage(archive_cmds::ArchiveState::new())
         .manage(accounts::UnreadMap::default())
         .manage(downloads::Downloads::default())
         .manage(notify::Recent::default())
@@ -246,6 +268,10 @@ pub fn run() {
             commands::unlock_password,
             commands::unlock_biometric,
             commands::reset_app_lock,
+            archive_cmds::archive_list_conversations,
+            archive_cmds::archive_list_messages,
+            archive_cmds::archive_search,
+            archive_cmds::archive_open,
         ])
         .setup(move |app| {
             // Menu-bar-only on macOS: load settings early (the rest of setup needs them

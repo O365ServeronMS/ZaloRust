@@ -384,6 +384,78 @@ Các batch build tiếp theo (trên branch audit, mỗi batch kết thúc bằng
   bm25 → ts DESC, hit chỉ id+ts; I4 guard đơn vị overhead trigger
   (<50%) + `probe_fts_bench` (reviewer chạy trên copy); §5 này.
 
+### Archive window (3.2) — batch 11
+
+Màn hình "Lưu trữ" (§4 Phase 3 item 3.2, KQ5): window Tauri RIÊNG,
+local, read-only — dữ liệu kho không bao giờ render ngược vào web UI
+Zalo (A1).
+
+- **Mô hình isolation (3 lớp, mỗi lớp test riêng):**
+  1. Capability `capabilities/archive.json` (`identifier:
+     "archive-local"`, `webviews: ["archive"]`) cấp ĐÚNG `core:default`
+     + `core:window:allow-close` (cửa sổ tự đóng) + 4 lệnh
+     `archive_*`; `main-remote.json` KHÔNG có quyền archive nào;
+     `settings.json` chỉ thêm `allow-archive-open` (nút "Mở Lưu trữ"
+     trong mục Armazenamento shadow). Mock-runtime ACL test trong
+     `ipc_acl_tests.rs` (Linux) + test parse JSON capability chạy mọi
+     nền tảng trong `archive_cmds.rs`.
+  2. Mỗi command kiểm tra label caller ĐÚNG bằng `archive` (+ URL
+     local), `archive_open` chấp nhận thêm `settings`; refusal qua Rust
+     ngay cả khi capability bị cấu hình nhầm.
+  3. App lock: data command đi qua `lock::require_unlocked`
+     (`Err("locked")`); `archive_open` khi khoá chỉ hiện lock screen
+     (quy tắc của `open_settings_legacy`); window label `archive` nằm
+     trong `lock::should_hide` nên khoá app ẩn cửa sổ này.
+- **Data layer (`shadow/archive.rs`)**: connection read-only RIÊNG theo
+  session (managed `Mutex<Option<Connection>>` trong
+  `archive_cmds::ArchiveState`, mở lazy, drop khi đóng cửa sổ) — qua
+  `open_with_key_readonly` (đã có `query_only` + busy_timeout 5 s, xác
+  minh trong `sqlcipher.rs`), không bao giờ connection của flusher
+  (A5). Shadow tắt / thiếu key file → lỗi dịch sạch. Query thuần:
+  `list_conversations` (keyset `(COALESCE(last_ts,0), id)` DESC, tên
+  COALESCE conversations.title > groups.name/contacts.display_name >
+  id, preview 80 ký tự hoặc nhãn `[ảnh]/[video]/[file]/[sticker]…`
+  theo bảng mã `msg_type_code`), `list_messages` (keyset `(ts, msg_id)`
+  DESC, sender_name join contacts, attachments gom 1 query),
+  `search_messages` (FTS5 batch 9 + row đầy đủ + tên conv),
+  `attachment_path` (chỉ `status='downloaded'`, resolve qua
+  `media::resolve_local_path` fail-closed, guard canonicalize +
+  starts_with: phải LÀ FILE nằm TRONG media root). Không OFFSET.
+- **Media protocol (K3):** scheme `zrarchive` đăng ký qua
+  `register_asynchronous_uri_scheme_protocol` (lib.rs); handler chỉ
+  trả lời webview label `archive`, parse URL dạng
+  `/media/<msg_id>/<idx>` (ids chặt, từ chối `%`, traversal, zero
+  đầu), file CHỌN TỪ DB row (URL không bao giờ mang path), content
+  type từ magic bytes theo kind (`media::magic_ok` family; image/video
+  row mà bytes không khớp sniff → 404), range request đơn 206 (window
+  8 MiB, phục vụ seek video), 416 cho range không thỏa. CSP của trang
+  archive (`<meta>` trong `archive.html`) cho img/media CHỈ từ scheme
+  này, không http/https nào; CSP app (tauri.conf.json) thêm
+  `zrarchive:`/`http://zrarchive.localhost` (Windows WebView2 map
+  scheme → http://<scheme>.localhost; hai nguồn để giao cả 2 dạng).
+- **UI (`settings-ui/archive{.html,.js,.css}`):** trái = danh sách hội
+  thoại (infinite scroll keyset), phải = tin nhắn (mới nhất dưới,
+  cuộn lên tải trang cũ prepend + neo viewport), search debounce 300
+  ms → click kết quả nhảy đến tin + highlight; header nhỏ với counts;
+  media qua scheme, media chưa tải hiện nhãn status
+  (`ref/failed/ref-encrypted`), tin thu hồi/xoá xám + nhãn; MỌI text
+  qua `textContent` (node test: source scan + fake DOM). i18n theo
+  quy ước PT→EN→VI (`i18n.js`, `vi.json`, regenerate `vi.js`). Entry
+  point: tray item "Lưu trữ" cạnh Settings + nút Settings.
+- **Cần kiểm runtime (không chứng được bằng unit test):**
+  - Mở cửa sổ trong app thật: `WebviewWindowBuilder` + entry
+    tray/settings, single-instance focus, hành vi khi khoá.
+  - ACL mock-runtime (`ipc_acl_tests.rs`) chỉ chạy trên Linux CI —
+    batch này viết theo pattern có sẵn nhưng KHÔNG chạy được trên máy
+    Windows này.
+  - Media protocol trong WebView2 thật: scheme map sang
+    `http://zrarchive.localhost`, CSP hai lớp thực tế, <video> seek
+    theo Range 206, và xác nhận các webview khác không request được
+    scheme (label check trong handler chỉ chứng minh được bằng unit
+    của phần thuần).
+  - End-to-end trên dữ liệu thật: ảnh/video đã download hiển thị qua
+    scheme; khối lượng lớn (sau P2) vẫn ổn với keyset pagination.
+
 Chưa xác minh runtime (reviewer chạy):
 - golden replay trên oracle đóng băng với schema mới — replay DB đi qua
   `schema::apply` nên trigger FTS chạy trong lúc replay; so sánh chỉ

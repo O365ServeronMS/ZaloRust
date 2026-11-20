@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- K3 (batch 11): this page allows images/media ONLY from the
+         internal zrarchive scheme — nothing remote, no data:, no
+         http(s) origins. It intersects with the app-wide CSP header;
+         scripts and styles stay local like every other local page. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src zrarchive: http://zrarchive.localhost; media-src zrarchive: http://zrarchive.localhost; connect-src ipc: http://ipc.localhost" />
+    <title>Zalo — Arquivo</title>
+    <script src="vi.js"></script>
+    <script src="i18n.js"></script>
+    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="archive.css" />
+  </head>
+  <body>
+    <header class="app-header archive-header">
+      <div><strong>Arquivo</strong><span id="archive-title" class="archive-title-sub"></span></div>
+      <span id="archive-counts" class="archive-counts"></span>
+    </header>
+    <div class="archive-search">
+      <input type="text" id="search" placeholder="Pesquisar mensagens" aria-label="Pesquisar mensagens" autocomplete="off" spellcheck="false" />
+      <div id="search-results" class="search-results" hidden></div>
+    </div>
+    <main class="archive-layout">
+      <nav id="conv-list" class="conv-list" aria-label="Conversas">
+        <div id="conv-empty" class="archive-empty">Nenhuma conversa encontrada.</div>
+      </nav>
+      <section id="msg-pane" class="msg-pane" aria-label="Mensagens">
+        <div id="msg-empty" class="archive-empty">Selecione uma conversa</div>
+        <div id="msgs" class="msgs" hidden></div>
+      </section>
+    </main>
+    <p id="archive-note" class="archive-note" role="status" aria-live="polite"></p>
+    <script src="archive.js"></script>
+  </body>
+</html>

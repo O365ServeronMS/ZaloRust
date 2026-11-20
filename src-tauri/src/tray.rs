@@ -82,6 +82,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             }
             match id {
                 "accounts" | "settings" => crate::window::open_settings_window(app),
+                "archive" => crate::window::open_archive_window(app),
                 "update" => crate::update_service::open_updates(app),
                 "reload" => {
                     if let Some(active) = app.try_state::<crate::accounts::ActiveAccount>() {
@@ -134,7 +135,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Rebuild the tray menu from the current accounts list: one `acct:<id>` item per
-/// account showing `name (n)`, then the static `Accounts… / Settings / Reload / [Update to X] / [Lock now] / Quit`.
+/// account showing `name (n)`, then the static `Accounts… / Settings / Archive / Reload / [Update to X] / [Lock now] / Quit`.
 pub fn rebuild_menu(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("main-tray") else {
         return;
@@ -177,6 +178,10 @@ pub fn rebuild_menu(app: &AppHandle) {
     else {
         return;
     };
+    // The Lưu trữ (archive) entry, next to Settings (audit §4 3.2).
+    let Ok(archive) = MenuItemBuilder::with_id("archive", tr("Arquivo")).build(app) else {
+        return;
+    };
     let Ok(reload) = MenuItemBuilder::with_id("reload", tr("Recarregar")).build(app) else {
         return;
     };
@@ -188,6 +193,7 @@ pub fn rebuild_menu(app: &AppHandle) {
         .separator()
         .item(&accounts_item)
         .item(&settings)
+        .item(&archive)
         .item(&reload);
     if let Some(version) = crate::update_service::available_version() {
         let Ok(update_item) =
