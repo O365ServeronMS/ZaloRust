@@ -7,6 +7,19 @@
 //! mapping, cut both sides to the overlapping time window, match by
 //! msgId, and report type/ts/sender agreement on the matches.
 //!
+//! Batch 15 O3: a SECOND type axis — `type_str agreement` — compares
+//! the import's MAPPED msgType string with the shadow payload's
+//! ORIGINAL wire `$.msgType` string. That is the meaningful type
+//! comparison today: the still-soaking pre-H1-fix build writes the
+//! degenerate numeric `type=100` for every real message, so the
+//! numeric axis is near-vacuous, while `payload_json` still carries
+//! the true wire string verbatim.
+//!
+//! Batch 15 O4 (KQ2 on the import path): `ZR_OWN_UID` (validated
+//! with `account::valid_uid`) seeds the self-sent sender
+//! substitution, exactly like the CLI's own-uid rule; the value is
+//! never printed — only `own_uid set: true/false`.
+//!
 //! Printout is shape-only per the batch-12 hard rule: conversations
 //! appear as `h12(conv id)`, never as the raw id; counts and
 //! percentages only — no message text, no payload, no senders.
@@ -32,6 +45,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use serde_json::Value;
+
 use super::cli::ImportArgs;
 use super::import;
 use super::import_map::{self, MapDb};
@@ -46,6 +61,11 @@ pub struct MsgLite {
     pub ts: i64,
     pub kind: i64,
     pub sender: Option<String>,
+    /// The payload's msgType STRING (batch 15 O3): on the Desktop side
+    /// the import's MAPPED msgType, on the shadow side the stored
+    /// payload's ORIGINAL `$.msgType` wire string. The meaningful
+    /// type comparison while the numeric `kind` axis is degenerate.
+    pub type_str: Option<String>,
 }
 
 fn ts_range(m: &[MsgLite]) -> Option<(i64, i64)> {
@@ -74,10 +94,15 @@ pub fn in_window<'a>(m: &'a [MsgLite], w: &(i64, i64)) -> Vec<&'a MsgLite> {
 }
 
 /// The pure comparison: two sides already cut to the window, matched
-/// by msgId. Type/ts agreement is counted over matches; sender
-/// agreement over the matches where BOTH sides have a sender (the
-/// capture path substitutes the own uid where import leaves NULL —
-/// the report shows the not-compared count so nothing is hidden).
+/// by msgId. Type agreement is counted over matches on BOTH axes —
+/// the numeric `kind` (degenerate while the soak build writes
+/// type=100) and `type_str` (the import's mapped msgType vs the
+/// shadow payload's `$.msgType`, the meaningful axis today; compared
+/// only when both sides have a string, like the sender axis). ts
+/// agreement over matches; sender agreement over the matches where
+/// BOTH sides have a sender (the capture path substitutes the own uid
+/// where import leaves NULL — the report shows the not-compared
+/// count so nothing is hidden).
 pub fn compare_overlap(desktop: &[MsgLite], shadow: &[MsgLite]) -> OverlapCounters {
     let mut c = OverlapCounters::default();
     c.desktop = desktop.len();
@@ -93,6 +118,12 @@ pub fn compare_overlap(desktop: &[MsgLite], shadow: &[MsgLite]) -> OverlapCounte
         c.matched += 1;
         if d.kind == s.kind {
             c.type_agree += 1;
+        }
+        if let (Some(a), Some(b)) = (&d.type_str, &s.type_str) {
+            c.type_str_compared += 1;
+            if a == b {
+                c.type_str_agree += 1;
+            }
         }
         if d.ts == s.ts {
             c.ts_agree += 1;
@@ -114,6 +145,8 @@ pub struct OverlapCounters {
     pub shadow: usize,
     pub matched: usize,
     pub type_agree: usize,
+    pub type_str_agree: usize,
+    pub type_str_compared: usize,
     pub ts_agree: usize,
     pub sender_agree: usize,
     pub sender_compared: usize,
@@ -126,6 +159,8 @@ impl OverlapCounters {
         self.shadow += o.shadow;
         self.matched += o.matched;
         self.type_agree += o.type_agree;
+        self.type_str_agree += o.type_str_agree;
+        self.type_str_compared += o.type_str_compared;
         self.ts_agree += o.ts_agree;
         self.sender_agree += o.sender_agree;
         self.sender_compared += o.sender_compared;
@@ -156,6 +191,8 @@ fn probe_import_overlap() {
         shadow_copy: None,
         delta: false,
         distinct: Vec::new(),
+        all_dbs: false,
+        own_uid_from_settings: false,
         apply: false,
         help: false,
     };
@@ -176,6 +213,15 @@ fn probe_import_overlap() {
         println!("overlap: the mapping maps no message entity — nothing to compare");
         return;
     }
+
+    // Batch 15 O4 (KQ2 on the import path): `ZR_OWN_UID`, validated,
+    // never printed — only whether one was found (the maint_repair
+    // convention). Without it the self-sent import rows keep a NULL
+    // sender and the missing-sender line below shows them.
+    let own_uid = std::env::var("ZR_OWN_UID")
+        .ok()
+        .filter(|u| super::account::valid_uid(u));
+    println!("overlap: own_uid set: {}", own_uid.is_some());
 
     // The shadow side: a temp COPY of the live store, read-only.
     let (shadow, tmp) = probe_util::open_copy();
@@ -257,7 +303,12 @@ fn probe_import_overlap() {
         let (writes, _skips) = import_map::extract(
             &conn,
             &plan,
-            &import_map::ExtractOpts { kind, db_id, cursor: None },
+            &import_map::ExtractOpts {
+                kind,
+                db_id,
+                cursor: None,
+                own_uid: own_uid.as_deref(),
+            },
         )
         .expect("extraction must not fail on an opened DB");
         // Keep only this conversation's messages (a 1-1 DB is one
@@ -271,19 +322,34 @@ fn probe_import_overlap() {
                     sender_id,
                     ts,
                     kind,
+                    payload,
                     ..
-                } if conv_id == pick.id => Some(MsgLite {
-                    msg_id,
-                    ts,
-                    kind,
-                    sender: sender_id,
-                }),
+                } if conv_id == pick.id => {
+                    // The import's MAPPED msgType string, read back
+                    // from the payload it built (batch 15 O3).
+                    let type_str = serde_json::from_str::<Value>(&payload)
+                        .ok()
+                        .and_then(|p| p.get("msgType").and_then(Value::as_str).map(str::to_string));
+                    Some(MsgLite {
+                        msg_id,
+                        ts,
+                        kind,
+                        sender: sender_id,
+                        type_str,
+                    })
+                }
                 _ => None,
             })
             .collect();
         let shadow_msgs: Vec<MsgLite> = {
+            // The shadow payload's ORIGINAL wire $.msgType (batch 15
+            // O3) rides along as the second type axis.
             let mut st = shadow
-                .prepare("SELECT msg_id, ts, type, sender_id FROM messages WHERE conv_id = ?1")
+                .prepare(
+                    "SELECT msg_id, ts, type, sender_id, \
+                     json_extract(payload_json, '$.msgType') \
+                     FROM messages WHERE conv_id = ?1",
+                )
                 .unwrap();
             let rows = st
                 .query_map(rusqlite::params![pick.id], |r| {
@@ -292,6 +358,7 @@ fn probe_import_overlap() {
                         ts: r.get(1)?,
                         kind: r.get(2)?,
                         sender: r.get(3)?,
+                        type_str: r.get::<_, Option<String>>(4)?,
                     })
                 })
                 .unwrap();
@@ -316,9 +383,10 @@ fn probe_import_overlap() {
         // Shape-only line: h12 conv id, counts and percentages — no
         // ids, no ts bounds, no content (batch-12 hard rule).
         println!(
-            "overlap: conv={h} kind={kind_s} desktop={} shadow={} matched={} pct={pct:.1} type={}/{} ts={}/{} sender={}/{} (compared {})",
+            "overlap: conv={h} kind={kind_s} desktop={} shadow={} matched={} pct={pct:.1} type={}/{} type_str={}/{} (compared {}) ts={}/{} sender={}/{} (compared {})",
             c.desktop, c.shadow, c.matched,
-            c.type_agree, c.matched, c.ts_agree, c.matched,
+            c.type_agree, c.matched, c.type_str_agree, c.type_str_compared, c.type_str_compared,
+            c.ts_agree, c.matched,
             c.sender_agree, c.sender_compared, c.sender_compared
         );
         total.add(c);
@@ -337,10 +405,16 @@ fn probe_import_overlap() {
         total.desktop, total.shadow, total.matched
     );
     println!(
-        "overlap: agreement on matches: type={}/{} ts={}/{} sender={}/{} of {} compared ({} matches have no sender on one side)",
-        total.type_agree, total.matched, total.ts_agree, total.matched,
-        total.sender_agree, total.sender_compared,
-        total.sender_compared, total.matched - total.sender_compared
+        "overlap: agreement on matches: type={}/{} (numeric axis) type_str={}/{} of {} compared (payload $.msgType axis) ts={}/{} sender={}/{} of {} compared ({} matches have no sender on one side)",
+        total.type_agree, total.matched,
+        total.type_str_agree, total.type_str_compared, total.type_str_compared,
+        total.ts_agree, total.matched,
+        total.sender_agree, total.sender_compared, total.sender_compared,
+        total.matched - total.sender_compared
+    );
+    println!(
+        "overlap: type_str is the meaningful type axis today — the shadow's numeric type stays \
+         degenerate (type=100) until the post-H1-fix build deploys; re-read both after deploy"
     );
     let overlap_ok = pct >= 99.0 && total.desktop > 0;
     let type_ts_ok =
@@ -370,6 +444,18 @@ mod tests {
             ts,
             kind,
             sender: sender.map(str::to_string),
+            type_str: None,
+        }
+    }
+
+    /// `m` plus the payload msgType STRING (batch 15 O3).
+    fn ms(id: &str, ts: i64, kind: i64, sender: Option<&str>, type_str: Option<&str>) -> MsgLite {
+        MsgLite {
+            msg_id: id.into(),
+            ts,
+            kind,
+            sender: sender.map(str::to_string),
+            type_str: type_str.map(str::to_string),
         }
     }
 
@@ -446,12 +532,40 @@ mod tests {
     }
 
     #[test]
+    fn compare_counts_type_str_agreement_on_the_string_axis() {
+        // Batch 15 O3: the second type axis — the import's MAPPED
+        // msgType string vs the shadow payload's $.msgType.
+        // Full agree.
+        let d = vec![ms("m1", 100, 100, None, Some("webchat"))];
+        let s = vec![ms("m1", 100, 100, None, Some("webchat"))];
+        let c = compare_overlap(&d, &s);
+        assert_eq!(c.type_str_compared, 1);
+        assert_eq!(c.type_str_agree, 1);
+        // Disagree: an UNMAPPED Desktop code stays the raw code string
+        // while the shadow carries the original wire string.
+        let s = vec![ms("m1", 100, 100, None, Some("chat.photo"))];
+        let c = compare_overlap(&d, &s);
+        assert_eq!(c.type_str_agree, 0, "\"webchat\" != \"chat.photo\"");
+        // A missing string on one side is not compared (reported,
+        // never hidden — same rule as the sender axis).
+        let s = vec![ms("m1", 100, 100, None, None)];
+        let c = compare_overlap(&d, &s);
+        assert_eq!(c.type_str_compared, 0);
+        assert_eq!(c.type_str_agree, 0);
+        // The numeric axis and the string axis are independent: this
+        // pair agrees numerically (both 100) but not on the string.
+        assert_eq!(c.type_agree, 1);
+    }
+
+    #[test]
     fn counters_add_up() {
         let a = OverlapCounters {
             desktop: 3,
             shadow: 2,
             matched: 1,
             type_agree: 1,
+            type_str_agree: 1,
+            type_str_compared: 1,
             ts_agree: 0,
             sender_agree: 1,
             sender_compared: 1,
@@ -462,6 +576,8 @@ mod tests {
         assert_eq!(t.desktop, 6);
         assert_eq!(t.matched, 2);
         assert_eq!(t.ts_agree, 0);
+        assert_eq!(t.type_str_agree, 2);
+        assert_eq!(t.type_str_compared, 2);
         assert_eq!(t.sender_compared, 2);
     }
 }

@@ -1,5 +1,7 @@
 //! Whitelisted distinct-values probe over a snapshot sample DB
-//! (batch 14 N1, brief `glm-brief-batch14.md`).
+//! (batch 14 N1, brief `glm-brief-batch14.md`) plus the batch-15 O2
+//! `--all-dbs` fold that sums the same fixed aggregation across
+//! EVERY DB of a message kind.
 //!
 //! PRIVACY (the batch-14 hard rule): this tool must be UNABLE to
 //! print row content. Three layered guards, all enforced in code and
@@ -18,11 +20,17 @@
 //! More than 50 distinct values print the first 50 plus
 //! `… (more than 50 distinct — not a code column?)`.
 //!
-//! The DB probed is the FIRST sample of the requested kind (the very
-//! sample `--inventory` reports): `index` = `Core\Index.db`,
-//! `one2one`/`group`/`stranger` = the first sample by sorted file
-//! name. Dry-run only (parse refuses `--apply`); every DB opens
-//! `mode=ro&immutable=1` — nothing is written anywhere.
+//! Without `--all-dbs` the DB probed is the FIRST sample of the
+//! requested kind (the very sample `--inventory` reports): `index` =
+//! `Core\Index.db`, `one2one`/`group`/`stranger` = the first sample
+//! by sorted file name. With `--all-dbs` (message kinds only — parse
+//! refuses an `index` spec) the SAME fixed aggregation runs in EVERY
+//! DB of that kind and the per-DB counts are SUMMED (batch 15 O2);
+//! the sums are exact for any column with ≤ 50 distinct values per
+//! DB, and a column that trips the per-DB cap in ANY DB is flagged
+//! with the >50 marker (not a code column there). Dry-run only (parse
+//! refuses `--apply`); every DB opens `mode=ro&immutable=1` — nothing
+//! is written anywhere.
 //!
 //! H-rule: the aggregation and rendering halves are PURE and tested
 //! below; only the CLI wires them to a connection.
@@ -160,30 +168,40 @@ pub fn render_value(v: &SV) -> String {
     }
 }
 
+/// The one fixed N1 aggregation both modes read with: per-DB
+/// `SELECT col, COUNT(*) FROM t GROUP BY col ORDER BY COUNT(*) DESC
+/// LIMIT 51` — 51 rows means "more than 50 distinct" in that DB.
+/// Table/column are identifier-quoted (the safety layer every module
+/// applies; the names come from the inventory, never raw user SQL).
+pub fn group_counts(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<Vec<(SV, i64)>, String> {
+    let qt = quote_ident(table)?;
+    let qc = quote_ident(column)?;
+    let sql = format!(
+        "SELECT {qc}, COUNT(*) FROM {qt} GROUP BY {qc} ORDER BY COUNT(*) DESC LIMIT 51"
+    );
+    let mut st = conn.prepare(&sql).map_err(|e| format!("{e}"))?;
+    let rows: Vec<(SV, i64)> = st
+        .query_map([], |r| Ok((r.get::<_, SV>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| format!("{e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{e}"))?;
+    Ok(rows)
+}
+
 /// The exact N1 aggregation over one sample DB: counts by value,
 /// most frequent first, capped at 51 (so "51 rows fetched" means
-/// "more than 50 distinct"). Table/column are identifier-quoted
-/// (the safety layer every module applies; the names come from the
-/// inventory, never raw user SQL).
+/// "more than 50 distinct").
 pub fn distinct_report(
     conn: &Connection,
     spec: &DistinctSpec,
     source_rel: &str,
 ) -> Result<Vec<String>, String> {
     let who = format!("--distinct {}:", spec_str(spec));
-    let qt = quote_ident(&spec.table)?;
-    let qc = quote_ident(&spec.column)?;
-    let sql = format!(
-        "SELECT {qc}, COUNT(*) FROM {qt} GROUP BY {qc} ORDER BY COUNT(*) DESC LIMIT 51"
-    );
-    let mut st = conn
-        .prepare(&sql)
-        .map_err(|e| format!("{who} {e}"))?;
-    let rows: Vec<(SV, i64)> = st
-        .query_map([], |r| Ok((r.get::<_, SV>(0)?, r.get::<_, i64>(1)?)))
-        .map_err(|e| format!("{who} {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("{who} {e}"))?;
+    let rows = group_counts(conn, &spec.table, &spec.column).map_err(|e| format!("{who} {e}"))?;
     let mut lines = vec![format!("distinct: {} source={}", spec_str(spec), source_rel)];
     let capped = rows.len() > 50; // LIMIT 51 ⇒ 51 rows means more than 50 distinct
     for (v, n) in rows.iter().take(50) {
@@ -193,6 +211,83 @@ pub fn distinct_report(
         lines.push(format!("  {MORE_THAN_50}"));
     }
     Ok(lines)
+}
+
+/// Identity/sort key for summing per-DB values (rusqlite's `Value`
+/// has no `Ord`): tag + the value itself; NULL sorts first. Only a
+/// deterministic tiebreak — the report still renders through
+/// `render_value`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AggKey {
+    Null,
+    Int(i64),
+    /// f64 by its bit pattern.
+    Real(u64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+fn agg_key(v: &SV) -> AggKey {
+    match v {
+        SV::Null => AggKey::Null,
+        SV::Integer(i) => AggKey::Int(*i),
+        SV::Real(f) => AggKey::Real(f.to_bits()),
+        SV::Text(s) => AggKey::Text(s.clone()),
+        SV::Blob(b) => AggKey::Blob(b.clone()),
+    }
+}
+
+/// (batch 15 O2) The pure fold: sum per-DB `(value, count)` rows into
+/// one value→count list, most frequent first, ties broken by the
+/// value key (deterministic — SQLite's arbitrary tie order never
+/// reaches the report). The bool says the summed set is INCOMPLETE:
+/// at least one DB hit the fixed LIMIT 51 (that column is not a code
+/// column there), so the >50 marker must fire even when the summed
+/// distinct count looks small.
+pub fn aggregate_counts(per_db: &[Vec<(SV, i64)>]) -> (Vec<(SV, i64)>, bool) {
+    let mut map: std::collections::BTreeMap<AggKey, (SV, i64)> = std::collections::BTreeMap::new();
+    let mut capped = false;
+    for rows in per_db {
+        if rows.len() > 50 {
+            capped = true;
+        }
+        for (v, n) in rows {
+            let e = map.entry(agg_key(v)).or_insert_with(|| (v.clone(), 0));
+            e.1 += n;
+        }
+    }
+    let mut out: Vec<(SV, i64)> = map.into_values().collect();
+    out.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| agg_key(&a.0).cmp(&agg_key(&b.0)))
+    });
+    (out, capped)
+}
+
+/// (batch 15 O2) The `--all-dbs` report: the summed distinct values
+/// of one code column over EVERY DB of a message kind, through the
+/// same renderer, capped at 50 values plus the >50 marker. `dbs` is
+/// how many DBs of the kind exist, `opened` how many produced
+/// counts, `failed` open/query failures (skipped — the report is an
+/// aggregate, not a per-DB log).
+pub fn all_dbs_report(
+    spec: &DistinctSpec,
+    dbs: usize,
+    opened: usize,
+    failed: usize,
+    per_db: &[Vec<(SV, i64)>],
+) -> Vec<String> {
+    let (rows, capped) = aggregate_counts(per_db);
+    let mut lines = vec![format!(
+        "distinct: {} source=ALL dbs={dbs} opened={opened} failed={failed}",
+        spec_str(spec)
+    )];
+    for (v, n) in rows.iter().take(50) {
+        lines.push(format!("  {} x {}", render_value(v), n));
+    }
+    if capped || rows.len() > 50 {
+        lines.push(format!("  {MORE_THAN_50}"));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -441,5 +536,111 @@ mod tests {
         let lines = distinct_report(&conn, &spec, "Core/Message/111.db").unwrap();
         assert_eq!(lines[1], "  1 x 2");
         assert!(lines.iter().any(|l| l == "  2 x 1"), "{lines:?}");
+    }
+
+    // --- batch 15 O2: the --all-dbs fold -----------------------------------
+
+    #[test]
+    fn group_counts_is_the_one_fixed_aggregation() {
+        // The shared read: value/count pairs, most frequent first,
+        // capped at 51 rows; a missing table/column errors out.
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE message (msgType INTEGER);
+             INSERT INTO message (msgType) VALUES (1),(1),(2),(NULL);",
+        )
+        .unwrap();
+        let rows = group_counts(&conn, "message", "msgType").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (SV::Integer(1), 2), "most frequent first");
+        // Ties keep SQLite's arbitrary order — assert membership.
+        assert!(rows.contains(&(SV::Integer(2), 1)), "{rows:?}");
+        assert!(rows.contains(&(SV::Null, 1)), "{rows:?}");
+        // A missing TABLE errors out. A missing COLUMN does not error
+        // here — SQLite's double-quoted-string quirk compiles
+        // `"nope"` as the literal — which is exactly why the caller
+        // validates every spec against the INVENTORY before any row
+        // is read (the run_distinct tests cover that guard).
+        assert!(group_counts(&conn, "nope", "msgType").is_err());
+    }
+
+    #[test]
+    fn aggregate_counts_sums_across_dbs_deterministically() {
+        // Two per-DB result sets: 1 x 2 + 1 x 3 sums to 1 x 5; a
+        // value only present on one side keeps its count.
+        let a = vec![(SV::Integer(1), 2), (SV::Integer(2), 1)];
+        let b = vec![(SV::Integer(1), 3), (SV::Integer(9), 1)];
+        let (rows, capped) = aggregate_counts(&[a, b]);
+        assert!(!capped);
+        assert_eq!(
+            rows,
+            vec![(SV::Integer(1), 5), (SV::Integer(2), 1), (SV::Integer(9), 1)]
+        );
+        // Type identity is exact: INTEGER 1, REAL 1.0 and TEXT '1'
+        // stay three values even though they all render "1".
+        let (rows, _) = aggregate_counts(&[
+            vec![(SV::Integer(1), 1)],
+            vec![(SV::Real(1.0), 1)],
+            vec![(SV::Text("1".into()), 1)],
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                (SV::Integer(1), 1),
+                (SV::Real(1.0), 1),
+                (SV::Text("1".into()), 1),
+            ]
+        );
+        // NULL sums; an empty DB folds to nothing.
+        let (rows, capped) = aggregate_counts(&[vec![(SV::Null, 4)], Vec::new()]);
+        assert!(!capped);
+        assert_eq!(rows, vec![(SV::Null, 4)]);
+        let (rows, capped) = aggregate_counts(&[]);
+        assert!(rows.is_empty());
+        assert!(!capped);
+        // A DB that hit the LIMIT 51 flags the whole fold.
+        let big: Vec<(SV, i64)> = (0..51).map(|i| (SV::Integer(i), 1)).collect();
+        let (_, capped) = aggregate_counts(&[big]);
+        assert!(capped, "51 rows in one DB means >50 distinct there");
+    }
+
+    #[test]
+    fn all_dbs_report_renders_privately_and_caps() {
+        let spec = parse_spec("one2one:message.msgType").unwrap();
+        let per_db = vec![
+            vec![(SV::Integer(1), 57), (SV::Integer(2), 2)],
+            vec![(SV::Integer(1), 40), (SV::Integer(4), 1)],
+            vec![(SV::Text("chat.photo".into()), 3)],
+        ];
+        let lines = all_dbs_report(&spec, 967, 966, 1, &per_db);
+        assert_eq!(
+            lines[0],
+            "distinct: one2one:message.msgType source=ALL dbs=967 opened=966 failed=1"
+        );
+        assert_eq!(lines[1], "  1 x 97", "most frequent first");
+        assert!(lines.iter().any(|l| l == "  2 x 2"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "  4 x 1"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "  chat.photo x 3"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(MORE_THAN_50)), "{lines:?}");
+        // A non-code-shaped TEXT renders as the fingerprint, never content.
+        let per_db = vec![vec![(SV::Text("some long sentence value".into()), 1)]];
+        let lines = all_dbs_report(&spec, 1, 1, 0, &per_db);
+        let joined = lines.join("\n");
+        assert!(joined.contains("text(len=24,h12="), "{joined}");
+        assert!(!joined.contains("sentence"), "{joined}");
+        // More than 50 distinct summed: the first 50 plus the marker.
+        let per_db: Vec<Vec<(SV, i64)>> = (0..60i64)
+            .map(|i| vec![(SV::Integer(i), 60 - i)])
+            .collect();
+        let lines = all_dbs_report(&spec, 60, 60, 0, &per_db);
+        assert_eq!(lines.len(), 1 + 50 + 1, "{lines:?}");
+        assert!(lines.iter().any(|l| *l == format!("  {MORE_THAN_50}")), "{lines:?}");
+        // A per-DB cap flags the fold even when the summed set is small.
+        let big: Vec<(SV, i64)> = (0..51).map(|i| (SV::Integer(i), 1)).collect();
+        let lines = all_dbs_report(&spec, 1, 1, 0, &[big]);
+        assert!(lines.iter().any(|l| *l == format!("  {MORE_THAN_50}")), "{lines:?}");
+        // A kind with no DBs at all: header only.
+        let lines = all_dbs_report(&spec, 0, 0, 0, &[]);
+        assert_eq!(lines.len(), 1);
     }
 }

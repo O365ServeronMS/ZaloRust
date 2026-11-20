@@ -125,6 +125,39 @@ pub fn load_d7_key(path: &Path) -> Result<Zeroizing<String>, String> {
     pass
 }
 
+// --- batch 15 O4: own-uid for the import extraction (KQ2 applied) -------
+
+/// The pure own-uid decision for an import run: the env override
+/// `ZR_OWN_UID` (validated with `account::valid_uid`) wins over the
+/// settings file's `shadow.own_uid`; a candidate that fails the
+/// shape check behaves as absent (the account.rs rule — a badly
+/// shaped config never becomes a sender). Unit-tested with FAKE uids.
+pub fn own_uid_decision(env_uid: Option<&str>, settings_uid: Option<&str>) -> Option<String> {
+    env_uid
+        .filter(|u| super::account::valid_uid(u))
+        .or_else(|| settings_uid.filter(|u| super::account::valid_uid(u)))
+        .map(str::to_string)
+}
+
+/// Resolve the import's own uid (batch 15 O4): `ZR_OWN_UID` first,
+/// else `settings.shadow.own_uid` read through the settings loader
+/// when `use_settings` (`--own-uid-from-settings`). The uid is NEVER
+/// printed or logged — callers report only `own_uid set: true/false`.
+/// The import CLI runs before Tauri exists, so the settings file is
+/// loaded by path (`settings::load_at`, same `jsonfile::read` +
+/// `sanitized()` semantics as the app loader, zero writes).
+pub fn resolve_own_uid(use_settings: bool) -> Option<String> {
+    let env_uid = std::env::var("ZR_OWN_UID").ok();
+    let settings_uid = if use_settings {
+        crate::settings::path_without_app()
+            .map(|p| crate::settings::load_at(&p))
+            .and_then(|s| s.shadow.own_uid)
+    } else {
+        None
+    };
+    own_uid_decision(env_uid.as_deref(), settings_uid.as_deref())
+}
+
 // --- F3: profiles + the immutable snapshot open -------------------------
 
 /// The SQLCipher parameter profile of a Desktop DB (audit M2-3: the
@@ -551,8 +584,9 @@ pub fn run(a: &ImportArgs) -> Result<Summary, String> {
 // --- batch 12: the inventory + mapping-dry-run modes (L1/L2/L4) ----------
 
 /// The snapshot's `Core\Message\*.db` entries, sorted by file name,
-/// with their kind (M2-4). Sidecars never match.
-fn message_db_names(uid_dir: &Path) -> Result<Vec<(String, DbKind)>, String> {
+/// with their kind (M2-4). Sidecars never match. Shared by the dry
+/// run, `--distinct --all-dbs` and the batch-15 probes.
+pub fn message_db_names(uid_dir: &Path) -> Result<Vec<(String, DbKind)>, String> {
     let msg_dir = uid_dir.join("Core").join("Message");
     if !msg_dir.is_dir() {
         return Err(format!("missing {} — broken snapshot?", msg_dir.display()));
@@ -713,13 +747,17 @@ pub fn run_inventory(a: &ImportArgs) -> Result<Vec<String>, String> {
 }
 
 /// The `--distinct` mode (batch 14 N1, dry-run only — parse refuses
-/// `--apply`): whitelisted code-column distinct values from the first
-/// sample DB of each requested kind (`--inventory`'s samples). Every
-/// spec is validated against the inventory BEFORE any row is read;
-/// all violations are listed at once (the `plan` convention). Nothing
-/// writes to the snapshot; every DB opens `mode=ro&immutable=1`.
+/// `--apply`): whitelisted code-column distinct values. Without
+/// `--all-dbs` it reads the first sample DB of each requested kind
+/// (`--inventory`'s samples); with `--all-dbs` (batch 15 O2, message
+/// kinds only) it runs the SAME fixed aggregation in EVERY DB of the
+/// kind and sums the per-DB counts. Every spec is validated against
+/// the inventory BEFORE any row is read; all violations are listed at
+/// once (the `plan` convention). Nothing writes to the snapshot;
+/// every DB opens `mode=ro&immutable=1`.
 pub fn run_distinct(a: &ImportArgs) -> Result<Vec<String>, String> {
     use import_map::MapDb;
+    use rusqlite::types::Value as SV;
 
     let p = prepare(a)?;
     let g = gather_inventories(&p)?;
@@ -767,6 +805,47 @@ pub fn run_distinct(a: &ImportArgs) -> Result<Vec<String>, String> {
             errs.len(),
             errs.join("\n  - ")
         ));
+    }
+
+    // Batch 15 O2: --all-dbs runs the SAME fixed aggregation in every
+    // DB of the requested message kind and sums the counts. Open and
+    // query failures are COUNTED, not printed one by one (1 472 DBs —
+    // the report is an aggregate).
+    if a.all_dbs {
+        let msg_dir = p.uid_dir.join("Core").join("Message");
+        let names = message_db_names(&p.uid_dir)?;
+        let mut lines = Vec::new();
+        for spec in &a.distinct {
+            let mut dbs = 0usize;
+            let mut opened = 0usize;
+            let mut failed = 0usize;
+            let mut per_db: Vec<Vec<(SV, i64)>> = Vec::new();
+            for (name, k) in &names {
+                let map_kind = match k {
+                    DbKind::OneToOne(_) => MapDb::OneToOne,
+                    DbKind::Group(_) => MapDb::Group,
+                    DbKind::StrangerBox => MapDb::Stranger,
+                    // `undefined.db` and unknown names stay skipped.
+                    DbKind::Undefined | DbKind::Other => continue,
+                };
+                if map_kind != spec.kind {
+                    continue;
+                }
+                dbs += 1;
+                match open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile) {
+                    Ok(conn) => match distinct::group_counts(&conn, &spec.table, &spec.column) {
+                        Ok(rows) => {
+                            opened += 1;
+                            per_db.push(rows);
+                        }
+                        Err(_) => failed += 1,
+                    },
+                    Err(_) => failed += 1,
+                }
+            }
+            lines.extend(distinct::all_dbs_report(spec, dbs, opened, failed, &per_db));
+        }
+        return Ok(lines);
     }
 
     // All specs valid: read the samples, one open per kind.
@@ -860,6 +939,12 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         ));
     }
 
+    // Batch 15 O4 (KQ2 on the import path): the self-sent sender
+    // substitution seed — `ZR_OWN_UID`, else `--own-uid-from-settings`.
+    // The value is never printed; only whether one was resolved.
+    let own_uid = resolve_own_uid(a.own_uid_from_settings);
+    lines.push(format!("import dry-run: own_uid set: {}", own_uid.is_some()));
+
     // The shadow target: a temp COPY opened read-only, never the live
     // store. Without --shadow-copy the classification is skipped and
     // only extraction counts are reported.
@@ -906,7 +991,7 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         match open_desktop_db(&index_path, p.passphrase.as_str(), p.profile) {
             Ok(conn) => {
                 dbs_opened += 1;
-                let opts = ExtractOpts { kind: MapDb::Index, db_id: None, cursor: None };
+                let opts = ExtractOpts { kind: MapDb::Index, db_id: None, cursor: None, own_uid: own_uid.as_deref() };
                 match import_map::extract(&conn, &plan, &opts) {
                     Ok((writes, skips)) => {
                         c_conv.skipped += skips.conversation;
@@ -1001,7 +1086,7 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         } else {
             None
         };
-        let opts = ExtractOpts { kind: map_kind, db_id, cursor };
+        let opts = ExtractOpts { kind: map_kind, db_id, cursor, own_uid: own_uid.as_deref() };
         let mut extracted_here = 0usize;
         match import_map::extract(&conn, &plan, &opts) {
             Ok((writes, skips)) => {
@@ -1228,6 +1313,8 @@ mod tests {
             shadow_copy: None,
             delta: false,
             distinct: Vec::new(),
+            all_dbs: false,
+            own_uid_from_settings: false,
             apply: false,
             help: false,
         }
@@ -2161,6 +2248,18 @@ mod tests {
         ('m5', 'chat.photo', 0, 1, 0, 0, 'y', 'y');
       INSERT INTO message (msgId, msgType, status) VALUES ('m6', x'00', 0);";
 
+    /// A second one2one fixture with a DIFFERENT code distribution, so
+    /// the `--all-dbs` sum is observable (batch 15 O2).
+    #[cfg(windows)]
+    const CODES_DB_SQL2: &str = "CREATE TABLE message (
+        msgId TEXT PRIMARY KEY, msgType INTEGER, status INTEGER,
+        src INTEGER, cmd INTEGER, isLocalMsgId INTEGER, content TEXT, message TEXT
+      );
+      INSERT INTO message (msgId, msgType, status, src, cmd, isLocalMsgId, content, message) VALUES
+        ('n1', 1, 0, 1, 0, 0, 'aa', 'aa'),
+        ('n2', 3, 0, 1, 0, 0, 'bb', 'bb'),
+        ('n3', 3, 0, 1, 0, 0, 'cc', 'cc');";
+
     /// A synthetic snapshot whose Index.db and every message-DB kind
     /// carry the code-column fixture. Returns the key path.
     #[cfg(windows)]
@@ -2320,6 +2419,129 @@ mod tests {
             e.contains("inventory Core/Message/g222.db") || e.contains("g222.db"),
             "{e}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 15 O2: --distinct --all-dbs (end to end) -------------------
+
+    #[test]
+    #[cfg(windows)]
+    fn run_distinct_all_dbs_sums_every_db_of_the_kind() {
+        let dir = temp_dir("dstall");
+        let pass = "fakefakefakefakefakefakefake1234";
+        // Index + TWO one2one DBs with different distributions, one
+        // group DB, one stranger DB, plus the skipped non-DBs.
+        write_manifest_json(&dir, valid_manifest_json());
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        make_cipher_db_sql(&core.join("Index.db"), pass, INDEX_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("111.db"), pass, CODES_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("112.db"), pass, CODES_DB_SQL2);
+        make_cipher_db_sql(&core.join("Message").join("g222.db"), pass, CODES_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("stranger_box.db"), pass, CODES_DB_SQL);
+        for name in ["undefined.db", "weird.db"] {
+            std::fs::write(core.join("Message").join(name), b"fake").unwrap();
+        }
+        let key = dir.join("d7.bin");
+        fake_d7_key_file(&key, pass);
+        let uin = sha12(pass.as_bytes());
+
+        let mut a = distinct_args(
+            &dir,
+            &uin,
+            &key,
+            &["one2one:message.msgType", "group:message.msgType"],
+        );
+        a.all_dbs = true;
+        let lines = run_distinct(&a).unwrap();
+        let joined = lines.join("\n");
+        // one2one has TWO DBs: the header says so and the counts are
+        // the SUM (111.db: 1 x 2, 2 x 1, NULL x 1, chat.photo x 1,
+        // blob x 1; 112.db: 1 x 1, 3 x 2).
+        assert!(
+            joined.contains(
+                "distinct: one2one:message.msgType source=ALL dbs=2 opened=2 failed=0"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("  1 x 3"), "the summed count: {joined}");
+        assert!(joined.contains("  3 x 2"), "{joined}");
+        assert!(joined.contains("  2 x 1"), "{joined}");
+        assert!(joined.contains("  chat.photo x 1"), "{joined}");
+        // group has ONE DB: dbs=1, the same counts as the sample.
+        assert!(
+            joined.contains("distinct: group:message.msgType source=ALL dbs=1 opened=1 failed=0"),
+            "{joined}"
+        );
+        assert!(joined.contains("  1 x 2"), "{joined}");
+        // `undefined.db`/`weird.db` are never counted as DBs of a kind.
+        assert!(!joined.contains("dbs=3"), "{joined}");
+        // Privacy: the content columns were never read.
+        assert!(!joined.contains("sentences"), "{joined}");
+        assert!(!joined.contains("words"), "{joined}");
+        // Immutable proof: nothing was created in the snapshot.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(
+            names,
+            vec![
+                "111.db".to_string(),
+                "112.db".to_string(),
+                "g222.db".to_string(),
+                "stranger_box.db".to_string(),
+                "undefined.db".to_string(),
+                "weird.db".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 15 O4: own-uid on the import path --------------------------
+
+    #[test]
+    fn own_uid_decision_env_wins_and_shapes_are_validated() {
+        const FAKE_UID: &str = "1234567890123456789"; // never a real one
+        // A valid env uid wins over any settings uid (per-run override).
+        assert_eq!(
+            own_uid_decision(Some(FAKE_UID), Some("9876543210987654321")).as_deref(),
+            Some(FAKE_UID)
+        );
+        // Without env, the settings uid is used.
+        assert_eq!(
+            own_uid_decision(None, Some("9876543210987654321")).as_deref(),
+            Some("9876543210987654321")
+        );
+        // A badly shaped candidate behaves as absent — account.rs's
+        // rule: a bad config never becomes a sender.
+        assert_eq!(
+            own_uid_decision(Some("nope"), Some(FAKE_UID)).as_deref(),
+            Some(FAKE_UID)
+        );
+        assert_eq!(own_uid_decision(Some("nope"), Some("1234")), None);
+        assert_eq!(own_uid_decision(None, Some("")), None);
+        assert_eq!(own_uid_decision(None, Some("bad-shape")), None);
+        assert_eq!(own_uid_decision(None, None), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_mapping_dry_reports_own_uid_shape_only() {
+        let dir = temp_dir("dryown");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        let map_path = dir.join("mapping.json");
+        std::fs::write(&map_path, DRY_MAPPING_JSON).unwrap();
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.mapping = Some(map_path);
+        let lines = run_mapping_dry(&a).unwrap();
+        let joined = lines.join("\n");
+        // The own-uid line reports ONLY whether one was resolved —
+        // the value never appears, whatever the environment carries.
+        assert!(
+            joined.contains("import dry-run: own_uid set: true")
+                || joined.contains("import dry-run: own_uid set: false"),
+            "{joined}"
+        );
+        assert!(!joined.contains("1234567890123456789"), "{joined}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

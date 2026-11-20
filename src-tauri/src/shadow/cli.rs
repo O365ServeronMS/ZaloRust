@@ -46,14 +46,15 @@ modes (one per run; all dry-run only — --apply stays fail-closed):
   --inventory                schema inventory of Core\\Index.db + ONE sample
                              per message-DB kind (names/types/counts only);
                              --out <file> writes the same as JSON
-  --distinct <kind>:<t>.<c>  whitelisted code-column distinct values from the
-                             first sample DB of that kind (batch 14): the
-                             column NAME must match the code-column whitelist
-                             (type/kind/status/state/cmd/.../is*/has*), values
-                             render code-shape only — numbers, NULL, <=32-char
-                             [A-Za-z0-9._:-] tokens, else text(len,h12) /
-                             blob(len) fingerprints; repeatable, max 10 per
-                             run
+  --distinct <kind>:<t>.<c>  whitelisted code-column distinct values (batch 14):
+                             the column NAME must match the code-column
+                             whitelist (type/kind/status/state/cmd/.../is*/
+                             has*), values render code-shape only — numbers,
+                             NULL, <=32-char [A-Za-z0-9._:-] tokens, else
+                             text(len,h12) / blob(len) fingerprints;
+                             repeatable, max 10 per run; from the FIRST
+                             sample DB of that kind, or with --all-dbs (batch
+                             15) summed across EVERY DB of a message kind
   --mapping <file>           mapping dry run (docs/import-mapping.md): extract
   [--shadow-copy <dir>]      per the mapping JSON and, with --shadow-copy,
   [--delta]                  classify each write READ-ONLY against a temp
@@ -73,6 +74,14 @@ flags:
 --delta          skip rows at/before the per-DB import cursor (dry-run only)
 --distinct       see the modes above: whitelisted code-column distinct
                   values, repeatable, max 10 per run, dry-run only
+--all-dbs        with --distinct: aggregate the column across EVERY DB of
+                  the message kind (one2one/group/stranger), summing
+                  per-DB counts (batch 15); an index spec is refused —
+                  there is exactly one Core\\Index.db
+--own-uid-from-settings   with --mapping/--shadow-copy: seed the import
+                  extraction's self-sent sender from settings.shadow.own_uid
+                  read through the settings loader (never printed; env
+                  ZR_OWN_UID, shape-validated, wins as the override)
 --dry-run        inventory only, zero writes (the default)
 --apply          write into the shadow DB (not wired yet: fail-closed)
 --help           this usage, exit 0";
@@ -110,6 +119,19 @@ pub struct ImportArgs {
     /// from the first sample DB of each kind. Repeatable, max
     /// `distinct::MAX_PER_RUN` per run; dry-run only.
     pub distinct: Vec<import::distinct::DistinctSpec>,
+    /// `--all-dbs` (batch 15 O2): with `--distinct`, run the same
+    /// fixed aggregation in EVERY DB of the requested message kind
+    /// and sum the counts, instead of reading the first sample.
+    /// Parse refuses it without `--distinct` and for `index` specs
+    /// (there is exactly one `Core\Index.db`).
+    pub all_dbs: bool,
+    /// `--own-uid-from-settings` (batch 15 O4): read the own uid from
+    /// `settings.shadow.own_uid` through the settings loader and seed
+    /// the import extraction's self-sent sender substitution with it
+    /// (the value is never printed). Env `ZR_OWN_UID` — validated
+    /// with `account::valid_uid` — wins as the per-run override.
+    /// Mapping dry-run mode only.
+    pub own_uid_from_settings: bool,
     /// `--apply`: write into the shadow DB (still fail-closed).
     pub apply: bool,
     /// `--help`: print usage, exit 0 (no other flag required).
@@ -185,6 +207,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let mut distinct: Vec<import::distinct::DistinctSpec> = Vec::new();
     let (mut dry_run, mut apply, mut help, mut inventory, mut delta) =
         (false, false, false, false, false);
+    let (mut all_dbs, mut own_uid_from_settings) = (false, false);
 
     let mut i = 0;
     while i < args.len() {
@@ -243,6 +266,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             "--help" => set_bool_once(&mut help, flag)?,
             "--inventory" => set_bool_once(&mut inventory, flag)?,
             "--delta" => set_bool_once(&mut delta, flag)?,
+            // Batch 15 O2/O4: valueless mode riders.
+            "--all-dbs" => set_bool_once(&mut all_dbs, flag)?,
+            "--own-uid-from-settings" => set_bool_once(&mut own_uid_from_settings, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -299,6 +325,34 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 .into(),
         );
     }
+    // Batch 15 O2: --all-dbs rides the --distinct mode, and only a
+    // message kind has more than one DB to aggregate.
+    if all_dbs && distinct.is_empty() {
+        return Err(
+            "--all-dbs needs --distinct (it aggregates every DB of the requested message kind)"
+                .into(),
+        );
+    }
+    if all_dbs {
+        if let Some(bad) = distinct
+            .iter()
+            .find(|s| s.kind == super::import_map::MapDb::Index)
+        {
+            return Err(format!(
+                "--all-dbs with {}: the snapshot has exactly ONE index DB — drop --all-dbs",
+                import::distinct::spec_str(bad)
+            ));
+        }
+    }
+    // Batch 15 O4: --own-uid-from-settings rides the mapping mode
+    // (that is where the import extraction runs).
+    if own_uid_from_settings && mapping.is_none() && shadow_copy.is_none() {
+        return Err(
+            "--own-uid-from-settings needs the mapping mode: add --mapping <file> \
+             (it seeds the import extraction's self-sent sender)"
+                .into(),
+        );
+    }
     if delta && mapping.is_none() && shadow_copy.is_none() {
         return Err(
             "--delta needs the mapping mode: add --mapping <file> and/or \
@@ -319,6 +373,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             shadow_copy,
             delta,
             distinct,
+            all_dbs,
+            own_uid_from_settings,
             apply: false,
             help: true,
         });
@@ -335,6 +391,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         shadow_copy,
         delta,
         distinct,
+        all_dbs,
+        own_uid_from_settings,
         apply,
         help: false,
     })
@@ -863,6 +921,113 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(e.contains("--distinct cannot be combined"), "{e}");
+    }
+
+    // --- batch 15: --all-dbs / --own-uid-from-settings ---------------------
+
+    #[test]
+    fn parse_all_dbs_needs_distinct_and_refuses_index_specs() {
+        // Needs --distinct (whatever other mode was picked).
+        let e = parse(&with_base(&["--all-dbs"])).unwrap_err();
+        assert!(e.contains("--all-dbs needs --distinct"), "{e}");
+        let e = parse(&with_base(&["--all-dbs", "--inventory"])).unwrap_err();
+        assert!(e.contains("--all-dbs needs --distinct"), "{e}");
+        // An index spec is refused: exactly one Core\Index.db.
+        let e = parse(&with_base(&[
+            "--all-dbs",
+            "--distinct",
+            "index:conversation.isGroup",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains(
+                "--all-dbs with index:conversation.isGroup: the snapshot has exactly ONE index DB"
+            ),
+            "{e}"
+        );
+        // The message kinds aggregate across every DB of the kind.
+        let a = parse(&with_base(&[
+            "--all-dbs",
+            "--distinct",
+            "one2one:message.msgType",
+            "--distinct",
+            "group:message.msgType",
+            "--distinct",
+            "stranger:message.msgType",
+        ]))
+        .unwrap();
+        assert!(a.all_dbs);
+        assert_eq!(a.distinct.len(), 3);
+        // Duplicates are a parse error like every valueless flag.
+        let e = parse(&with_base(&[
+            "--all-dbs",
+            "--distinct",
+            "one2one:message.msgType",
+            "--all-dbs",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--all-dbs given twice"), "{e}");
+        // A CONSISTENT invocation yields to help…
+        let a = parse(&args(&[
+            "--help",
+            "--all-dbs",
+            "--distinct",
+            "one2one:message.msgType",
+        ]))
+        .unwrap();
+        assert!(a.help);
+    }
+
+    #[test]
+    fn parse_own_uid_from_settings_needs_the_mapping_mode() {
+        // Outside the mapping mode the flag has nothing to seed.
+        let e = parse(&with_base(&["--own-uid-from-settings"])).unwrap_err();
+        assert!(e.contains("--own-uid-from-settings needs the mapping mode"), "{e}");
+        let e = parse(&with_base(&[
+            "--own-uid-from-settings",
+            "--distinct",
+            "one2one:message.msgType",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--own-uid-from-settings needs the mapping mode"), "{e}");
+        // Either mapping-mode selector is enough.
+        let a = parse(&with_base(&["--own-uid-from-settings", "--mapping", "m.json"])).unwrap();
+        assert!(a.own_uid_from_settings);
+        let a = parse(&with_base(&[
+            "--own-uid-from-settings",
+            "--shadow-copy",
+            r"D:\s",
+        ]))
+        .unwrap();
+        assert!(a.own_uid_from_settings);
+        // It rides along with --delta (still the mapping mode).
+        let a = parse(&with_base(&[
+            "--own-uid-from-settings",
+            "--delta",
+            "--mapping",
+            "m.json",
+        ]))
+        .unwrap();
+        assert!(a.own_uid_from_settings);
+        assert!(a.delta);
+        // Duplicates are an error.
+        let e = parse(&with_base(&[
+            "--own-uid-from-settings",
+            "--mapping",
+            "m.json",
+            "--own-uid-from-settings",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--own-uid-from-settings given twice"), "{e}");
+        // A CONSISTENT invocation yields to help…
+        let a = parse(&args(&[
+            "--help",
+            "--own-uid-from-settings",
+            "--mapping",
+            "m.json",
+        ]))
+        .unwrap();
+        assert!(a.help);
     }
 
     #[test]

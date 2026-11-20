@@ -281,3 +281,12 @@ mod maint_replay;
 /// `ZR_D7_KEY_FILE`, `ZR_UIN_HASH`, `ZR_MAPPING`.
 #[cfg(test)]
 mod probe_import_overlap;
+
+/// Code cross-tab probe (batch 15 O1): resolve the Desktop NUMERIC
+/// msgType codes by joining EVERY snapshot message DB's
+/// (msgId, msgType) pairs against the shadow copy's payload
+/// `$.msgType` strings — the type arbiter that needs no deploy.
+/// Ignored: needs `ZR_SNAPSHOT_DIR`, `ZR_D7_KEY_FILE`, `ZR_UIN_HASH`,
+/// `ZR_MAPPING`.
+#[cfg(test)]
+mod probe_import_codes;

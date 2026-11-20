@@ -1,19 +1,26 @@
 # Desktop → shadow mapping (Phase 2.3/2.4 tooling)
 
-This is the how-to for the tools batch 12 added to `zalors import`
-and the batch-14 addition:
+This is the how-to for the tools batch 12 added to `zalors import`,
+the batch-14 addition, and the batch-15 additions:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
 - `--distinct` — whitelisted distinct values of one CODE column in a
   sample DB (batch 14 N1: the tool that settles code tables without
-  ever printing content);
-- `--mapping <file>` + `--shadow-copy <dir>` (+ `--delta`) — the
-  declarative mapping dry run with a read-only classification against
-  a temp COPY of your shadow store (item 2.4);
+  ever printing content); with `--all-dbs` (batch 15) it sums the
+  same aggregation across EVERY DB of a message kind;
+- `--mapping <file>` + `--shadow-copy <dir>` (+ `--delta`, and batch
+  15's `--own-uid-from-settings`) — the declarative mapping dry run
+  with a read-only classification against a temp COPY of your shadow
+  store (item 2.4);
 - `probe_import_overlap` — the 2.3 acceptance probe (≥99% msgId
   overlap, 100% type/ts/sender on the matches) that a mapping must
-  pass before any apply step is even proposed.
+  pass before any apply step is even proposed; batch 15 adds the
+  `type_str` axis (the meaningful type comparison today);
+- `probe_import_codes` (batch 15) — the code cross-tab that resolves
+  the Desktop NUMERIC msgType codes against the shadow payload's
+  original wire `$.msgType` strings, matched by msgId — the type
+  arbiter that needs no deploy.
 
 Everything here is **dry-run only**: `--apply` stays fail-closed until
 P2 item 2.5 is explicitly approved (see "What still needs you"
@@ -116,6 +123,55 @@ target\debug\zalors.exe import `
   sentence-like TEXT values) is not a code column in practice.
 - Output of a good code column looks like
   `  1 x 57` — value `1`, seen on 57 rows of the sample.
+
+## 1b. The whole kind at once (`--all-dbs`, batch 15)
+
+A sample DB can miss most of a code vocabulary (the batch-14 sample
+had 61 rows and a 3-code vocabulary; the real one2one kind turned out
+to hold 16 codes). Adding `--all-dbs` runs the SAME fixed aggregation
+in EVERY DB of the requested message kind and sums the counts:
+
+```powershell
+target\debug\zalors.exe import `
+  --from-snapshot "D:\ZaloRust Data\import-snapshot\2026-MM-DD" `
+  --account default --uin-hash dca62c394a68 `
+  --key-file D:\.opencode\d7\zalo-desktop-uin-key-2026-11-19.bin `
+  --distinct one2one:message.msgType --distinct group:message.msgType `
+  --distinct stranger:message.msgType --all-dbs
+```
+
+- Message kinds only — an `index` spec with `--all-dbs` is a parse
+  error (there is exactly one `Core\Index.db`); it rides the
+  `--distinct` mode (max 10 specs per run, dry-run only).
+- Same whitelist, same renderer, cap 50 summed values. The sums are
+  exact for any column with ≤ 50 distinct values per DB; a column
+  that trips the per-DB cap in ANY DB is flagged with the >50 marker.
+- Open/query failures are counted in the header
+  (`dbs=<kind count> opened=<counted> failed=<skipped>`), not
+  printed one DB at a time.
+
+## 1c. Resolving the codes (`probe_import_codes`, batch 15)
+
+`--distinct` gives you the vocabulary but not the meaning. The code
+cross-tab joins EVERY snapshot message DB's (msgId, msgType) pairs —
+read through the mapping's own `msgId`/`msgType` column names only —
+against the shadow copy's `messages.payload_json $.msgType` (the
+ORIGINAL wire string the capture path stored, even while the soaking
+build's numeric `type` is degenerate):
+
+```powershell
+$env:ZR_SNAPSHOT_DIR = "D:\ZaloRust Data\import-snapshot\2026-MM-DD"
+$env:ZR_D7_KEY_FILE  = "D:\.opencode\d7\zalo-desktop-uin-key-2026-11-19.bin"
+$env:ZR_UIN_HASH     = "dca62c394a68"
+$env:ZR_MAPPING      = "D:\...\mapping.json"
+cargo test --lib probe_import_codes -- --ignored --nocapture
+```
+
+Output: `code-cross-tab: <desktop_code> | <shadow msgType> | <count>`
+rows, then per-code totals with the no-shadow-match counts, the
+dominant msgType and its purity. Fill the mapping's `msgType` table
+from the codes with **purity ≥ 90% and ≥ 5 matched rows**; leave the
+rest for a re-run after more soak coverage.
 
 ## 2. Write the mapping JSON
 
@@ -250,6 +306,16 @@ target\debug\zalors.exe import `
 to a temp dir and the copy is opened `query_only` — the live store is
 never opened by SQLite.)
 
+Batch 15 (KQ2 applied to the import path): `--own-uid-from-settings`
+seeds the extraction's self-sent sender substitution
+(`uidFrom == "0"` rows) from `settings.shadow.own_uid`, read through
+the settings loader — the value is never printed; the dry run only
+reports `own_uid set: true/false`. Env `ZR_OWN_UID` (shape-validated,
+5..=32 ASCII digits) wins over the settings file when set — the same
+override the repair/replay probes use. Without either, self-sent
+import rows keep a NULL sender (visible in the probe as the
+missing-sender count).
+
 Output, per entity mapped:
 
 ```
@@ -312,8 +378,16 @@ Per conversation (h12 of the conversation id only — never the raw
 id, never message content):
 
 ```
-overlap: conv=1a2b3c4d5e6f kind=one2one desktop=210 shadow=205 matched=209 pct=99.5% type=209/209 ts=209/209 sender=205/205 (compared 205)
+overlap: conv=1a2b3c4d5e6f kind=one2one desktop=210 shadow=205 matched=209 pct=99.5% type=209/209 type_str=209/209 (compared 209) ts=209/209 sender=205/205 (compared 205)
 ```
+
+Two type axes (batch 15): `type` is the NUMERIC axis — degenerate
+while the still-soaking pre-H1-fix build writes `type=100` for every
+real message — and `type_str` is the meaningful one: the import's
+MAPPED msgType string vs the shadow payload's `$.msgType` (the
+original wire string). The first line reports both; a mapping whose
+`msgType` table is wrong shows up as `type_str` disagreements long
+before the numeric axis means anything.
 
 Totals and the verdict lines at the end:
 
@@ -328,10 +402,12 @@ overlap: AC sender 100% on matches: NOT MET (missing-sender matches are shown ab
   direction: "msgId Desktop trùng msgId shadow ≥ 99%").
 - Sender agreement is over the matches where BOTH sides have a
   sender; self-sent Desktop rows keep a NULL sender in the import
-  (the capture path substitutes the configured own uid), and those
-  matches are reported in the `(compared N)` / missing-sender line —
-  nothing is hidden, decide whether they are acceptable or fix them
-  in the mapping/own-uid configuration.
+  unless an own uid is configured — `ZR_OWN_UID` for the probe
+  (validated, printed only as `own_uid set: true/false`) or the
+  CLI's `--own-uid-from-settings` — and those matches are reported
+  in the `(compared N)` / missing-sender line — nothing is hidden,
+  decide whether they are acceptable or fix them in the
+  mapping/own-uid configuration.
 - The probe is pure comparison plus reads: it opens the snapshot
   through the batch-6 guards and the shadow DB through a temp copy;
   it writes nothing and asserts nothing about your data (the verdict

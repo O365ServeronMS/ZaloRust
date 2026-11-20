@@ -35,6 +35,10 @@
 //!   A media-kind `content` column that holds a JSON text becomes the
 //!   parsed OBJECT in the payload (the wire shape; that is what keeps
 //!   `writer::content_hash` and attachment extraction comparable).
+//!   Batch 15 O4 (KQ2 applied to the import path): the self-sent
+//!   sender substitution is `normalize::sender_for` — the SAME rule
+//!   the capture path applies — seeded from `ExtractOpts::own_uid`
+//!   (env `ZR_OWN_UID` or `--own-uid-from-settings`, never printed).
 //! - `conversation` (fields `id`*, `is_group`*, `title`,
 //!   `avatar_url`, `last_msg_id`, `last_ts`, `raw`),
 //!   `contact` (`user_id`*, `display_name`, `avatar_url`, `raw`),
@@ -899,13 +903,19 @@ pub fn next_cursor(conn: &Connection, ep: &EntityPlan) -> Result<Option<ImportCu
 
 /// Per-row extraction options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtractOpts {
+pub struct ExtractOpts<'a> {
     pub kind: MapDb,
     /// Digits from the DB file name (`123.db` → Some(123)); None for
     /// index/stranger.
     pub db_id: Option<u64>,
     /// L4 `--delta`: skip rows with `rowid <= max_rowid AND ts <= max_ts`.
     pub cursor: Option<ImportCursor>,
+    /// Own-uid for the self-sent sender substitution (batch 15 O4,
+    /// KQ2): rows with `uidFrom == "0"` (or no uidFrom) get this as
+    /// `sender_id` through `normalize::sender_for` — the SAME rule
+    /// the capture path applies. `None` keeps the sender NULL. The
+    /// value is never printed or logged anywhere.
+    pub own_uid: Option<&'a str>,
 }
 
 /// Per-entity skip counts (rows the mapping read but could not turn
@@ -973,7 +983,14 @@ pub fn extract(
                     .map(|c| (ep.ts_col().expect("plan guarantees a unit ts"), c));
                 let rows = read_source_rows(conn, ep, delta)?;
                 for vals in &rows {
-                    match message_row(ep, vals, &plan.msg_type, opts.kind, opts.db_id) {
+                    match message_row(
+                        ep,
+                        vals,
+                        &plan.msg_type,
+                        opts.kind,
+                        opts.db_id,
+                        opts.own_uid,
+                    ) {
                         Some(w) => out.push(w),
                         None => skips.message += 1,
                     }
@@ -989,6 +1006,59 @@ pub fn count_rows(conn: &Connection, ep: &EntityPlan) -> Result<i64, String> {
     let q = quote_ident(&ep.table)?;
     conn.query_row(&format!("SELECT count(*) FROM {q}"), [], |r| r.get(0))
         .map_err(|e| format!("count(*) on {:?} failed: {e}", ep.table))
+}
+
+/// (batch 15 O1) The minimal code-cross-tab extractor: one
+/// (msgId, raw Desktop msgType) pair per row of the mapped message
+/// table, reading ONLY the two source columns the mapping names for
+/// the `msgId`/`msgType` targets — nothing else. Both must be PLAIN
+/// column mappings: a const/expr `msgType` is refused (fail closed —
+/// the cross-tab must see the raw stored code, never a mapping
+/// product). Rows whose msgId or msgType is NULL/BLOB are skipped and
+/// counted (they can never join). No other column is ever read; no
+/// row value other than the pair itself ever leaves this function.
+pub fn extract_msg_codes(
+    conn: &Connection,
+    ep: &EntityPlan,
+) -> Result<(Vec<(String, String)>, usize), String> {
+    let col_of = |target: &str| -> Result<String, String> {
+        let Some(spec) = ep.fields.iter().find(|f| f.target == target) else {
+            return Err(format!(
+                "extract_msg_codes: entities.message has no '{target}' target \
+                 — the code cross-tab needs msgId + msgType"
+            ));
+        };
+        match &spec.res {
+            FieldRes::Col(i) => Ok(ep.select[*i].clone()),
+            _ => Err(format!(
+                "extract_msg_codes: entities.message.columns.{target} must map a PLAIN \
+                 source column (a const/expr value is a mapping product, not the raw \
+                 Desktop code)"
+            )),
+        }
+    };
+    let id_col = col_of("msgId")?;
+    let mt_col = col_of("msgType")?;
+    let qt = quote_ident(&ep.table)?;
+    let qid = quote_ident(&id_col)?;
+    let qmt = quote_ident(&mt_col)?;
+    let sql = format!("SELECT {qid}, {qmt} FROM {qt} ORDER BY rowid");
+    let mut st = conn
+        .prepare(&sql)
+        .map_err(|e| format!("{}: {e}", ep.table))?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, SV>(0)?, r.get::<_, SV>(1)?)))
+        .map_err(|e| format!("{}: {e}", ep.table))?;
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for row in rows {
+        let (idv, mtv) = row.map_err(|e| format!("{}: {e}", ep.table))?;
+        match (sv_str(&idv), sv_str(&mtv)) {
+            (Some(id), Some(mt)) => out.push((id, mt)),
+            _ => skipped += 1,
+        }
+    }
+    Ok((out, skipped))
 }
 
 /// SELECT every referenced column (identifier-quoted), optionally
@@ -1237,6 +1307,7 @@ fn message_row(
     mtm: &BTreeMap<String, String>,
     kind: MapDb,
     db_id: Option<u64>,
+    own_uid: Option<&str>,
 ) -> Option<Write> {
     // msgId (required, non-empty).
     let msg_id = string_field(ep, vals, "msgId", db_id)?;
@@ -1268,13 +1339,11 @@ fn message_row(
         return None;
     }
 
-    // uidFrom == "0" marks self-sent; import has no own-uid to
-    // substitute (the capture path may fill the NULL sender later via
-    // the writer's COALESCE).
-    let sender_id = match uid_from.as_deref() {
-        Some(f) if f != "0" => Some(f.to_string()),
-        _ => None,
-    };
+    // Self-sent sender substitution — the ONE shared rule, reused
+    // (batch 15 O4): `uidFrom == "0"` (or absent) + a configured own
+    // uid becomes the sender, else NULL. The payload below keeps the
+    // raw uidFrom ("0") exactly like the capture envelope.
+    let sender_id = super::normalize::sender_for(uid_from.as_deref(), own_uid);
 
     // msgType: the configurable Desktop→web table, pass-through by
     // default; the mapped string is what lands in the payload.
@@ -2132,6 +2201,7 @@ mod tests {
             kind: MapDb::OneToOne,
             db_id: Some(123),
             cursor: None,
+            own_uid: None,
         };
         let (writes, skips) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 0);
@@ -2206,6 +2276,138 @@ mod tests {
     }
 
     #[test]
+    fn extract_substitutes_own_uid_on_self_sent_rows() {
+        // Batch 15 O4 (KQ2 applied to the import path): with an own
+        // uid configured, self-sent rows get a sender through the SAME
+        // `normalize::sender_for` rule the capture path applies; the
+        // payload keeps the raw uidFrom ("0"), exactly like the
+        // capture envelope. Without one the sender stays NULL.
+        const FAKE_UID: &str = "1234567890123456789";
+        let conn = desktop_like();
+        // Row 106: uidFrom NULL — the shared rule treats an absent
+        // uidFrom as self-sent too (no fork of the rule).
+        conn.execute_batch(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) VALUES
+               (106, 'c106', NULL, 'u9', 1690000004, 'webchat', 'x');",
+        )
+        .unwrap();
+        let inv = inventories(&conn, &conn);
+        let m = parse_mapping(MAPPING_JSON.as_bytes()).unwrap();
+        let p = plan(&m, &inv).unwrap();
+
+        let sender_of = |writes: &[Write], id: &str| {
+            writes
+                .iter()
+                .find_map(|w| match w {
+                    Write::Message { msg_id, sender_id, .. } if msg_id == id => {
+                        Some(sender_id.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        let (writes, _) = extract(
+            &conn,
+            &p,
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(123),
+                cursor: None,
+                own_uid: Some(FAKE_UID),
+            },
+        )
+        .unwrap();
+        // Row 103 (uidFrom "0"): the own uid, never "0"/NULL.
+        assert_eq!(sender_of(&writes, "103").as_deref(), Some(FAKE_UID));
+        // Row 106 (uidFrom absent): the shared rule substitutes too.
+        assert_eq!(sender_of(&writes, "106").as_deref(), Some(FAKE_UID));
+        // A peer row is untouched by the substitution.
+        assert_eq!(sender_of(&writes, "101").as_deref(), Some("u1"));
+        // The payload keeps the RAW uidFrom ("0") — capture shape.
+        let payload103 = writes
+            .iter()
+            .find_map(|w| match w {
+                Write::Message { msg_id, payload, .. } if msg_id == "103" => Some(payload.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let pay: Value = serde_json::from_str(&payload103).unwrap();
+        assert_eq!(pay["uidFrom"], json!("0"), "the payload keeps the raw uidFrom");
+        // Sender NULL still — the sender_id field, not the payload.
+        let (writes, _) = extract(
+            &conn,
+            &p,
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(123),
+                cursor: None,
+                own_uid: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(sender_of(&writes, "103"), None, "no own uid: stays NULL");
+    }
+
+    #[test]
+    fn extract_msg_codes_reads_only_msgid_and_msgtype() {
+        // Batch 15 O1: the minimal extractor pairs (msgId, raw
+        // Desktop msgType) per row and skips NULL/BLOB values,
+        // counted. The four FAKE rows of desktop_like pair cleanly.
+        let conn = desktop_like();
+        let inv = inventories(&conn, &conn);
+        let m = parse_mapping(MAPPING_JSON.as_bytes()).unwrap();
+        let p = plan(&m, &inv).unwrap();
+        let ep = p.message.as_ref().unwrap();
+        let (pairs, skipped) = extract_msg_codes(&conn, ep).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            pairs,
+            vec![
+                ("101".to_string(), "chat.text.v2".to_string()),
+                ("102".to_string(), "chat.photo".to_string()),
+                ("103".to_string(), "webchat".to_string()),
+                ("104".to_string(), "chat.text.v2".to_string()),
+            ]
+        );
+        // Rows with a NULL/BLOB msgType never join: they are skipped
+        // and counted, never guessed into the tab. (A NULL msgId is
+        // impossible in this fixture — `id INTEGER PRIMARY KEY`
+        // auto-assigns — so that case is covered by the probe's
+        // synthetic end-to-end test, whose msgId is a TEXT pk.)
+        conn.execute_batch(
+            "INSERT INTO msg (id, fromUid, toUid, ts, type, content) VALUES
+               (107, 'u1', 'u2', 1, NULL, 'x'),
+               (108, 'u1', 'u2', 1, x'00', 'x');",
+        )
+        .unwrap();
+        let (pairs, skipped) = extract_msg_codes(&conn, ep).unwrap();
+        assert_eq!(skipped, 2, "NULL msgType + BLOB msgType");
+        assert_eq!(pairs.len(), 4, "only the complete rows pair");
+    }
+
+    #[test]
+    fn extract_msg_codes_refuses_non_plain_or_missing_targets() {
+        let conn = desktop_like();
+        let inv = inventories(&conn, &conn);
+        // A const msgType is a mapping product, not the raw code.
+        let doc = MAPPING_JSON.replace("\"msgType\": \"type\",", "\"msgType\": {\"const\": \"webchat\"},");
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        let p = plan(&m, &inv).unwrap();
+        let e = extract_msg_codes(&conn, p.message.as_ref().unwrap()).unwrap_err();
+        assert!(
+            e.contains("entities.message.columns.msgType must map a PLAIN source column"),
+            "{e}"
+        );
+        // No msgType target at all.
+        let doc = MAPPING_JSON.replace("            \"msgType\": \"type\",\n", "");
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        let p = plan(&m, &inv).unwrap();
+        let e = extract_msg_codes(&conn, p.message.as_ref().unwrap()).unwrap_err();
+        assert!(e.contains("has no 'msgType' target"), "{e}");
+    }
+
+    #[test]
     fn extract_group_kind_uses_idto_and_db_id_const() {
         let conn = desktop_like();
         let inv = inventories(&conn, &conn);
@@ -2221,6 +2423,7 @@ mod tests {
             kind: MapDb::Group,
             db_id: Some(77),
             cursor: None,
+            own_uid: None,
         };
         let (writes, skips) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 0);
@@ -2247,6 +2450,7 @@ mod tests {
             kind: MapDb::Index,
             db_id: None,
             cursor: None,
+            own_uid: None,
         };
         let (writes, skips) = extract(&conn, &p, &opts).unwrap();
         assert_eq!((skips.conversation, skips.contact, skips.group), (0, 0, 0));
@@ -2295,6 +2499,7 @@ mod tests {
             kind: MapDb::OneToOne,
             db_id: Some(1),
             cursor: None,
+            own_uid: None,
         };
         let (writes, skips) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 3, "unparsable ts, no conv source, NULL ts");
@@ -2323,6 +2528,7 @@ mod tests {
             kind: MapDb::OneToOne,
             db_id: Some(1),
             cursor: Some(ImportCursor { max_ts: 300, max_rowid: 2 }),
+            own_uid: None,
         };
         let (writes, _) = extract(&conn, &p, &opts).unwrap();
         // Include iff rowid > 2 OR raw ts > 300: row 3 (rowid 3) is
@@ -2569,7 +2775,7 @@ mod tests {
         let (writes, _) = extract(
             &conn,
             &p,
-            &ExtractOpts { kind: MapDb::OneToOne, db_id: Some(1), cursor: None },
+            &ExtractOpts { kind: MapDb::OneToOne, db_id: Some(1), cursor: None, own_uid: None },
         )
         .unwrap();
         let verdicts: Vec<(&str, Verdict)> = writes

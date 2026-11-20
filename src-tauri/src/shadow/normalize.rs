@@ -242,6 +242,19 @@ fn key_shaped(v: &Value, depth: u32) -> bool {
     }
 }
 
+/// Self-sent sender substitution (KQ2) — the ONE shared rule for the
+/// capture path AND the Desktop import extract (batch 15 O4):
+/// `uidFrom == "0"` (or an absent uidFrom) marks the user's own
+/// message, so the configured own uid becomes the sender; without one
+/// the sender stays NULL rather than pretending "0" is a person. The
+/// import extract must not fork this rule — it calls this helper.
+pub fn sender_for(uid_from: Option<&str>, own_uid: Option<&str>) -> Option<String> {
+    match uid_from {
+        Some("0") | None => own_uid.map(str::to_string),
+        Some(f) => Some(f.to_string()),
+    }
+}
+
 /// Map one E2EE plaintext message forwarded by the bridge tap.
 /// `m` is the decrypted message object; `source` is always `e2ee`.
 ///
@@ -297,12 +310,10 @@ fn message_to_write(
     let kind_str = obj.get("msgType").and_then(Value::as_str).unwrap_or("");
     let kind = msg_type_code(kind_str);
     // Self-sent messages carry uidFrom == "0"; the account's real uid is
-    // learned from the page (handshake getUserId). Without it the sender
-    // stays NULL rather than pretending "0" is a person.
-    let sender_id = match uid_from {
-        Some("0") | None => own_uid.map(str::to_string),
-        Some(f) => Some(f.to_string()),
-    };
+    // a configuration decision (KQ2 — see sender_for, the shared rule
+    // the import extract reuses). Without it the sender stays NULL
+    // rather than pretending "0" is a person.
+    let sender_id = sender_for(uid_from, own_uid);
     // Text: non-E2EE string content, OR a bridge-delivered e2ee plaintext
     // (source 'e2ee' is what the page itself decrypted — it IS text). An
     // E2EE cipher row (base64 content on the capture path) must never land

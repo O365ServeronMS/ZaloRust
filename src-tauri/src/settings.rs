@@ -364,18 +364,56 @@ fn settings_path(app: &AppHandle) -> tauri::Result<PathBuf> {
 }
 
 pub fn load(app: &AppHandle) -> Settings {
-    use crate::jsonfile::Loaded;
     let Ok(path) = settings_path(app) else {
         return Settings::default();
     };
-    match crate::jsonfile::read::<Settings>(&path) {
+    load_file(&path, true)
+}
+
+/// Read + sanitize a settings.json at an explicit path (the shared
+/// loader core). `preserve` writes the `.corrupt-<ts>` copy the app
+/// loader makes when the file turns out to be corrupt; strictly
+/// read-only callers pass false.
+fn load_file(path: &std::path::Path, preserve: bool) -> Settings {
+    use crate::jsonfile::Loaded;
+    match crate::jsonfile::read::<Settings>(path) {
         Loaded::Ok(s) | Loaded::Recovered(s) => s.sanitized(),
         Loaded::Missing => Settings::default(),
         Loaded::Corrupt => {
-            crate::jsonfile::preserve_corrupt(&path);
+            if preserve {
+                crate::jsonfile::preserve_corrupt(path);
+            }
             Settings::default()
         }
     }
+}
+
+/// The settings loader WITHOUT an AppHandle (batch 15 O4): the import
+/// CLI dispatches before Tauri exists, so `--own-uid-from-settings`
+/// reads the same file through the same `jsonfile::read` +
+/// `sanitized()` semantics — but strictly read-only: a corrupt file
+/// is NOT preserved (the import CLI performs zero writes by
+/// construction) and a missing/corrupt file yields the defaults.
+pub fn load_at(path: &std::path::Path) -> Settings {
+    load_file(path, false)
+}
+
+/// The app identifier `settings_path` resolves through Tauri's
+/// app_config_dir — re-derived here because the import CLI runs
+/// before Tauri exists (same string the shadow store helpers use).
+const APP_CONFIG_DIR_ID: &str = "com.o365serveronms.zalors";
+
+/// `<APPDATA>\<identifier>\settings.json` — the file [`load`] reads,
+/// resolved without an AppHandle (batch 15 O4:
+/// `--own-uid-from-settings` on the import CLI). `None` when
+/// APPDATA is not set.
+pub fn path_without_app() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(base)
+            .join(APP_CONFIG_DIR_ID)
+            .join("settings.json"),
+    )
 }
 
 pub fn save(app: &AppHandle, s: &Settings) -> tauri::Result<()> {
@@ -782,6 +820,85 @@ mod tests {
         s.shadow.disk_stop_pct = 3;
         let c = s.clone();
         assert_eq!(s.sanitized().shadow, c.shadow);
+    }
+
+    // --- batch 15 O4: the AppHandle-free settings loader -------------
+
+    /// A fresh unique temp dir (synthetic settings files only).
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("zr-settings-{tag}-{}-{ms}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_at_reads_a_synthetic_file_through_the_same_loader() {
+        // A FAKE uid of the documented shape (never a real one).
+        let dir = tmp("loadat");
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"shadow":{"enabled":true,"own_uid":"1234567890123456789","raw_events_days":9}}"#,
+        )
+        .unwrap();
+        let s = super::load_at(&file);
+        assert!(s.shadow.enabled);
+        assert_eq!(s.shadow.raw_events_days, 9);
+        assert_eq!(s.shadow.own_uid.as_deref(), Some("1234567890123456789"));
+        // The sanitizer runs on this path too (hand-edited clamps).
+        std::fs::write(
+            &file,
+            r#"{"zoom": 99, "shadow":{"backup_interval_hours":0,"disk_warn_pct":200}}"#,
+        )
+        .unwrap();
+        let s = super::load_at(&file);
+        assert_eq!(s.zoom, ZOOM_MAX);
+        assert_eq!(s.shadow.backup_interval_hours, 1);
+        assert_eq!(s.shadow.disk_warn_pct, 100);
+        // Missing file → defaults, no error surface.
+        let s = super::load_at(&dir.join("nope.json"));
+        assert_eq!(s, Settings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_at_never_writes_not_even_for_a_corrupt_file() {
+        // The import CLI's contract is ZERO writes: a corrupt file
+        // yields defaults and leaves the directory untouched (no
+        // `.corrupt-*` copy — that is the app loader's job).
+        let dir = tmp("loadcor");
+        let file = dir.join("settings.json");
+        std::fs::write(&file, "definitely not json").unwrap();
+        let s = super::load_at(&file);
+        assert_eq!(s, Settings::default());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["settings.json".to_string()], "nothing was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_without_app_mirrors_the_app_config_dir_shape() {
+        if let Some(p) = super::path_without_app() {
+            assert!(p.is_absolute());
+            let s = p.to_string_lossy();
+            assert!(
+                s.replace('/', "\\")
+                    .ends_with("com.o365serveronms.zalors\\settings.json"),
+                "{s}"
+            );
+        } else {
+            // APPDATA unset (unusual, but the function must not panic).
+            assert!(std::env::var_os("APPDATA").is_none());
+        }
     }
 
     #[test]
