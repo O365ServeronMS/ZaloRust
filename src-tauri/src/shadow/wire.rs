@@ -258,12 +258,21 @@ pub fn decode_rest_body(data: &str, key: &[u8; 16]) -> Option<Value> {
 
 /// Stored shape for a REST event: the decoded inner envelope
 /// `{error_code, data}` when decoded, else `{error_code, data, undecoded}`.
+///
+/// R1 (batch 19): a decrypt whose INNER envelope still has a STRING
+/// `data` is flagged `undecoded: true` like a failed decrypt — the
+/// pre-H2 legacy rows (ids < 800) show exactly that shape stored
+/// unflagged, which made `rest_stats` and the coverage probes call a
+/// ciphertext row "decoded". With the flag, no NEW stored envelope
+/// with a string `data` can ever look decoded (the payload under it
+/// is unreachable: `normalize::unwrap_payload` only descends strings
+/// that parse as JSON, and a cipher string never does).
 pub fn rest_envelope(endpoint: &str, outer: &Value, key: Option<&[u8; 16]>) -> Value {
     let ec = outer.get("error_code").cloned().unwrap_or(Value::Null);
     let data_s = outer.get("data").and_then(Value::as_str);
     let mut env = match (data_s, key) {
         (Some(s), Some(k)) => match decode_rest_body(s, k) {
-            Some(inner) => inner,
+            Some(inner) => flag_string_data(inner),
             None => json!({
                 "error_code": ec,
                 "data": truncate_str(s),
@@ -287,6 +296,35 @@ pub fn rest_envelope(endpoint: &str, outer: &Value, key: Option<&[u8; 16]>) -> V
 
 fn truncate_str(s: &str) -> String {
     s.chars().take(2048).collect()
+}
+
+/// R1 (batch 19): a decrypted inner whose `data` is STILL a string
+/// carries an unreachable payload — flag it `undecoded: true` (see
+/// `rest_envelope`'s doc). A bare non-object decrypt (e.g. a scalar
+/// JSON string) cannot carry the flag — it has no object to insert
+/// into — and stays unflagged; `classify_rest_envelope` still counts
+/// it by the outer's shape.
+fn flag_string_data(mut inner: Value) -> Value {
+    if data_is_opaque_string(&inner) {
+        if let Some(o) = inner.as_object_mut() {
+            o.insert("undecoded".into(), Value::Bool(true));
+        }
+    }
+    inner
+}
+
+/// Review fix (batch 19): `data` is a string that is NOT a JSON object
+/// or array. A JSON-encoded string payload is reachable —
+/// `normalize::unwrap_payload` parses and descends it — so it is a
+/// decoded payload and must not be flagged or counted undecoded.
+pub(crate) fn data_is_opaque_string(env: &Value) -> bool {
+    match env.get("data") {
+        Some(Value::String(s)) => !matches!(
+            serde_json::from_str::<Value>(s),
+            Ok(Value::Object(_)) | Ok(Value::Array(_))
+        ),
+        _ => false,
+    }
 }
 
 /// Minimal percent-decoder (no allocation for unreserved input).
@@ -471,6 +509,40 @@ mod tests {
         assert_eq!(nokey["undecoded"], "no-key");
         let bad = rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&[9u8; 16]));
         assert_eq!(bad["undecoded"], true);
+    }
+
+    #[test]
+    fn decoded_inner_with_string_data_is_flagged_undecoded() {
+        // R1 (batch 19): the legacy pre-H2 rows stored string-`data`
+        // envelopes WITHOUT the flag and got called "decoded". The one
+        // live path that can still produce that SHAPE is a decrypt
+        // whose inner envelope carries a string `data` (a plain-string
+        // payload, or a doubly-wrapped cipher): it must be flagged so
+        // no NEW row can look decoded while its payload is unreachable.
+        let key = [0x44u8; 16];
+        let inner = json!({"error_code": 0, "data": "still-a-string"});
+        let enc = test_encode_rest(&inner, &key);
+        let outer = json!({"error_code": 0, "data": enc});
+        let env = rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&key));
+        assert_eq!(env["undecoded"], true, "string data is never a decoded payload");
+        assert_eq!(env["data"], "still-a-string");
+        assert_eq!(env["error_code"], 0, "the error_code backfill still ran");
+        // The normal decoded shape (object data) stays unflagged.
+        let inner = json!({"error_code": 0, "data": {"ok": 1}});
+        let enc = test_encode_rest(&inner, &key);
+        let outer = json!({"error_code": 0, "data": enc});
+        let env = rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&key));
+        assert!(env.get("undecoded").is_none(), "an object payload is decoded");
+        assert_eq!(env["data"]["ok"], 1);
+        // A JSON-encoded string payload is reachable (unwrap_payload
+        // parses it): decoded, never flagged.
+        let inner = json!({"error_code": 0, "data": "{\"msgs\":[]}"});
+        let enc = test_encode_rest(&inner, &key);
+        let outer = json!({"error_code": 0, "data": enc});
+        let env = rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&key));
+        assert!(env.get("undecoded").is_none(), "a JSON-string payload is decoded");
+        assert!(!data_is_opaque_string(&json!({"data": "[1]"})));
+        assert!(data_is_opaque_string(&json!({"data": "\"plain\""})));
     }
 
     #[test]

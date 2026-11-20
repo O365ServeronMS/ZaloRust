@@ -7,8 +7,13 @@
 //! makes it a perfect oracle: replay every stored event through THIS
 //! rebuild's `pipeline` into a scratch DB and compare, row by row.
 //!
-//! Never prints message content — only ids, counts and field PRESENCE
-//! (handoff rule: no message values in logs).
+//! PRIVACY (R2, batch 19): never prints message content, raw ids, or
+//! raw endpoints — only sha256-12 id fingerprints (the probes' `h12`),
+//! counts, field PRESENCE and `capture::safe_endpoint` paths. Legacy
+//! V1 `raw_events.endpoint` values are FULL urls with query strings
+//! (device ids / sign keys), so they are rendered through
+//! `safe_endpoint` before printing; msg/conv ids only ever appear as
+//! their sha256-12.
 //!
 //! Run: cargo test --lib golden -- --ignored --nocapture
 
@@ -19,6 +24,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use super::pipeline::{self, Incoming};
+use super::probe_util::h12;
 use super::schema;
 use crate::migrate::sqlcipher;
 
@@ -77,6 +83,13 @@ fn scratch() -> Connection {
     let conn = sqlcipher::open_in_memory(&key).unwrap();
     schema::apply(&conn).unwrap();
     conn
+}
+
+/// R2 (batch 19): the id fingerprint for every printed msg/conv id —
+/// sha256-12, the same helper the probes use (`probe_util::h12`). A
+/// raw id never reaches a line.
+fn hid(s: &str) -> String {
+    h12(s)
 }
 
 #[test]
@@ -284,12 +297,20 @@ fn golden_replay_messages_and_conversations() {
         .filter(|c| !live_orphan_convs.contains(**c))
         .count();
 
-    // Diff diagnostics (ids + flags only, never content).
+    // Diff diagnostics (R2: sha256-12 fingerprints + flags only, never
+    // content, never raw ids).
     println!("-- diff details --");
     for id in extra.iter().take(6) {
         if let Some(rm) = repl_msgs.get(*id) {
             let live_is_group = live_convs.get(&rm.conv).map(|t| *t == 1);
-            println!("EXTRA {id}: conv={} conv_live_type={:?} sender={:?} text={}", rm.conv, live_is_group, rm.sender.is_some(), rm.has_text);
+            println!(
+                "EXTRA h12={}: conv_h12={} conv_live_type={:?} sender={:?} text={}",
+                hid(*id),
+                hid(&rm.conv),
+                live_is_group,
+                rm.sender.is_some(),
+                rm.has_text
+            );
         }
     }
     for (id, lm) in live_msgs.iter() {
@@ -297,20 +318,32 @@ fn golden_replay_messages_and_conversations() {
         if rm.conv != lm.conv {
             let lt = live_convs.get(&lm.conv).copied();
             let rt = repl_convs.get(&rm.conv).copied();
-            println!("CONVDIFF {id}: live={}/type{:?} replay={}/type{:?}", lm.conv, lt, rm.conv, rt);
+            println!(
+                "CONVDIFF h12={}: live_h12={}/type{:?} replay_h12={}/type{:?}",
+                hid(id),
+                hid(&lm.conv),
+                lt,
+                hid(&rm.conv),
+                rt
+            );
         }
         if rm.sender != lm.sender {
             println!(
-                "SENDERDIFF {id}: live={:?} replay={:?} conv={}",
+                "SENDERDIFF h12={}: live={:?} replay={:?} conv_h12={}",
+                hid(id),
                 lm.sender.is_some(),
                 rm.sender.is_some(),
-                lm.conv
+                hid(&lm.conv)
             );
         }
     }
     for id in convs_extra.iter().take(4) {
         let ty = repl_convs.get(*id).copied();
-        println!("CONVEXTRA {id}: replay type={ty:?} msgs_in_replay={}", repl_msgs.values().filter(|m| &m.conv == *id).count());
+        println!(
+            "CONVEXTRA h12={}: replay type={ty:?} msgs_in_replay={}",
+            hid(*id),
+            repl_msgs.values().filter(|m| &m.conv == *id).count()
+        );
     }
 
     println!(
@@ -333,10 +366,16 @@ conversations: missing_in_replay={} extra_in_replay={}",
         convs_extra.len(),
     );
     if !missing.is_empty() {
-        println!("sample missing: {:?}", missing.iter().take(5).collect::<Vec<_>>());
+        println!(
+            "sample missing (h12): {:?}",
+            missing.iter().take(5).map(|i| hid(*i)).collect::<Vec<_>>()
+        );
     }
     if !extra.is_empty() {
-        println!("sample extra: {:?}", extra.iter().take(5).collect::<Vec<_>>());
+        println!(
+            "sample extra (h12): {:?}",
+            extra.iter().take(5).map(|i| hid(*i)).collect::<Vec<_>>()
+        );
     }
 
     // Acceptance: every live message must replay with the exact same
@@ -407,7 +446,10 @@ fn golden_shape_inventory() {
                 v.get("cmd").map(|c| c.to_string()).unwrap_or("?".into()),
                 v.get("subCmd").map(|c| c.to_string()).unwrap_or("?".into())
             ),
-            _ => format!("rest {ep}"),
+            // R2 (batch 19): legacy V1 rows store FULL urls with query
+            // strings (device ids / sign keys) — render the path only,
+            // collapsed, exactly like every probe does.
+            _ => format!("rest {}", crate::shadow::capture::safe_endpoint(&ep)),
         };
         let g = inv.entry(label).or_default();
         *g.entry(data_keys).or_default() += 1;

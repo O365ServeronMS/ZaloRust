@@ -25,6 +25,13 @@
 //!   H4): the flusher runs the DB export on its own connection (A5)
 //!   and reports the outcome back on a one-shot channel.
 //!
+//! R1 (batch 19): a REST body that arrives BEFORE the handshake arms
+//! the key is not lost — the flusher writes its truncated no-key row
+//! as always, holds the FULL ciphertext in a bounded RAM queue
+//! (`rest_pending`: 32 bodies / 8 MiB / 10 minutes) and drains it
+//! with the newly armed key, landing a NEW decoded raw row plus the
+//! normalized writes.
+//!
 //! The WS per-connection AES key is harvested from frame `cmd=1 subCmd=1`
 //! the same way and never touches disk (redacted before `raw_events`).
 //! Since audit M4 (batch 4) keys are PER-CONNECTION, keyed by the CDP
@@ -44,6 +51,7 @@ use super::account::{self, UidEvent};
 use super::bounded::{BoundedMap, Inserted};
 use super::passphrase::StoreKeyMode;
 use super::pipeline;
+use super::rest_pending::PendingRest;
 use super::rest_stats::{self, RestStage};
 use super::ws_stats::{self, WsStage};
 use super::{schema, wire, writer};
@@ -358,6 +366,13 @@ fn flusher(
     // at the cap, never the live one, never the whole map.
     let mut ws_keys: BoundedMap<String, [u8; 16]> = BoundedMap::new(WS_KEYS_CAP);
     let mut rest_key: Option<[u8; 16]> = None;
+    // R1 (batch 19): REST bodies that arrive BEFORE the key arms are
+    // held here in RAM (bounded: 32 bodies / 8 MiB ciphertext / 10 min)
+    // until a `Job::Handshake` arms or replaces the key and drains the
+    // queue — the truncated no-key rows stay the audit trail, the
+    // ciphertext never touches disk. Still-queued bodies are wiped at
+    // shutdown (`PendingRest::drop`).
+    let mut pending = PendingRest::new();
     // D1 (KQ2): the own uid is configuration, not a guess — seed it
     // from settings; the handshake only cross-checks afterwards.
     let mut own_uid: Option<String> = None;
@@ -389,7 +404,16 @@ fn flusher(
     'outer: loop {
         let first = match rx.recv_timeout(batch_ms) {
             Ok(j) => j,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // R1 (batch 19): the pending queue's age bound runs on
+                // the idle tick too — a silent session still drops
+                // 10-minute-old ciphertext (counted, wiped, never
+                // logged per body).
+                for _ in 0..pending.purge_aged(schema::now_ms()) {
+                    rest_stats::bump(RestStage::PendingEvicted);
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'outer,
         };
         let mut jobs: Vec<Job> = vec![first];
@@ -416,6 +440,30 @@ fn flusher(
                             old.zeroize();
                         }
                         crate::dlog::log("shadow: rest decode key armed (len 16)");
+                        // R1 (batch 19): an arm OR a replacement drains
+                        // every held body with the NEW key, in arrival
+                        // order. Bodies that decode join this batch as
+                        // normal `kind:"rest"` items — `process_batch`
+                        // writes their NEW decoded raw rows plus the
+                        // normalized writes, and the old no-key rows stay
+                        // untouched. Bodies that still fail are dropped
+                        // (counted). The drain itself only ever logs
+                        // counts (H-rule).
+                        let drained = pending.drain_with_key(&k);
+                        if drained.decoded() + drained.failed > 0 {
+                            crate::dlog::log(&format!(
+                                "shadow rest pending drain: decoded={} failed={}",
+                                drained.decoded(),
+                                drained.failed
+                            ));
+                        }
+                        for _ in 0..drained.decoded() {
+                            rest_stats::bump(RestStage::PendingDecoded);
+                        }
+                        for _ in 0..drained.failed {
+                            rest_stats::bump(RestStage::PendingFailed);
+                        }
+                        items.extend(drained.items);
                     } else {
                         crate::dlog::log("shadow: handshake key rejected (bad shape)");
                     }
@@ -509,6 +557,19 @@ fn flusher(
                         endpoint: super::capture::safe_endpoint(&endpoint),
                         env,
                     });
+                    // R1 (batch 19): with NO key yet, a string-`data`
+                    // body is not lost — the row above (truncated,
+                    // `undecoded:"no-key"`) is only the audit trail; the
+                    // FULL ciphertext rides the bounded pending queue
+                    // until a handshake arms the key. Non-string `data`
+                    // bodies have nothing to decode and never queue.
+                    if rest_key.is_none() && outer.get("data").and_then(Value::as_str).is_some() {
+                        rest_stats::bump(RestStage::PendingQueued);
+                        let out = pending.push(endpoint, outer, direction, schema::now_ms());
+                        for _ in 0..out.evicted {
+                            rest_stats::bump(RestStage::PendingEvicted);
+                        }
+                    }
                 }
                 Job::E2ee { payload } => {
                     let Ok(v) = serde_json::from_str::<Value>(&payload) else {
@@ -643,6 +704,11 @@ fn flusher(
     if let Some(mut p) = pass_ram.take() {
         p.zeroize();
     }
+    // R1 (batch 19): bodies still queued at shutdown are dropped and
+    // wiped (`PendingRest::drop` zeroes each ciphertext + raw endpoint
+    // string) — they were never persisted beyond their truncated
+    // no-key rows.
+    drop(pending);
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 }
 
@@ -766,6 +832,7 @@ pub(crate) fn send_passphrase(
 mod tests {
     use super::*;
     use crate::migrate::sqlcipher;
+    use serde_json::json;
 
     /// FAKE values of the documented shapes — never a real uid/hash.
     const FAKE_UID: &str = "1234567890123456789";
@@ -866,6 +933,276 @@ mod tests {
         // it) and frees the slot.
         assert_eq!(ws_keys.remove(&live), Some([1; 16]));
         assert!(ws_keys.get(&live).is_none());
+    }
+
+    // --- R1/R3 (batch 19): the real flusher thread end to end ----------------
+    //
+    // The flusher consumes its DB connection, so these tests use a
+    // FILE-backed store and re-open it for assertions. They assert
+    // DELTAS on the process-wide `REST_STAGES` counters (cargo test
+    // runs tests in parallel), so they serialize on this lock; every
+    // other counter test in the suite uses local instances.
+    static REST_FLUSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The fake get-last-msgs inner shape (R3): 2 `msgs`, 1
+    /// `groupMsgs`, 1 `clearUnreads` — every value fake.
+    fn fake_last_msgs_inner() -> Value {
+        json!({
+            "error_code": 0,
+            "data": {
+                "msgs": [
+                    {"msgId": "fmsg-1", "uidFrom": "fu-1", "idTo": "0", "ts": 111,
+                     "msgType": "webchat", "content": "fake one"},
+                    {"msgId": "fmsg-2", "uidFrom": "fu-2", "idTo": "0", "ts": 222,
+                     "msgType": "webchat", "content": "fake two"}
+                ],
+                "groupMsgs": [
+                    {"msgId": "fmsg-g", "uidFrom": "fu-1", "idTo": "fgroup-1", "ts": 333,
+                     "msgType": "webchat", "content": "fake group"}
+                ],
+                "clearUnreads": [
+                    {"idTo": "fconv-1", "isGroup": false, "lastMsgId": "fmsg-1"}
+                ]
+            }
+        })
+    }
+
+    fn b64_key(k: [u8; 16]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(k)
+    }
+
+    /// A fresh file-backed SQLCipher store for one flusher run (the
+    /// same open path as the app's raw mode).
+    fn temp_store() -> (std::path::PathBuf, Vec<u8>, rusqlite::Connection) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "zr-flusher-test-{}-{}-{}",
+            std::process::id(),
+            schema::now_ms(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let key = sqlcipher::generate_key().unwrap();
+        let conn = sqlcipher::open_with_key(&path, &key).unwrap();
+        super::schema::apply(&conn).unwrap();
+        (path, key, conn)
+    }
+
+    /// Drive the REAL flusher thread: hand it `jobs`, drop the sender,
+    /// wait for shutdown (all keys wiped, queue dropped), and return
+    /// the store path + key so assertions can re-open what it wrote.
+    fn run_flusher(jobs: Vec<Job>) -> (std::path::PathBuf, Vec<u8>) {
+        let (path, key, conn) = temp_store();
+        let (tx, rx) = channel::<Job>();
+        let dir = std::env::temp_dir();
+        let cfg = ShadowSettings::default();
+        let handle = std::thread::Builder::new()
+            .name("zr-flusher-test".into())
+            .spawn(move || flusher(conn, dir, None, rx, cfg))
+            .unwrap();
+        for j in jobs {
+            tx.send(j).unwrap();
+        }
+        drop(tx);
+        handle.join().unwrap();
+        (path, key)
+    }
+
+    /// Re-open one run's store read-write (assertions only).
+    fn open_store(path: &std::path::Path, key: &[u8]) -> rusqlite::Connection {
+        sqlcipher::open_with_key(path, key).unwrap()
+    }
+
+    #[test]
+    fn flusher_holds_no_key_rest_bodies_until_the_handshake() {
+        let _guard = REST_FLUSH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key: [u8; 16] = [0x19; 16];
+        let outer =
+            json!({"error_code": 0, "data": wire::test_encode_rest(&fake_last_msgs_inner(), &key)});
+        let before = rest_stats::REST_STAGES.snapshot();
+        let (path, file_key) = run_flusher(vec![
+            Job::RestBody {
+                endpoint: "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs?zcid=fake-eyes-only".into(),
+                body: serde_json::to_vec(&outer).unwrap(),
+                direction: "in",
+            },
+            Job::Handshake { key_b64: b64_key(key), uid: None },
+        ]);
+        let conn = open_store(&path, &file_key);
+        // Exactly one no-key row (truncated audit trail) and one
+        // DECODED row, in that order — the decoded row is a NEW row,
+        // the no-key row is never rewritten.
+        let rows: Vec<(i64, String, String)> = {
+            let mut st = conn
+                .prepare("SELECT id, endpoint, payload_json FROM raw_events WHERE kind = 'rest' ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert_eq!(rows.len(), 2, "one no-key row + one decoded row, nothing more");
+        let (id1, ep1, p1) = &rows[0];
+        let (id2, ep2, p2) = &rows[1];
+        assert!(id1 < id2, "the no-key row landed first");
+        let v1: Value = serde_json::from_str(p1).unwrap();
+        assert_eq!(v1["undecoded"], "no-key", "the audit-trail row keeps its flag");
+        assert!(v1["data"].is_string(), "the no-key row holds the truncated ciphertext string");
+        let v2: Value = serde_json::from_str(p2).unwrap();
+        assert!(v2.get("undecoded").is_none(), "the decoded row is never flagged");
+        assert_eq!(v2["data"]["msgs"][0]["msgId"], "fmsg-1");
+        assert_eq!(v2["data"]["msgs"][1]["msgId"], "fmsg-2");
+        assert_eq!(v2["data"]["groupMsgs"][0]["msgId"], "fmsg-g");
+        assert_eq!(v2["data"]["clearUnreads"][0]["idTo"], "fconv-1");
+        // Both stored endpoints are SAFE — the raw query-string URL
+        // only ever rode RAM.
+        assert_eq!(ep1, "/api/preloadconvers/get-last-msgs");
+        assert_eq!(ep2, "/api/preloadconvers/get-last-msgs");
+        // The messages landed exactly once (2 msgs + 1 groupMsg)…
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 3);
+        for id in ["fmsg-1", "fmsg-2", "fmsg-g"] {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages WHERE msg_id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "{id} must land exactly once");
+        }
+        // …plus the clearUnreads stub and the three message stubs.
+        let convs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(convs, 4);
+        // Counter deltas (deterministic under the lock).
+        let after = rest_stats::REST_STAGES.snapshot();
+        assert_eq!(after.no_key - before.no_key, 1);
+        assert_eq!(after.pending_queued - before.pending_queued, 1);
+        assert_eq!(after.pending_decoded - before.pending_decoded, 1);
+        assert_eq!(after.pending_failed - before.pending_failed, 0);
+        assert_eq!(after.pending_evicted - before.pending_evicted, 0);
+        assert_eq!(
+            after.decoded - before.decoded, 0,
+            "drain decodes count pending_decoded, not the arrival-time decoded bucket"
+        );
+        assert_eq!(after.undecoded - before.undecoded, 0);
+    }
+
+    #[test]
+    fn flusher_pending_body_that_still_fails_is_counted_not_written() {
+        let _guard = REST_FLUSH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sealed = [0x33u8; 16]; // the body was sealed with this…
+        let armed = [0x22u8; 16]; // …but the handshake armed this
+        let outer =
+            json!({"error_code": 0, "data": wire::test_encode_rest(&fake_last_msgs_inner(), &sealed)});
+        let before = rest_stats::REST_STAGES.snapshot();
+        let (path, file_key) = run_flusher(vec![
+            Job::RestBody {
+                endpoint: "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs?zcid=fake-eyes-only".into(),
+                body: serde_json::to_vec(&outer).unwrap(),
+                direction: "in",
+            },
+            Job::Handshake { key_b64: b64_key(armed), uid: None },
+        ]);
+        let conn = open_store(&path, &file_key);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raw_events WHERE kind = 'rest'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "only the no-key audit row — no decoded row");
+        let no_key_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE kind = 'rest' \
+                 AND json_extract(payload_json, '$.undecoded') = 'no-key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(no_key_rows, 1);
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 0);
+        let convs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(convs, 0);
+        let after = rest_stats::REST_STAGES.snapshot();
+        assert_eq!(after.no_key - before.no_key, 1);
+        assert_eq!(after.pending_queued - before.pending_queued, 1);
+        assert_eq!(after.pending_decoded - before.pending_decoded, 0);
+        assert_eq!(after.pending_failed - before.pending_failed, 1);
+        assert_eq!(after.pending_evicted - before.pending_evicted, 0);
+    }
+
+    #[test]
+    fn flusher_rest_body_after_the_key_armed_never_queues() {
+        let _guard = REST_FLUSH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key: [u8; 16] = [0x19; 16];
+        let outer =
+            json!({"error_code": 0, "data": wire::test_encode_rest(&fake_last_msgs_inner(), &key)});
+        let before = rest_stats::REST_STAGES.snapshot();
+        let (path, file_key) = run_flusher(vec![
+            Job::Handshake { key_b64: b64_key(key), uid: None },
+            Job::RestBody {
+                endpoint: "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs?zcid=fake-eyes-only".into(),
+                body: serde_json::to_vec(&outer).unwrap(),
+                direction: "in",
+            },
+        ]);
+        let conn = open_store(&path, &file_key);
+        // One DECODED row only — no no-key row ever existed.
+        let (total, decoded): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(*) FILTER \
+                 (WHERE json_extract(payload_json, '$.undecoded') IS NULL) \
+                 FROM raw_events WHERE kind = 'rest'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, decoded), (1, 1));
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 3, "the messages land through the arrival path");
+        let after = rest_stats::REST_STAGES.snapshot();
+        assert_eq!(after.decoded - before.decoded, 1, "an arrival decode counts decoded");
+        assert_eq!(after.no_key - before.no_key, 0);
+        assert_eq!(after.pending_queued - before.pending_queued, 0, "nothing queued");
+        assert_eq!(after.pending_decoded - before.pending_decoded, 0);
+        assert_eq!(after.pending_failed - before.pending_failed, 0);
+        assert_eq!(after.pending_evicted - before.pending_evicted, 0);
+    }
+
+    #[test]
+    fn flusher_drops_pending_bodies_at_shutdown() {
+        let _guard = REST_FLUSH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key: [u8; 16] = [0x19; 16];
+        let outer =
+            json!({"error_code": 0, "data": wire::test_encode_rest(&fake_last_msgs_inner(), &key)});
+        let before = rest_stats::REST_STAGES.snapshot();
+        // No handshake ever arrives: the body rides the queue until
+        // the sender drops and the flusher exits.
+        let (path, file_key) = run_flusher(vec![Job::RestBody {
+            endpoint: "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs?zcid=fake-eyes-only".into(),
+            body: serde_json::to_vec(&outer).unwrap(),
+            direction: "in",
+        }]);
+        let conn = open_store(&path, &file_key);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM raw_events WHERE kind = 'rest'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "just the no-key audit row");
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 0);
+        let after = rest_stats::REST_STAGES.snapshot();
+        assert_eq!(after.no_key - before.no_key, 1);
+        assert_eq!(after.pending_queued - before.pending_queued, 1);
+        assert_eq!(after.pending_decoded - before.pending_decoded, 0);
+        assert_eq!(after.pending_failed - before.pending_failed, 0);
+        assert_eq!(after.pending_evicted - before.pending_evicted, 0);
     }
 }
 

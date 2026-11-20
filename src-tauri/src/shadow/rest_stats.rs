@@ -9,6 +9,9 @@
 //! responseReceived ─▶ api_matched ─▶ loadingFinished / loadingFailed
 //!   ─▶ Network.getResponseBody (call_err | ok | err variants)
 //!   ─▶ deliver_rest ─▶ flusher (outer_json_err | decoded | undecoded | no_key)
+//!                        no-key bodies (R1, batch 19): pending queue in RAM
+//!                          ─▶ handshake drain (pending_queued | pending_decoded
+//!                             | pending_failed | pending_evicted)
 //! ```
 //!
 //! One summary line logs at most once per 60 s and only when a counter
@@ -69,6 +72,23 @@ pub enum RestStage {
     Undecoded,
     /// Flusher: no REST key armed (`undecoded: "no-key"`).
     NoKey,
+    /// Flusher (R1, batch 19): a no-key REST body entered the pending
+    /// queue — its full ciphertext is held in RAM (bounded) until a
+    /// handshake arms the key.
+    PendingQueued,
+    /// Flusher (R1, batch 19): a pending body decoded at a handshake
+    /// drain. NOT also counted `Decoded`: that stage counts
+    /// arrival-time decodes only, so `decoded + pending_decoded` is
+    /// the total of bodies that ever decoded.
+    PendingDecoded,
+    /// Flusher (R1, batch 19): a pending body still failed to decode
+    /// at a handshake drain — dropped, never retried.
+    PendingFailed,
+    /// Flusher (R1, batch 19): a pending body left the queue WITHOUT a
+    /// decode attempt — the count, bytes or age bound fired, or a
+    /// body whose ciphertext alone exceeds the bytes bound was refused
+    /// at the door.
+    PendingEvicted,
     /// Host ends with `zalo.me` but `is_api_url` said no.
     ApiHostUnmatched,
 }
@@ -91,6 +111,10 @@ pub struct RestStageCounters {
     pub decoded: AtomicU64,
     pub undecoded: AtomicU64,
     pub no_key: AtomicU64,
+    pub pending_queued: AtomicU64,
+    pub pending_decoded: AtomicU64,
+    pub pending_failed: AtomicU64,
+    pub pending_evicted: AtomicU64,
     pub api_host_unmatched: AtomicU64,
 }
 
@@ -110,6 +134,10 @@ pub static REST_STAGES: RestStageCounters = RestStageCounters {
     decoded: AtomicU64::new(0),
     undecoded: AtomicU64::new(0),
     no_key: AtomicU64::new(0),
+    pending_queued: AtomicU64::new(0),
+    pending_decoded: AtomicU64::new(0),
+    pending_failed: AtomicU64::new(0),
+    pending_evicted: AtomicU64::new(0),
     api_host_unmatched: AtomicU64::new(0),
 };
 
@@ -132,6 +160,10 @@ pub struct RestStageSnapshot {
     pub decoded: u64,
     pub undecoded: u64,
     pub no_key: u64,
+    pub pending_queued: u64,
+    pub pending_decoded: u64,
+    pub pending_failed: u64,
+    pub pending_evicted: u64,
     pub api_host_unmatched: u64,
 }
 
@@ -154,6 +186,10 @@ impl RestStageSnapshot {
             decoded: 0,
             undecoded: 0,
             no_key: 0,
+            pending_queued: 0,
+            pending_decoded: 0,
+            pending_failed: 0,
+            pending_evicted: 0,
             api_host_unmatched: 0,
         }
     }
@@ -177,6 +213,10 @@ impl RestStageCounters {
             RestStage::Decoded => &self.decoded,
             RestStage::Undecoded => &self.undecoded,
             RestStage::NoKey => &self.no_key,
+            RestStage::PendingQueued => &self.pending_queued,
+            RestStage::PendingDecoded => &self.pending_decoded,
+            RestStage::PendingFailed => &self.pending_failed,
+            RestStage::PendingEvicted => &self.pending_evicted,
             RestStage::ApiHostUnmatched => &self.api_host_unmatched,
         }
     }
@@ -204,6 +244,10 @@ impl RestStageCounters {
             decoded: self.decoded.load(Relaxed),
             undecoded: self.undecoded.load(Relaxed),
             no_key: self.no_key.load(Relaxed),
+            pending_queued: self.pending_queued.load(Relaxed),
+            pending_decoded: self.pending_decoded.load(Relaxed),
+            pending_failed: self.pending_failed.load(Relaxed),
+            pending_evicted: self.pending_evicted.load(Relaxed),
             api_host_unmatched: self.api_host_unmatched.load(Relaxed),
         }
     }
@@ -215,13 +259,15 @@ pub fn bump(s: RestStage) {
     maybe_log();
 }
 
-/// Pure: the one summary line (cumulative counts only).
+/// Pure: the one summary line (cumulative counts only). The pending
+/// group (R1, batch 19) carries the no-key hold queue's lifecycle.
 pub fn format_stage_line(s: &RestStageSnapshot) -> String {
     format!(
         "shadow rest stages: seen={} api={} finished={} failed={} \
          body_ok={} body_err=(notjson {} nobody {} badb64 {} empty {}) \
          call_err={} delivered={} outer_json_err={} decoded={} undecoded={} \
-         no_key={} host_unmatched={} (cumulative)",
+         no_key={} pending=(queued {} decoded {} failed {} evicted {}) \
+         host_unmatched={} (cumulative)",
         s.response_seen,
         s.api_matched,
         s.finished_seen,
@@ -237,6 +283,10 @@ pub fn format_stage_line(s: &RestStageSnapshot) -> String {
         s.decoded,
         s.undecoded,
         s.no_key,
+        s.pending_queued,
+        s.pending_decoded,
+        s.pending_failed,
+        s.pending_evicted,
         s.api_host_unmatched
     )
 }
@@ -271,13 +321,23 @@ pub enum RestDecode {
 
 /// Classify one REST envelope for the stage counters: `outer` is the
 /// response JSON the flusher parsed, `env` what `wire::rest_envelope`
-/// returned. The `undecoded` flag is the only signal `wire` emits.
+/// returned. The `undecoded` flag is the primary signal; a decoded
+/// inner whose `data` is STILL a string is counted UNDECODED even
+/// without the flag (R1, batch 19: `wire::rest_envelope` already
+/// flags that shape, so this arm is defense in depth — a legacy-shaped
+/// pair can never be called "decoded" again).
 pub fn classify_rest_envelope(outer: &Value, env: &Value) -> RestDecode {
     let had_cipher = outer.get("data").and_then(Value::as_str).is_some();
     match env.get("undecoded") {
         Some(Value::String(s)) if s == "no-key" => RestDecode::NoKey,
         Some(_) => RestDecode::Undecoded,
-        None if had_cipher => RestDecode::Decoded,
+        None if had_cipher => {
+            if crate::shadow::wire::data_is_opaque_string(env) {
+                RestDecode::Undecoded
+            } else {
+                RestDecode::Decoded
+            }
+        }
         None => RestDecode::NoCipher,
     }
 }
@@ -334,6 +394,7 @@ mod tests {
             "shadow rest stages: seen=0 api=0 finished=0 failed=0 body_ok=0 \
              body_err=(notjson 0 nobody 0 badb64 0 empty 0) call_err=0 \
              delivered=0 outer_json_err=0 decoded=0 undecoded=0 no_key=0 \
+             pending=(queued 0 decoded 0 failed 0 evicted 0) \
              host_unmatched=0 (cumulative)"
         );
         let mut s = zero;
@@ -346,12 +407,18 @@ mod tests {
         s.delivered = 4;
         s.decoded = 3;
         s.undecoded = 1;
+        s.pending_queued = 1;
+        s.pending_decoded = 1;
+        s.pending_failed = 2;
+        s.pending_evicted = 3;
         let line = format_stage_line(&s);
         assert!(line.contains("seen=100 api=7 finished=5 failed=1"), "{line}");
         assert!(line.contains("body_ok=4"), "{line}");
         assert!(line.contains("body_err=(notjson 0 nobody 0 badb64 1 empty 0)"), "{line}");
         assert!(line.contains("delivered=4 outer_json_err=0"), "{line}");
-        assert!(line.contains("decoded=3 undecoded=1 no_key=0 host_unmatched=0"), "{line}");
+        assert!(line.contains("decoded=3 undecoded=1 no_key=0"), "{line}");
+        assert!(line.contains("pending=(queued 1 decoded 1 failed 2 evicted 3)"), "{line}");
+        assert!(line.contains("host_unmatched=0"), "{line}");
         assert!(line.ends_with("(cumulative)"), "{line}");
         // The line is built from a fixed template and integers only —
         // no url, host, requestId or body fragment can ever appear.
@@ -397,6 +464,10 @@ mod tests {
         c.bump_on(RestStage::Decoded);
         c.bump_on(RestStage::Undecoded);
         c.bump_on(RestStage::NoKey);
+        c.bump_on(RestStage::PendingQueued);
+        c.bump_on(RestStage::PendingDecoded);
+        c.bump_on(RestStage::PendingFailed);
+        c.bump_on(RestStage::PendingEvicted);
         c.bump_on(RestStage::ApiHostUnmatched);
         let s = c.snapshot();
         assert_eq!(s.response_seen, 2);
@@ -414,6 +485,10 @@ mod tests {
         assert_eq!(s.decoded, 1);
         assert_eq!(s.undecoded, 1);
         assert_eq!(s.no_key, 1);
+        assert_eq!(s.pending_queued, 1);
+        assert_eq!(s.pending_decoded, 1);
+        assert_eq!(s.pending_failed, 1);
+        assert_eq!(s.pending_evicted, 1);
         assert_eq!(s.api_host_unmatched, 1);
         // The pure helpers compose with a snapshot diff.
         let zero = RestStageSnapshot::zeroed();
@@ -440,5 +515,35 @@ mod tests {
         let plain = json!({"error_code": 0, "data": {"plain": true}});
         let env = wire::rest_envelope("https://wpa.chat.zalo.me/a/x", &plain, Some(&key));
         assert_eq!(classify_rest_envelope(&plain, &env), RestDecode::NoCipher);
+    }
+
+    #[test]
+    fn classify_counts_the_legacy_string_data_shape_undecoded() {
+        // R1 (batch 19): a stored envelope with a STRING `data` and no
+        // `undecoded` flag is the legacy pre-H2 shape (4 rows, ids <
+        // 800) — it must never be called "decoded" again, neither via
+        // the flag `wire::rest_envelope` now emits nor via the
+        // belt-and-braces string check.
+        use crate::shadow::wire;
+        let key = [0x44u8; 16];
+        // (a) The live path: a decrypt whose inner carries a string
+        // `data` — rest_envelope flags it, so the pair classifies
+        // undecoded through the normal flag arm.
+        let inner = json!({"error_code": 0, "data": "still-a-string"});
+        let outer = json!({"error_code": 0, "data": wire::test_encode_rest(&inner, &key)});
+        let env = wire::rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&key));
+        assert_eq!(env["undecoded"], true, "wire must flag it first");
+        assert_eq!(classify_rest_envelope(&outer, &env), RestDecode::Undecoded);
+        // (b) Defense in depth: the same shape hand-built WITHOUT the
+        // flag (exactly what the legacy rows look like) still counts
+        // undecoded, never decoded.
+        let legacy_env = json!({"error_code": 0, "data": "ciphertext-looking-string"});
+        assert_eq!(
+            classify_rest_envelope(&outer, &legacy_env),
+            RestDecode::Undecoded
+        );
+        // Sanity: the same env with an OBJECT data stays decoded.
+        let obj_env = json!({"error_code": 0, "data": {"msgs": []}});
+        assert_eq!(classify_rest_envelope(&outer, &obj_env), RestDecode::Decoded);
     }
 }

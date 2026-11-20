@@ -86,6 +86,12 @@ pub mod rate_limit;
 pub mod repair;
 /// REST capture stage counters (audit H2 / batch 3 C2).
 pub mod rest_stats;
+/// In-RAM hold for REST bodies that arrive BEFORE the REST key arms
+/// (batch 19, R1): a bounded queue (32 bodies / 8 MiB ciphertext /
+/// 10 minutes, oldest-first eviction, injected clock) plus the
+/// handshake drain that turns held bodies into normal `kind:"rest"`
+/// pipeline items. Pure — the flusher owns all `rest_stats` bumping.
+pub mod rest_pending;
 pub mod runtime;
 pub mod schema;
 /// Full-text search over `messages` via the contentless FTS5 mirror
