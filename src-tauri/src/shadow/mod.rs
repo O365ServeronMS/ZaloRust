@@ -57,6 +57,13 @@ pub mod cli;
 /// pure verdict + `GetDiskFreeSpaceExW` (hand-declared — no new crates).
 pub mod disk_space;
 pub mod import;
+/// Configurable Desktop→shadow mapping (batch 12 L2, audit §4 items
+/// 2.3/2.4/2.7): declarative JSON mapping (no free SQL), plan
+/// validation against the snapshot inventory, extraction into the
+/// same `Write` values the capture path produces, read-only dry-run
+/// classification against a temp COPY of the shadow store, and the
+/// `sync_cursors` delta groundwork.
+pub mod import_map;
 pub mod media;
 pub mod normalize;
 pub mod pipeline;
@@ -265,3 +272,12 @@ mod maint_purge;
 /// replay itself is the ignored `maint_replay_roaming` test.
 #[cfg(test)]
 mod maint_replay;
+
+/// Overlap probe (audit §4 item 2.3 AC, batch 12 L3): extract
+/// messages for the 20 most recent conversations present in BOTH a
+/// cold snapshot and the shadow DB (temp COPY), and compare them by
+/// msgId + type/ts/sender — the mapping-verification gate before any
+/// apply is even proposed. Ignored: needs `ZR_SNAPSHOT_DIR`,
+/// `ZR_D7_KEY_FILE`, `ZR_UIN_HASH`, `ZR_MAPPING`.
+#[cfg(test)]
+mod probe_import_overlap;

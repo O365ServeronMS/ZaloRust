@@ -1,5 +1,7 @@
 //! Zalo Desktop DB import (P2 — dry-run skeleton; audit §4 items
-//! 2.0–2.4, batch 6 F2–F4).
+//! 2.0–2.4, batch 6 F2–F4; batch 12 adds the L1 inventory, the L2
+//! mapping dry run and the L4 delta groundwork — see
+//! `import_map.rs` and `docs/import-mapping.md`).
 //!
 //! Source layout (verified 2026-11-12/13, Zalo Desktop 26.11.12):
 //! ```text
@@ -45,6 +47,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::migrate::sqlcipher;
 
 use super::cli::ImportArgs;
+use super::import_map;
+use super::Write;
+
+/// Batch 12 L1: shape-only schema inventory (`--inventory`).
+pub mod inventory;
 
 /// The snapshot manifest file (F5 writes it, `run` requires it):
 /// proof that `--from-snapshot` is a cold, byte-verified copy.
@@ -441,9 +448,23 @@ fn table_count(conn: &Connection) -> usize {
     .unwrap_or(0)
 }
 
-/// Dry-run inventory of a cold snapshot (F3/F4). `--apply` stays
-/// fail-closed (P2 item 2.5 wires the writer later).
-pub fn run(a: &ImportArgs) -> Result<Summary, String> {
+/// Everything a run mode needs after the batch-6 guards: the account
+/// dir, the zeroized passphrase (never printed, never logged), the
+/// verified cipher profile and the key sha12 (the only key fact that
+/// may appear in output).
+pub struct Prepared {
+    pub uid_dir: PathBuf,
+    pub passphrase: Zeroizing<String>,
+    pub profile: CipherProfile,
+    pub key_sha12: String,
+}
+
+/// The batch-6 guards + key load + profile detection (KQ4/M2), shared
+/// by every import mode: refuse anything that is not a cold snapshot
+/// (`validate_snapshot`), load the D7 key file (the key is never on
+/// argv), cross-check it against `--uin-hash`, then detect — or
+/// verify a forced — cipher profile against `Core\Index.db`.
+pub fn prepare(a: &ImportArgs) -> Result<Prepared, String> {
     // KQ4: nothing runs until the snapshot guard passes.
     validate_snapshot(&a.from_snapshot)?;
 
@@ -472,41 +493,42 @@ pub fn run(a: &ImportArgs) -> Result<Summary, String> {
     }
 
     // F3/2.2: detect (or verify the forced) cipher profile against
-    // Index.db, then take the one real count it offers.
-    let (profile, index_tables) = match a.cipher_compat {
+    // Index.db.
+    let profile = match a.cipher_compat {
         Some(p) => {
-            let conn = open_desktop_db(&index, &passphrase, p)?;
-            (p, table_count(&conn))
+            open_desktop_db(&index, &passphrase, p)?;
+            p
         }
-        None => {
-            let p = try_profiles(&index, &passphrase)?;
-            let conn = open_desktop_db(&index, &passphrase, p)?;
-            (p, table_count(&conn))
-        }
+        None => try_profiles(&index, &passphrase)?,
     };
+    Ok(Prepared {
+        uid_dir,
+        passphrase,
+        profile,
+        key_sha12,
+    })
+}
+
+/// Dry-run inventory of a cold snapshot (F3/F4). `--apply` stays
+/// fail-closed (P2 item 2.5 wires the writer later).
+pub fn run(a: &ImportArgs) -> Result<Summary, String> {
+    let p = prepare(a)?;
+    let index = p.uid_dir.join("Core").join("Index.db");
+    let conn = open_desktop_db(&index, p.passphrase.as_str(), p.profile)?;
+    let index_tables = table_count(&conn);
+    drop(conn);
 
     let mut s = Summary {
         index_tables,
-        profile: Some(profile),
-        key_sha12,
+        profile: Some(p.profile),
+        key_sha12: p.key_sha12,
         ..Summary::default()
     };
 
     // F4/M2-4: classify every Core\Message\*.db; `undefined.db` is
     // counted and skipped; `-wal`/`-shm` sidecars are not DBs.
-    let msg_dir = uid_dir.join("Core").join("Message");
-    if !msg_dir.is_dir() {
-        return Err(format!("missing {} — broken snapshot?", msg_dir.display()));
-    }
-    for entry in std::fs::read_dir(&msg_dir)
-        .map_err(|e| format!("{}: {e}", msg_dir.display()))?
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".db") {
-            continue;
-        }
-        match classify_message_db(&name) {
+    for (_name, kind) in message_db_names(&p.uid_dir)? {
+        match kind {
             DbKind::OneToOne(_) => s.one_to_one += 1,
             DbKind::Group(_) => s.group += 1,
             DbKind::StrangerBox => s.stranger_box += 1,
@@ -519,6 +541,451 @@ pub fn run(a: &ImportArgs) -> Result<Summary, String> {
         return Err("--apply not wired in this rebuild phase yet (dry-run only, fail-closed)".into());
     }
     Ok(s)
+}
+
+// --- batch 12: the inventory + mapping-dry-run modes (L1/L2/L4) ----------
+
+/// The snapshot's `Core\Message\*.db` entries, sorted by file name,
+/// with their kind (M2-4). Sidecars never match.
+fn message_db_names(uid_dir: &Path) -> Result<Vec<(String, DbKind)>, String> {
+    let msg_dir = uid_dir.join("Core").join("Message");
+    if !msg_dir.is_dir() {
+        return Err(format!("missing {} — broken snapshot?", msg_dir.display()));
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&msg_dir)
+        .map_err(|e| format!("{}: {e}", msg_dir.display()))?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".db"))
+        .collect();
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|n| {
+            let kind = classify_message_db(&n);
+            (n, kind)
+        })
+        .collect())
+}
+
+/// The snapshot inventory set (L1): `Core\Index.db` plus ONE sample
+/// per message-DB kind (first 1-1, first group, stranger_box by
+/// sorted file name). A sample that refuses to open is REPORTED, not
+/// fatal — the inventory is a report tool; one broken DB among 1 471
+/// must not block it.
+pub struct GatheredInventories {
+    pub inv: inventory::SnapshotInventories,
+    /// (file name, error) per sample DB that existed but did not open.
+    pub failed_samples: Vec<(String, String)>,
+    /// The F4 enumeration counts.
+    pub one_to_one: usize,
+    pub group: usize,
+    pub stranger_box: usize,
+    pub undefined: usize,
+    pub other: usize,
+}
+
+pub fn gather_inventories(p: &Prepared) -> Result<GatheredInventories, String> {
+    let index_path = p.uid_dir.join("Core").join("Index.db");
+    let conn = open_desktop_db(&index_path, p.passphrase.as_str(), p.profile)?;
+    let inv = inventory::inventory_db(&conn)?;
+    drop(conn);
+    let mut g = GatheredInventories {
+        inv: inventory::SnapshotInventories {
+            index: Some(inventory::KindInventory {
+                source_rel: "Core/Index.db".into(),
+                inventory: inv,
+            }),
+            one_to_one: None,
+            group: None,
+            stranger_box: None,
+        },
+        failed_samples: Vec::new(),
+        one_to_one: 0,
+        group: 0,
+        stranger_box: 0,
+        undefined: 0,
+        other: 0,
+    };
+    for (name, kind) in message_db_names(&p.uid_dir)? {
+        match kind {
+            DbKind::OneToOne(_) => g.one_to_one += 1,
+            DbKind::Group(_) => g.group += 1,
+            DbKind::StrangerBox => g.stranger_box += 1,
+            DbKind::Undefined => g.undefined += 1,
+            DbKind::Other => g.other += 1,
+        }
+        let sample_free = match kind {
+            DbKind::OneToOne(_) => g.inv.one_to_one.is_none(),
+            DbKind::Group(_) => g.inv.group.is_none(),
+            DbKind::StrangerBox => g.inv.stranger_box.is_none(),
+            _ => false,
+        };
+        if !sample_free {
+            continue;
+        }
+        let path = p.uid_dir.join("Core").join("Message").join(&name);
+        let sampled: Result<inventory::DbInventory, (String, String)> = (|| {
+            let conn = open_desktop_db(&path, p.passphrase.as_str(), p.profile)
+                .map_err(|e| (name.clone(), e))?;
+            inventory::inventory_db(&conn).map_err(|e| (name.clone(), e))
+        })();
+        match sampled {
+            Ok(inv) => {
+                let ki = inventory::KindInventory {
+                    source_rel: format!("Core/Message/{name}"),
+                    inventory: inv,
+                };
+                match kind {
+                    DbKind::OneToOne(_) => g.inv.one_to_one = Some(ki),
+                    DbKind::Group(_) => g.inv.group = Some(ki),
+                    DbKind::StrangerBox => g.inv.stranger_box = Some(ki),
+                    _ => unreachable!("only these kinds sample"),
+                }
+            }
+            Err((n, e)) => g.failed_samples.push((n, e)),
+        }
+    }
+    Ok(g)
+}
+
+/// The `--inventory` mode (L1, dry-run only — parse refuses `--apply`
+/// with it): shape-only inventory of `Core\Index.db` + one sample per
+/// message-DB kind, as lines for the CLI to print, and the same as
+/// JSON to `--out` when given. Nothing writes to the snapshot; every
+/// DB opens `mode=ro&immutable=1`.
+pub fn run_inventory(a: &ImportArgs) -> Result<Vec<String>, String> {
+    let p = prepare(a)?;
+    let g = gather_inventories(&p)?;
+    let mut lines = Vec::new();
+
+    let idx = g
+        .inv
+        .index
+        .as_ref()
+        .expect("gather_inventories always inventories Index.db");
+    lines.push(format!(
+        "inventory: Core/Index.db ({} table(s))",
+        idx.inventory.tables.len()
+    ));
+    for t in &idx.inventory.tables {
+        lines.push(t.line());
+    }
+    for (title, ki) in [
+        ("sample one2one", g.inv.one_to_one.as_ref()),
+        ("sample group", g.inv.group.as_ref()),
+        ("sample stranger_box", g.inv.stranger_box.as_ref()),
+    ] {
+        match ki {
+            Some(ki) => {
+                lines.push(format!(
+                    "inventory: {title} {} ({} table(s))",
+                    ki.source_rel,
+                    ki.inventory.tables.len()
+                ));
+                for t in &ki.inventory.tables {
+                    lines.push(t.line());
+                }
+            }
+            None => lines.push(format!("inventory: {title}: none found in the snapshot")),
+        }
+    }
+    for (name, err) in &g.failed_samples {
+        lines.push(format!("inventory: sample {name}: skipped (open failed: {err})"));
+    }
+    lines.push(format!(
+        "inventory: message DBs: one_to_one={} group={} stranger_box={} undefined={} other={}",
+        g.one_to_one, g.group, g.stranger_box, g.undefined, g.other
+    ));
+    if let Some(out) = &a.out {
+        let json = serde_json::to_string_pretty(&g.inv)
+            .map_err(|e| format!("--out {}: serializing the inventory failed: {e}", out.display()))?;
+        std::fs::write(out, json)
+            .map_err(|e| format!("--out {}: {e}", out.display()))?;
+        lines.push(format!("inventory: wrote JSON to {}", out.display()));
+    }
+    Ok(lines)
+}
+
+/// The `--mapping`/`--shadow-copy` dry-run mode (L2, dry-run only):
+/// plan the mapping against the snapshot inventory, extract every DB
+/// of the mapped kinds into `Write`s, and classify each write
+/// READ-ONLY against a temp COPY of the shadow store when
+/// `--shadow-copy` is given. No writes anywhere; `--apply` stays
+/// fail-closed (2.5 is a later, user-approved step).
+pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
+    use import_map::{EntityCounters, ExtractOpts, MapDb};
+
+    let p = prepare(a)?;
+    let mapping = match &a.mapping {
+        Some(f) => import_map::load_mapping_file(f)?,
+        None => import_map::Mapping::skeleton(),
+    };
+    let g = gather_inventories(&p)?;
+    let plan = import_map::plan(&mapping, &g.inv).map_err(|errs| {
+        format!(
+            "mapping failed validation ({} error(s)):\n  - {}",
+            errs.len(),
+            errs.join("\n  - ")
+        )
+    })?;
+
+    let mut lines = vec![
+        format!(
+            "import dry-run: mapping={}",
+            match &a.mapping {
+                Some(f) => f.display().to_string(),
+                None => "<built-in skeleton: maps nothing>".to_string(),
+            }
+        ),
+        format!("import dry-run: plan OK ({})", plan.summary_line()),
+        format!(
+            "import dry-run: snapshot: profile={} one_to_one={} group={} stranger_box={} undefined={} other={}",
+            p.profile.name(),
+            g.one_to_one,
+            g.group,
+            g.stranger_box,
+            g.undefined,
+            g.other
+        ),
+    ];
+    for (name, err) in &g.failed_samples {
+        lines.push(format!(
+            "import dry-run: sample {name}: skipped (open failed: {err})"
+        ));
+    }
+
+    // The shadow target: a temp COPY opened read-only, never the live
+    // store. Without --shadow-copy the classification is skipped and
+    // only extraction counts are reported.
+    let shadow = match &a.shadow_copy {
+        Some(dir) => {
+            let (conn, tmp) = import_map::open_shadow_copy(dir)?;
+            lines.push(format!(
+                "import dry-run: shadow target: temp copy of {} at {} (read-only)",
+                dir.display(),
+                tmp.display()
+            ));
+            Some(conn)
+        }
+        None => {
+            lines.push("import dry-run: classification: skipped (no --shadow-copy)".into());
+            None
+        }
+    };
+
+    let (mut c_conv, mut c_contact, mut c_group, mut c_msg) = (
+        EntityCounters::default(),
+        EntityCounters::default(),
+        EntityCounters::default(),
+        EntityCounters::default(),
+    );
+    let mut msg_by_kind: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    let mut attachment_rows: i64 = 0;
+    let (mut dbs_opened, mut dbs_failed) = (0usize, 0usize);
+
+    // Index.db: the account-wide entities (+ attachment refs if the
+    // mapping points them at the index kind).
+    let index_entities = [
+        plan.conversation.as_ref(),
+        plan.contact.as_ref(),
+        plan.group.as_ref(),
+        plan.attachment.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|e| e.db.contains(&MapDb::Index));
+    if index_entities {
+        let index_path = p.uid_dir.join("Core").join("Index.db");
+        match open_desktop_db(&index_path, p.passphrase.as_str(), p.profile) {
+            Ok(conn) => {
+                dbs_opened += 1;
+                let opts = ExtractOpts { kind: MapDb::Index, db_id: None, cursor: None };
+                match import_map::extract(&conn, &plan, &opts) {
+                    Ok((writes, skips)) => {
+                        c_conv.skipped += skips.conversation;
+                        c_contact.skipped += skips.contact;
+                        c_group.skipped += skips.group;
+                        for w in &writes {
+                            let verdict = shadow
+                                .as_ref()
+                                .map(|s| import_map::classify_write(s, w))
+                                .transpose()?;
+                            match w {
+                                Write::Conversation { .. } => {
+                                    c_conv.extracted += 1;
+                                    if let Some(v) = verdict {
+                                        c_conv.bump(v);
+                                    }
+                                }
+                                Write::Contact { .. } => {
+                                    c_contact.extracted += 1;
+                                    if let Some(v) = verdict {
+                                        c_contact.bump(v);
+                                    }
+                                }
+                                Write::Group { .. } => {
+                                    c_group.extracted += 1;
+                                    if let Some(v) = verdict {
+                                        c_group.bump(v);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(ap) = &plan.attachment {
+                            if ap.db.contains(&MapDb::Index) {
+                                attachment_rows += import_map::count_rows(&conn, ap)?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        dbs_failed += 1;
+                        lines.push(format!("import dry-run: Core/Index.db: extract failed: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                dbs_failed += 1;
+                lines.push(format!("import dry-run: Core/Index.db: open failed: {e}"));
+            }
+        }
+    }
+
+    // The message DBs of the mapped kinds.
+    let msg_dir = p.uid_dir.join("Core").join("Message");
+    for (name, kind) in message_db_names(&p.uid_dir)? {
+        let (map_kind, db_id) = match kind {
+            DbKind::OneToOne(id) => (MapDb::OneToOne, Some(id)),
+            DbKind::Group(id) => (MapDb::Group, Some(id)),
+            DbKind::StrangerBox => (MapDb::Stranger, None),
+            // `undefined.db` and unknown names stay counted, skipped.
+            DbKind::Undefined | DbKind::Other => continue,
+        };
+        let applies = plan
+            .message
+            .as_ref()
+            .is_some_and(|e| e.db.contains(&map_kind))
+            || plan
+                .attachment
+                .as_ref()
+                .is_some_and(|e| e.db.contains(&map_kind));
+        if !applies {
+            continue;
+        }
+        let rel = format!("Core/Message/{name}");
+        let conn = match open_desktop_db(&msg_dir.join(&name), p.passphrase.as_str(), p.profile) {
+            Ok(c) => {
+                dbs_opened += 1;
+                c
+            }
+            Err(e) => {
+                dbs_failed += 1;
+                lines.push(format!("import dry-run: {rel}: open failed: {e}"));
+                continue;
+            }
+        };
+        // L4 --delta: read this DB's cursor from the shadow COPY
+        // (read-only; never written).
+        let cursor = if a.delta {
+            match &shadow {
+                Some(s) => import_map::read_import_cursor(s, &rel)?,
+                None => None, // no shadow copy: assume a fresh import
+            }
+        } else {
+            None
+        };
+        let opts = ExtractOpts { kind: map_kind, db_id, cursor };
+        let mut extracted_here = 0usize;
+        match import_map::extract(&conn, &plan, &opts) {
+            Ok((writes, skips)) => {
+                c_msg.skipped += skips.message;
+                extracted_here = writes.len();
+                *msg_by_kind.entry(map_kind.name()).or_default() += writes.len();
+                for w in &writes {
+                    let verdict = shadow
+                        .as_ref()
+                        .map(|s| import_map::classify_write(s, w))
+                        .transpose()?;
+                    if let Write::Message { .. } = w {
+                        c_msg.extracted += 1;
+                        if let Some(v) = verdict {
+                            c_msg.bump(v);
+                        }
+                    }
+                }
+                if let Some(ap) = &plan.attachment {
+                    if ap.db.contains(&map_kind) {
+                        attachment_rows += import_map::count_rows(&conn, ap)?;
+                    }
+                }
+            }
+            Err(e) => {
+                dbs_failed += 1;
+                lines.push(format!("import dry-run: {rel}: extract failed: {e}"));
+            }
+        }
+        if a.delta {
+            let total = plan
+                .message
+                .as_ref()
+                .map(|ep| import_map::count_rows(&conn, ep))
+                .transpose()?
+                .unwrap_or(0);
+            let next = plan
+                .message
+                .as_ref()
+                .map(|ep| import_map::next_cursor(&conn, ep))
+                .transpose()?
+                .flatten();
+            let cur = cursor.map(import_map::encode_cursor).unwrap_or_else(|| "none".into());
+            let nxt = next
+                .map(import_map::encode_cursor)
+                .unwrap_or_else(|| "none".into());
+            lines.push(format!(
+                "import delta: {rel} cursor={cur} total_rows={total} would_extract={extracted_here} next_cursor={nxt}"
+            ));
+        }
+    }
+
+    if plan.conversation.is_some() {
+        lines.push(format!("import dry-run: conversations: {}", c_conv.line()));
+    }
+    if plan.contact.is_some() {
+        lines.push(format!("import dry-run: contacts: {}", c_contact.line()));
+    }
+    if plan.group.is_some() {
+        lines.push(format!("import dry-run: groups: {}", c_group.line()));
+    }
+    if plan.message.is_some() {
+        let by_kind: Vec<String> = msg_by_kind
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect();
+        let by_kind = if by_kind.is_empty() {
+            String::from("-")
+        } else {
+            by_kind.join(" ")
+        };
+        lines.push(format!(
+            "import dry-run: messages: {} by_kind={}",
+            c_msg.line(),
+            by_kind
+        ));
+    }
+    if plan.attachment.is_some() {
+        lines.push(format!(
+            "import dry-run: attachment refs: rows={attachment_rows} (counted only — no Write in this batch; the writer derives refs from message payloads at apply time)"
+        ));
+    }
+    lines.push(format!(
+        "import dry-run: dbs opened={dbs_opened} failed={dbs_failed}"
+    ));
+    lines.push(
+        "import dry-run: no writes performed (dry-run; --apply is not wired — P2 item 2.5)".into(),
+    );
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -650,6 +1117,11 @@ mod tests {
             uin_hash: uin_hash.into(),
             key_file: key.map(|p| p.to_path_buf()),
             cipher_compat: None,
+            inventory: false,
+            out: None,
+            mapping: None,
+            shadow_copy: None,
+            delta: false,
             apply: false,
             help: false,
         }
@@ -1180,5 +1652,379 @@ mod tests {
         );
         assert!(!dest.join("Core").join("Index.db-journal").exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- batch 12: --inventory and the mapping dry run (L1/L2/L4) -------
+
+    /// A synthetic Desktop-style cipher DB with ARBITRARY SQL (the
+    /// fake schema the mapping tests iterate on). Fake passphrase,
+    /// temp dir — never a real DB.
+    #[cfg(windows)]
+    fn make_cipher_db_sql(path: &Path, pass: &str, sql: &str) {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        apply_passphrase_key(&conn, pass).unwrap();
+        conn.execute_batch(sql).unwrap();
+        conn.close().map_err(|(_, e)| e).unwrap();
+    }
+
+    /// The fake Desktop message schema + rows (the same shape the
+    /// import_map unit tests use, so the CLI path and the pure path
+    /// are pinned to one contract).
+    #[cfg(windows)]
+    const MSG_DB_SQL: &str = "CREATE TABLE msg (
+        id INTEGER PRIMARY KEY, cliId TEXT, fromUid TEXT, toUid TEXT,
+        ts INTEGER, type TEXT, content TEXT
+      );
+      INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) VALUES
+        (101, 'c101', 'u1', 'u2', 1690000000, 'chat.text.v2', 'hello there'),
+        (102, 'c102', 'u2', 'u1', 1690000001, 'chat.photo',
+         '{\"href\":\"https://fake-photo-stal.zdn.vn/x.jpg\",\"thumb\":\"https://fake/t.jpg\"}'),
+        (103, 'c103', '0',   'u9', 1690000002, 'webchat', 'self sent'),
+        (104, 'c104', 'u1', 'g77', 1690000003, 'chat.text.v2', 'group hello');";
+
+    /// A full synthetic snapshot whose message DBs are REAL cipher
+    /// DBs (the inventory + dry run open them). Returns the key path.
+    #[cfg(windows)]
+    fn synthetic_snapshot_rich(dir: &Path, pass: &str) -> PathBuf {
+        write_manifest_json(dir, valid_manifest_json());
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        make_cipher_db(&core.join("Index.db"), pass, None);
+        make_cipher_db_sql(&core.join("Message").join("111.db"), pass, MSG_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("g222.db"), pass, MSG_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("stranger_box.db"), pass, MSG_DB_SQL);
+        for name in ["undefined.db", "weird.db"] {
+            std::fs::write(core.join("Message").join(name), b"fake").unwrap();
+        }
+        let key = dir.join("d7.bin");
+        fake_d7_key_file(&key, pass);
+        key
+    }
+
+    /// A FAKE shadow STORE dir (never the live one): default.db with
+    /// the shadow schema applied + default.key. Returns the open
+    /// connection so the test can seed rows, then drop it.
+    #[cfg(windows)]
+    fn fake_shadow_store(dir: &Path) -> Connection {
+        let key = sqlcipher::generate_key().unwrap();
+        sqlcipher::save_key(&key, &super::super::key_file(dir)).unwrap();
+        let conn = sqlcipher::open_with_key(&super::super::db_file(dir), &key).unwrap();
+        super::super::schema::apply(&conn).unwrap();
+        conn
+    }
+
+    fn file_sha256(path: &Path) -> String {
+        let mut h = Sha256::new();
+        h.update(std::fs::read(path).unwrap());
+        format!("{:x}", h.finalize())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_inventory_prints_and_writes_the_shape_only_report() {
+        let dir = temp_dir("inv");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        let out = dir.parent().unwrap().join(format!(
+            "zr-inv-out-{}-{}.json",
+            std::process::id(),
+            super::super::schema::now_ms()
+        ));
+        let mut a = args_for(&dir, &uin, Some(&key));
+        a.inventory = true;
+        a.out = Some(out.clone());
+        let lines = run_inventory(&a).unwrap();
+        let joined = lines.join("\n");
+        // Index.db (the batch-6 fixture's `conv` table) + one sample
+        // per message kind — names/types/counts only.
+        assert!(joined.contains("inventory: Core/Index.db (1 table(s))"), "{joined}");
+        assert!(joined.contains("conv: rows=2 cols=(id:INTEGER pk,v:TEXT)"), "{joined}");
+        assert!(joined.contains("inventory: sample one2one Core/Message/111.db (1 table(s))"), "{joined}");
+        assert!(joined.contains("inventory: sample group Core/Message/g222.db (1 table(s))"), "{joined}");
+        assert!(joined.contains("inventory: sample stranger_box Core/Message/stranger_box.db (1 table(s))"), "{joined}");
+        assert!(joined.contains("msg: rows=4 cols=(id:INTEGER pk,cliId:TEXT,fromUid:TEXT"), "{joined}");
+        assert!(
+            joined.contains("message DBs: one_to_one=1 group=1 stranger_box=1 undefined=1 other=1"),
+            "{joined}"
+        );
+        assert!(joined.contains(&format!("wrote JSON to {}", out.display())), "{joined}");
+        // The out file parses back as the inventory set and matches.
+        let back: inventory::SnapshotInventories =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let idx = back.index.as_ref().unwrap();
+        assert_eq!(idx.source_rel, "Core/Index.db");
+        assert_eq!(idx.inventory.tables.len(), 1);
+        let o2o = back.one_to_one.as_ref().unwrap();
+        assert_eq!(o2o.inventory.table("msg").unwrap().row_count, 4);
+        assert!(back.stranger_box.is_some());
+        // Nothing was ever written to the snapshot: immutable proof.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(
+            names,
+            vec![
+                "111.db".to_string(),
+                "g222.db".to_string(),
+                "stranger_box.db".to_string(),
+                "undefined.db".to_string(),
+                "weird.db".to_string()
+            ]
+        );
+        // The CLI exit-code path prints the same lines and exits 0.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            uin,
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--inventory".to_string(),
+            "--out".to_string(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_inventory_reports_a_missing_sample_kind() {
+        let dir = temp_dir("invmiss");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        // Drop the group DB: the report says so and still succeeds.
+        std::fs::remove_file(dir.join("Core").join("Message").join("g222.db")).unwrap();
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.inventory = true;
+        let lines = run_inventory(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains("inventory: sample group: none found in the snapshot"), "{joined}");
+        assert!(joined.contains("message DBs: one_to_one=1 group=0"), "{joined}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mapping used by the dry-run test (message over one2one,
+    /// the fake msg schema, s_to_ms, a msgType table entry).
+    #[cfg(windows)]
+    const DRY_MAPPING_JSON: &str = r#"{
+      "msgType": { "chat.text.v2": "webchat" },
+      "entities": {
+        "message": {
+          "db": ["one2one"],
+          "table": "msg",
+          "columns": {
+            "msgId": "id",
+            "uidFrom": "fromUid",
+            "idTo": "toUid",
+            "ts": { "expr": "s_to_ms", "of": "ts" },
+            "msgType": "type",
+            "content": "content",
+            "cliMsgId": "cliId"
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    #[cfg(windows)]
+    fn run_mapping_dry_with_the_skeleton_maps_nothing() {
+        let dir = temp_dir("dryskel");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        let store = dir.join("shadow-store");
+        std::fs::create_dir_all(&store).unwrap();
+        drop(fake_shadow_store(&store));
+        let before = (
+            file_sha256(&super::super::db_file(&store)),
+            file_sha256(&super::super::key_file(&store)),
+        );
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.shadow_copy = Some(store.clone());
+        let lines = run_mapping_dry(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("mapping=<built-in skeleton: maps nothing>"),
+            "{joined}"
+        );
+        assert!(joined.contains("plan OK (nothing mapped (skeleton))"), "{joined}");
+        assert!(!joined.contains("classification: skipped (no --shadow-copy)"), "{joined}");
+        assert!(joined.contains("shadow target: temp copy of"), "{joined}");
+        assert!(joined.contains("dbs opened=0 failed=0"), "{joined}");
+        assert!(joined.contains("no writes performed"), "{joined}");
+        // No entity lines when nothing is mapped.
+        assert!(!joined.contains("import dry-run: messages:"), "{joined}");
+        // The store files never changed (only file-copied).
+        assert_eq!(
+            (file_sha256(&super::super::db_file(&store)), file_sha256(&super::super::key_file(&store))),
+            before
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_mapping_dry_classifies_against_a_copied_store() {
+        let dir = temp_dir("drymap");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        // The mapping file.
+        let map_path = dir.join("mapping.json");
+        std::fs::write(&map_path, DRY_MAPPING_JSON).unwrap();
+        // A FAKE shadow store seeded like the writer would leave it:
+        // m101 capture WITH text, m102 capture cipher-only (NULL text
+        // AND NULL sender).
+        let store = dir.join("shadow-store");
+        std::fs::create_dir_all(&store).unwrap();
+        {
+            let conn = fake_shadow_store(&store);
+            super::super::writer::apply(
+                &conn,
+                &Write::Message {
+                    msg_id: "101".into(),
+                    conv_id: "u1".into(),
+                    sender_id: Some("u1".into()),
+                    ts: 1_690_000_000_000,
+                    kind: 1,
+                    text: Some("cap-text".into()),
+                    payload: r#"{"msgId":"101","uidFrom":"u1","idTo":"u2","ts":1690000000000,"msgType":"webchat","content":"cap-text"}"#.into(),
+                    source: "capture",
+                    is_group: Some(false),
+                },
+            )
+            .unwrap();
+            super::super::writer::apply(
+                &conn,
+                &Write::Message {
+                    msg_id: "102".into(),
+                    conv_id: "u1".into(),
+                    sender_id: None,
+                    ts: 1_690_000_001_000,
+                    kind: 2,
+                    text: None,
+                    payload: r#"{"msgId":"102","uidFrom":"u1","idTo":"u2","ts":1690000001000,"msgType":"chat.photo"}"#.into(),
+                    source: "capture",
+                    is_group: Some(false),
+                },
+            )
+            .unwrap();
+        }
+        let before = (
+            file_sha256(&super::super::db_file(&store)),
+            file_sha256(&super::super::key_file(&store)),
+        );
+
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.mapping = Some(map_path.clone());
+        a.shadow_copy = Some(store.clone());
+        a.delta = true;
+        let lines = run_mapping_dry(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(joined.contains(&format!("mapping={}", map_path.display())), "{joined}");
+        assert!(joined.contains("plan OK (msgType entries=1, message[one2one]table=msg)"), "{joined}");
+        // The four rows of 111.db: 101 ignored (capture has it),
+        // 102 fill_null (NULL cells), 103+104 new. The g222/stranger
+        // DBs are not in the mapping's kinds — never opened.
+        assert!(
+            joined.contains(
+                "import dry-run: messages: extracted=4 new=2 fill_null=1 ignored=1 \
+                 update_import=0 skipped=0 by_kind=one2one=4"
+            ),
+            "{joined}"
+        );
+        // The delta line: no cursor yet (nothing applied ever), the
+        // raw-table totals, and the cursor an apply would write. Note
+        // rowid: `id INTEGER PRIMARY KEY` IS the rowid alias here, so
+        // max(rowid) is 104, not 4.
+        assert!(
+            joined.contains(
+                "import delta: Core/Message/111.db cursor=none total_rows=4 \
+                 would_extract=4 next_cursor=1690000003:104"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("dbs opened=1 failed=0"), "{joined}");
+        assert!(joined.contains("no writes performed"), "{joined}");
+        // The shadow store files never changed.
+        assert_eq!(
+            (file_sha256(&super::super::db_file(&store)), file_sha256(&super::super::key_file(&store))),
+            before
+        );
+        // The snapshot was never touched either (immutable proof).
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(
+            names,
+            vec![
+                "111.db".to_string(),
+                "g222.db".to_string(),
+                "stranger_box.db".to_string(),
+                "undefined.db".to_string(),
+                "weird.db".to_string()
+            ]
+        );
+        // CLI exit-code path with the same flags: 0.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            sha12(pass.as_bytes()),
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--mapping".to_string(),
+            map_path.to_string_lossy().into_owned(),
+            "--shadow-copy".to_string(),
+            store.to_string_lossy().into_owned(),
+            "--delta".to_string(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_mapping_dry_plan_errors_name_the_missing_column() {
+        let dir = temp_dir("dryplan");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        // A mapping referencing a column the fake schema does not
+        // have: the dry run fails closed, listing exactly that.
+        let bad = DRY_MAPPING_JSON.replace("\"msgId\": \"id\",", "\"msgId\": \"nope\",");
+        let map_path = dir.join("mapping.json");
+        std::fs::write(&map_path, bad).unwrap();
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.mapping = Some(map_path);
+        let e = run_mapping_dry(&a).unwrap_err();
+        assert!(
+            e.contains("mapping failed validation (1 error(s))"),
+            "{e}"
+        );
+        assert!(
+            e.contains("columns.msgId: column \"nope\" does not exist in table \"msg\""),
+            "{e}"
+        );
+        // The CLI exit-code path: exit 1 with the same message.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            sha12(pass.as_bytes()),
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--mapping".to_string(),
+            dir.join("mapping.json").to_string_lossy().into_owned(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

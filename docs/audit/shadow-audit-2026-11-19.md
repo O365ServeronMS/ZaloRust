@@ -471,3 +471,45 @@ Chưa xác minh runtime (reviewer chạy):
 - Lưu ý: file spec `D:\.opencode\zalo-shadow-schema-v1.sql` KHÔNG được
   cập nhật phần v2 (quy tắc worktree-only); nguồn chân lý của v2 là
   `schema.rs`.
+
+### Desktop schema inventory + mapping + overlap probe — batch 12
+
+Phase 2.3 prep (§4 items 2.3/2.4/2.7 groundwork); cách dùng đầy đủ nằm
+trong **`docs/import-mapping.md`** (link từ đây). `--apply` vẫn
+fail-closed (2.5 là bước riêng, cần user duyệt).
+
+- **L1 `import::inventory`** (`shadow/import/inventory.rs`): shape-only
+  qua `sqlite_master` + `PRAGMA table_info` + `count(*)` + `index_list`,
+  identifier-quote an toàn. CLI `--inventory` (dry-run only, xung đột
+  `--apply`) in `Core\Index.db` + MỘT sample mỗi loại message DB (1-1
+  đầu tiên, group đầu tiên, stranger_box) — chỉ tên/cột/kiểu/đếm — và
+  ghi JSON qua `--out`.
+- **L2 `shadow/import_map.rs`**: mapping JSON khai báo (KHÔNG có SQL
+  tự do): mỗi entity (conversation/contact/group/message/attachment)
+  chọn db kind (index/one2one/group/stranger) + bảng + cột map
+  `{target: col | {const} | {expr}}` với expr whitelist đúng
+  `ms_to_ms, s_to_ms, string, int, json_object_of` (thêm const đặc biệt
+  `$db_id` = số trong tên file DB). `plan()` đối chiếu TẤT CẢ tham chiếu
+  với inventory và liệt kê chính xác thứ thiếu. `extract()` sinh đúng
+  `Write` như đường capture (source='import', msgType qua bảng map
+  pass-through mặc định, is_group từ db kind, content media dạng JSON
+  text trở thành object như wire shape). Dry run `--mapping` +
+  `--shadow-copy`: phân loại NEW / FILL NULL (import chỉ đắp ô NULL của
+  capture/e2ee — không bao giờ đè text/payload) / IGNORED /
+  UPDATE_IMPORT bằng quy tắc precedence của writer, READ-ONLY trên bản
+  COPY temp của shadow (`query_only`), không ghi gì đâu.
+- **L3 `probe_import_overlap`** (`#[ignore]`, env `ZR_SNAPSHOT_DIR` /
+  `ZR_D7_KEY_FILE` / `ZR_UIN_HASH` / `ZR_MAPPING`): 20 hội thoại mới
+  nhất có ở cả hai bên (10 1-1 + 10 nhóm), so msgId trong cửa sổ thời
+  gian giao nhau + type/ts/sender agreement, tổng kết với verdict AC
+  (≥99% msgId, 100% type/ts/sender). Hàm so sánh thuần đã unit-test;
+  in h12 conv id, không in nội dung.
+- **L4 delta cursor**: `sync_cursors` scope `import:<db-rel-path>`
+  `"<max_ts>:<max_rowid>"` (ts giữ nguyên đơn vị của CỘT nguồn);
+  `--delta` cho extract bỏ qua hàng khi rowid ≤ max VÀ ts ≤ max;
+  dry run chỉ ĐỌC cursor (ghi là việc của 2.5).
+- Cần user/reviewer chạy trên dữ liệu thật (xem `docs/import-mapping.md`
+  §0–§5): thoát Desktop + snapshot + key D7 thật (2.1/2.2 đã có từ
+  batch 6), rồi `--inventory` → viết mapping → dry run → overlap probe,
+  lặp tới khi AC đạt; `Media.db` / `Reaction.db` chưa có kind riêng
+  (attachment hiện chỉ đếm).
