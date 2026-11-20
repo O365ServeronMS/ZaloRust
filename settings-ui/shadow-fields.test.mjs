@@ -123,9 +123,19 @@ ok(!/\bs\.shadow\s*=(?!\.)/.test(mainJs),
 // --- the folder pickers reuse the download-dir picker -----------------------
 ok(/async function chooseMediaStore\(\)/.test(mainJs), "chooseMediaStore() exists");
 ok(/async function chooseBackupDir\(\)/.test(mainJs), "chooseBackupDir() exists");
-ok(count(/invoke\("pick_download_dir"\)/g, mainJs) === 3,
+ok(count(/invoke\("pick_download_dir"/g, mainJs) === 3,
   "both shadow pickers reuse pick_download_dir");
-ok(/invoke\("pick_download_dir"\)[\s\S]{0,200}if \(!dir\) return;/.test(mainJs),
+// Batch 10 J5: each shadow picker passes its own semantic title key —
+// media_store -> "media", backup_dir -> "backup" — so the dialog
+// title names the folder being picked, while the download picker
+// (the third call) stays argument-less and keeps the default title.
+ok(/invoke\("pick_download_dir", \{ titleKey: "media" \}\)/.test(mainJs),
+  "chooseMediaStore() passes titleKey=media");
+ok(/invoke\("pick_download_dir", \{ titleKey: "backup" \}\)/.test(mainJs),
+  "chooseBackupDir() passes titleKey=backup");
+ok(count(/titleKey: "(?:media|backup)"/g, mainJs) === 2,
+  "exactly the two shadow pickers pass a titleKey (download_dir does not)");
+ok(/invoke\("pick_download_dir", \{ titleKey: "media" \}\)[\s\S]{0,120}if \(!dir\) return;/.test(mainJs),
   "chooseMediaStore() reuses pick_download_dir and returns on cancel");
 ok(/if \(!\(await save\(\)\)\) input\.value = previous;/.test(mainJs),
   "a refused path is rolled back out of the input");

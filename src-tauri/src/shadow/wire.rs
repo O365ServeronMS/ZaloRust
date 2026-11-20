@@ -30,7 +30,7 @@
 //! NOTE (handoff): `zcld.chat.zalo.me/cloudmedia/*` responses use a
 //! different key and stay undecoded — stored, never claimed decrypted.
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use aes_gcm::aead::Aead as _;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -38,6 +38,9 @@ use serde_json::{json, Map, Value};
 /// AES-128-GCM with a 16-byte nonce (Zalo's nonstandard GCM IV length).
 type Aes128GcmN16 = aes_gcm::AesGcm<aes_gcm::aes::Aes128, aes_gcm::aead::consts::U16>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+/// The ENCODE side of the CBC format — used only by the test fixture
+/// builders below (the app only decodes).
+#[cfg(test)]
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -496,6 +499,9 @@ mod tests {
         // both a `+` and a `/` (a handful of tries at most — each
         // ciphertext is fresh AES output).
         let (raw_b64, n): (String, u64) = {
+            // The trait brings encrypt_padded_vec_mut into this scope
+            // (test_encode_rest imports it locally for itself).
+            use aes::cipher::BlockEncryptMut as _;
             let mut i = 0u64;
             loop {
                 let enc = Aes128CbcEnc::new_from_slices(&key, &iv).unwrap();

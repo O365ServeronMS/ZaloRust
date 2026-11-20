@@ -244,9 +244,22 @@ fn key_shaped(v: &Value, depth: u32) -> bool {
 
 /// Map one E2EE plaintext message forwarded by the bridge tap.
 /// `m` is the decrypted message object; `source` is always `e2ee`.
-/// The bridge payload carries no group context on its own (no
-/// envelope array key, no `isGroup` field) — the stub marker stays
-/// `None` (B5), and the conversation id keeps the 1-1 logic.
+///
+/// B5, re-verified for batch 10 (J5): the stub marker stays `None`
+/// because the bridge payload carries NO reliable group marker:
+/// - the group-ness of a capture-side message lives in the ENVELOPE
+///   ARRAY KEY (`groupMsgs` vs `msgs`/`pageMsgs`/`eeMsgs` — verified
+///   live, audit §1 item 5: the same message sits in
+///   `.data.data.groupMsgs[0]`), and bridge.js forwards only the
+///   message object, never the array it came from;
+/// - `isGroup` exists only on `clearUnreads` conversation stubs, and
+///   `toGroupId` appears nowhere in the observed wire shapes;
+/// - guessing from `idTo`'s shape is exactly the unreliable kind:
+///   group ids and peer uids are BOTH 19-digit numbers with no `g`
+///   prefix (probe_group/probe_ctx measured both), so a length or
+///   numeric check would silently mistype half the stubs.
+/// An honest unknown beats a wrong guess: the stub stays type 0 and
+/// the Conversation/Group writes still refine the type later.
 pub fn normalize_e2ee_message(m: &Value, own_uid: Option<&str>) -> Option<Write> {
     message_to_write(m, None, "e2ee", own_uid)
 }
@@ -645,12 +658,25 @@ mod tests {
             _ => panic!(),
         }
         // The bridge E2EE payload carries no group context -> None
-        // (B5: honest unknown; conv id keeps the 1-1 logic).
+        // (B5: honest unknown; conv id keeps the 1-1 logic). Pinned
+        // for batch 10 (J5): even a payload whose `idTo` IS a
+        // 19-digit group-shaped id stays `None` — group ids and peer
+        // uids are indistinguishable by shape, so NO heuristic may
+        // fire here (see normalize_e2ee_message's doc).
         let plain = json!({"msgId": "k3", "uidFrom": "u1", "idTo": "0", "ts": 1,
                             "msgType": "webchat", "content": "c"});
         let Some(Write::Message { is_group, .. }) = normalize_e2ee_message(&plain, None) else {
             panic!()
         };
         assert_eq!(is_group, None);
+        let group_shaped = json!({"msgId": "k4", "uidFrom": "u1", "idTo": "4945066207717951086",
+                                   "ts": 1, "msgType": "webchat", "content": "c"});
+        let Some(Write::Message { is_group, conv_id, .. }) =
+            normalize_e2ee_message(&group_shaped, None)
+        else {
+            panic!()
+        };
+        assert_eq!(is_group, None, "a group-SHAPED idTo is not a group MARKER");
+        assert_eq!(conv_id, "u1", "the 1-1 conv logic still applies");
     }
 }

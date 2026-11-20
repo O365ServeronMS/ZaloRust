@@ -158,7 +158,7 @@ fn probe_shapes() {
             .prepare("SELECT endpoint, payload_json FROM raw_events WHERE kind='rest' AND endpoint LIKE '%get-last-msgs%' LIMIT 1")
             .unwrap();
         for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap() {
-            let (ep, p) = row.unwrap();
+            let (_ep, p) = row.unwrap();
             let v: Value = serde_json::from_str(&p).unwrap();
             println!("REST-LAST-MSGS (len {}):", p.len());
             println!("{}", shape(&v, 1));

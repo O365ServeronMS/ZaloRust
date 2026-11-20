@@ -153,6 +153,10 @@ static EN_TABLE: &[(&str, &str)] = &[
     ("A pasta não existe.", "The folder does not exist."),
     ("Não é possível gravar nessa pasta.", "That folder is not writable."),
     ("Pasta de downloads", "Download folder"),
+    // folder-picker dialog titles (batch 10 J5; PT keys shared with
+    // settings-ui/i18n.js, VI via the same vi.json)
+    ("Pasta de armazenamento de mídia", "Media storage folder"),
+    ("Pasta de backup", "Backup folder"),
     ("Ícone do aplicativo", "App icon"),
     ("A imagem tem mais de 5 MB.", "The image is larger than 5 MB."),
     ("O arquivo não é uma imagem PNG.", "The file is not a PNG image."),

@@ -239,6 +239,12 @@ mod probe_audit;
 #[cfg(test)]
 mod probe_coverage;
 
+/// E2EE coverage probe (audit §4 item 1.5 AC iv, batch 10 J3): every
+/// cmd-551 msgId is either plaintext `source='e2ee'` or listed. Pure
+/// census unit-tested; the ignored test reads a temp COPY.
+#[cfg(test)]
+mod probe_e2ee_coverage;
+
 /// Maintenance probe (audit §1.2 migration, E4): repair_v1 dry-run +
 /// real run against a temp COPY of the live store — never the live DB.
 #[cfg(test)]

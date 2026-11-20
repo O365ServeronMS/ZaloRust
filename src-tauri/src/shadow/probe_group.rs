@@ -69,7 +69,6 @@ fn probe_group_fields() {
     let mut st = live
         .prepare("SELECT payload_json FROM raw_events WHERE kind='ws' AND payload_json LIKE '%clearUnreads%' LIMIT 40")
         .unwrap();
-    let mut sentinels: std::collections::BTreeSet<String> = Default::default();
     let mut sentinel_list: Vec<String> = Vec::new();
     for row in st.query_map([], |r| Ok(r.get::<_, String>(0)?)).unwrap() {
         let p = row.unwrap();

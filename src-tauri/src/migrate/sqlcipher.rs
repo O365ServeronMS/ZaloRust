@@ -91,7 +91,11 @@ pub fn load_key(path: &Path) -> Result<Vec<u8>, KeyError> {
 /// NOT the D7 path: the 2026-11-19 D7 Zalo-Desktop capture passed
 /// `"zalors.d7"` as `szDataDescr` (the description parameter), NOT as
 /// entropy, so its blob unwraps only with [`unwrap_no_entropy`]
-/// (audit M2-1). Kept for genuinely labeled captures.
+/// (audit M2-1). Kept for genuinely labeled captures; nothing in the
+/// production paths calls it today (the M2-1 regression test below
+/// does — so it is compiled with the tests, not shipped dead in the
+/// app binary).
+#[cfg(test)]
 pub fn unwrap_with_label(blob: &[u8], label: &str) -> Result<Vec<u8>, KeyError> {
     unwrap(blob, Some(label))
 }
@@ -161,7 +165,10 @@ pub fn open_with_key_readonly(path: &Path, key: &[u8]) -> Result<Connection, Key
     open_with_key_opts(path, key, true)
 }
 
-/// Encrypted in-memory DB for tests.
+/// Encrypted in-memory DB for tests (every schema/writer/probe test
+/// module opens its fake stores through this — nothing in the app
+/// binary needs it, so it compiles with the tests only).
+#[cfg(test)]
 pub fn open_in_memory(key: &[u8]) -> Result<Connection, KeyError> {
     let conn = Connection::open_in_memory()?;
     apply_key(&conn, key)?;

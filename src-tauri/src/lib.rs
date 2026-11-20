@@ -418,9 +418,17 @@ pub fn run() {
         .run(|_app_handle, _event| {
             // Give restyled panels their real geometry back before the exit
             // saves window state. The tray Quit path does the same.
-            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::ExitRequested { .. } = &_event {
+                #[cfg(target_os = "macos")]
                 menubar::restore_all(_app_handle);
+
+                // Audit §4 4.1 follow-up (batch 10 J4): one DB backup on
+                // app exit — only when backups are configured, skipped when
+                // one just ran, never blocking exit longer than 20 s. The
+                // flusher (single writer) runs the export; media backup is
+                // NOT part of the exit path. No-op on every platform where
+                // the shadow pipeline is off or unconfigured.
+                shadow::backup::on_exit(_app_handle);
             }
 
             // macOS delivers scheme links (zalors://…) as an Apple

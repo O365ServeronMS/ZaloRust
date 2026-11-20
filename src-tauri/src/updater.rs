@@ -1597,6 +1597,9 @@ mod tests {
         }
     }
 
+    // Every caller is a #[cfg(unix)] test; without the gate the
+    // Windows test build flags the helper as dead.
+    #[cfg(unix)]
     fn leftovers(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()

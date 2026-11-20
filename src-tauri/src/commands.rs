@@ -452,21 +452,43 @@ pub fn open_release_page(window: tauri::Webview, app: tauri::AppHandle) -> Resul
     Ok(())
 }
 
+/// The dialog title for one folder-picker invocation (batch 10 J5).
+/// `title_key` is a SEMANTIC key the settings window sends, never a
+/// literal title — unknown or absent keys keep the download default,
+/// so a stale or hostile caller cannot put arbitrary text in a
+/// native dialog. Every language goes through `tr` (PT source, EN/VI
+/// via the shared tables).
+fn folder_title(title_key: Option<&str>) -> std::borrow::Cow<'_, str> {
+    match title_key {
+        // The two shadow pickers (batch 7 G1 / batch 8 H4) used to
+        // show the download title — each now shows its own.
+        Some("media") => tr("Pasta de armazenamento de mídia"),
+        Some("backup") => tr("Pasta de backup"),
+        _ => tr("Pasta de downloads"),
+    }
+}
+
 /// Ask for a download folder with the system's folder picker. Returns the
 /// chosen path (already checked as writable), or `None` if cancelled. The UI
 /// saves it with the other settings. In the Flatpak the picker is the
 /// xdg-desktop-portal one, so the folder is exported into the sandbox.
+///
+/// `title_key` (batch 10 J5, optional): `"media"` / `"backup"` makes the
+/// dialog show the media-store / backup-folder title instead of the
+/// download one; absent (or unknown) keeps `pick_download_dir`'s
+/// behaviour byte-for-byte.
 #[tauri::command]
 pub async fn pick_download_dir(
     window: tauri::Webview,
     app: tauri::AppHandle,
+    title_key: Option<String>,
 ) -> Result<Option<String>, String> {
     if is_remote(&window) {
         return Err("forbidden".into());
     }
     lock::require_unlocked(&app)?;
     use tauri_plugin_dialog::DialogExt;
-    let mut dialog = app.dialog().file().set_title(tr("Pasta de downloads"));
+    let mut dialog = app.dialog().file().set_title(folder_title(title_key.as_deref()));
     if let Some(dir) = app.path().download_dir().ok().filter(|d| d.is_dir()) {
         dialog = dialog.set_directory(dir);
     }
@@ -1149,7 +1171,8 @@ pub fn reset_app_lock(
 
 #[cfg(test)]
 mod tests {
-    use super::is_remote_label;
+    use super::{folder_title, is_remote_label};
+    use crate::i18n::{tr_in, Lang};
 
     #[test]
     fn is_remote_wa_prefix_is_true() {
@@ -1164,5 +1187,38 @@ mod tests {
     #[test]
     fn is_remote_settings_is_false() {
         assert!(!is_remote_label("settings"));
+    }
+
+    // --- batch 10 J5: the folder-picker titles --------------------------
+
+    #[test]
+    fn folder_titles_are_translated_per_key() {
+        // Each known key routes to its OWN Portuguese source string
+        // (whatever the current language is)…
+        assert_eq!(folder_title(Some("media")), crate::i18n::tr("Pasta de armazenamento de mídia"));
+        assert_eq!(folder_title(Some("backup")), crate::i18n::tr("Pasta de backup"));
+        // …and each source string really maps in BOTH languages (the
+        // vi.json side is additionally pinned by i18n.rs's
+        // every_english_text_has_a_vietnamese_entry).
+        assert_eq!(
+            tr_in(Lang::En, "Pasta de armazenamento de mídia"),
+            "Media storage folder"
+        );
+        assert_eq!(
+            tr_in(Lang::Vi, "Pasta de armazenamento de mídia"),
+            "Thư mục lưu trữ media"
+        );
+        assert_eq!(tr_in(Lang::En, "Pasta de backup"), "Backup folder");
+        assert_eq!(tr_in(Lang::Vi, "Pasta de backup"), "Thư mục sao lưu");
+        // …while absent/unknown keys keep the download default — a
+        // hostile or stale caller cannot put arbitrary text in the
+        // native dialog.
+        for key in [None, Some("download"), Some("MEDIA"), Some("whatever <b>")] {
+            assert_eq!(
+                folder_title(key),
+                crate::i18n::tr("Pasta de downloads"),
+                "{key:?} falls back to the download title"
+            );
+        }
     }
 }

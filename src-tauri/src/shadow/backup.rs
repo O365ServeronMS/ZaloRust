@@ -31,8 +31,13 @@
 //! retention buckets derive from the same rendering, so the schedule
 //! is self-consistent without a timezone database.
 //!
-//! No on-exit backup in this batch — follow-up noted for the next
-//! one (the flusher's shutdown path would own it).
+//! On-exit backup (batch 10 J4, audit 4.1 follow-up): when
+//! `backup_enabled && backup_dir` are set, app exit runs ONE DB
+//! backup through the same `Job::Backup` path (the flusher still owns
+//! the only RW connection), waits at most [`EXIT_WAIT`] for the
+//! reply, then continues exiting regardless. A backup that finished
+//! less than [`EXIT_SKIP_RECENT_MS`] ago is skipped. Media backup is
+//! NOT run on exit.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
@@ -43,6 +48,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tauri::Manager as _;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::pipeline::sqlite_kind;
@@ -140,8 +146,10 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 - 719_468 + doe as i64
 }
 
-/// Civil date for days since 1970-01-01.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// Civil date for days since 1970-01-01. `pub(crate)`: the FTS
+/// coverage probe (probe_e2ee_coverage.rs) renders ts buckets with
+/// the same exact integer math.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -712,6 +720,123 @@ pub fn backup_media(store_root: &Path, dest_root: &Path) -> MediaBackupReport {
     report
 }
 
+// --- J4: the on-exit DB backup (audit §4 4.1 follow-up, batch 10) -----------
+
+/// The exit path skips when the last successful DB backup is younger
+/// than this (the scheduled thread stamps the same clock).
+pub(crate) const EXIT_SKIP_RECENT_MS: i64 = 30 * 60 * 1000;
+
+/// How long app exit waits for the flusher's backup reply before
+/// continuing regardless (a backup export is typically seconds; the
+/// bound exists so exit can never hang on it).
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(20);
+
+/// When the last successful DB backup ran (epoch ms; 0 = never this
+/// process). Stamped by the scheduled thread after each successful DB
+/// half and by the exit path after its own — so a short session whose
+/// ~2-minute first run already fired, and a session whose exit just
+/// backed up, both read "recent". Shared atomic per J4: the backup
+/// thread writes it, the exit path reads it.
+static LAST_OK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The pure verdict of the exit path (J4): run, or why not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitBackupDecision {
+    /// Backups are off or no folder is configured: nothing to do (and
+    /// nothing to log — most installs never configure backups).
+    NotConfigured,
+    /// A DB backup succeeded less than [`EXIT_SKIP_RECENT_MS`] ago.
+    Recent,
+    /// Ask the flusher for one `Job::Backup`.
+    Run,
+}
+
+/// Pure skip decision for the exit backup (J4). `last_ok_ms <= 0`
+/// means "never this process" (run); a FUTURE stamp (clock skew)
+/// saturates to age 0 and skips — fail-safe: never a surprise second
+/// export right after a successful one.
+pub(crate) fn exit_backup_decision(
+    enabled: bool,
+    has_dir: bool,
+    last_ok_ms: i64,
+    now_ms: i64,
+) -> ExitBackupDecision {
+    if !enabled || !has_dir {
+        return ExitBackupDecision::NotConfigured;
+    }
+    if last_ok_ms > 0 && now_ms.saturating_sub(last_ok_ms) < EXIT_SKIP_RECENT_MS {
+        return ExitBackupDecision::Recent;
+    }
+    ExitBackupDecision::Run
+}
+
+/// The single log line the exit path writes for one `Job::Backup`
+/// round trip (pure — the caller supplies the `recv_timeout` result).
+/// Kinds only, counts only: `ok (tables=N size_mb=M)` /
+/// `skipped (recent)` / `timeout` / `FAILED (<kind>)`, exactly as the
+/// brief's four outcomes.
+fn exit_backup_line(reply: &Result<DbBackupOutcome, std::sync::mpsc::RecvTimeoutError>) -> String {
+    match reply {
+        Ok(db) if db.ok => format!(
+            "shadow backup (exit): ok (tables={} size_mb={:.1})",
+            db.tables,
+            db.size as f64 / 1_048_576.0
+        ),
+        Ok(db) => format!(
+            "shadow backup (exit): FAILED ({})",
+            db.kind.as_deref().unwrap_or("unknown")
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            "shadow backup (exit): timeout".into()
+        }
+        // The flusher dropped its end (shutdown race): the export may
+        // still be running on its thread, but exit never waits past
+        // EXIT_WAIT — the tmp+rename design leaves nothing partial.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            "shadow backup (exit): FAILED (flusher-gone)".into()
+        }
+    }
+}
+
+/// One DB backup on app exit (J4), called from `lib.rs`'s
+/// `RunEvent::ExitRequested` handler. Only when `backup_enabled &&
+/// backup_dir` (current settings, same condition the backup thread
+/// uses); skips when a DB backup finished
+/// [`EXIT_SKIP_RECENT_MS`] ago; waits at most [`EXIT_WAIT`]; never
+/// blocks exit longer. Media backup is NOT run on exit (4.2 stays
+/// the scheduled thread's job). Log: exactly one line, one of the
+/// four outcomes above. `tauri::AppHandle` is the only non-pure
+/// input; the decision itself is [`exit_backup_decision`].
+pub(crate) fn on_exit(app: &tauri::AppHandle) {
+    // No pipeline running -> no flusher owns the DB -> nothing to ask.
+    if app.try_state::<super::runtime::Shadow>().is_none() {
+        return;
+    }
+    let cfg = crate::settings::load(app).shadow;
+    let now = schema::now_ms();
+    let last_ok = LAST_OK_MS.load(std::sync::atomic::Ordering::Relaxed);
+    match exit_backup_decision(cfg.backup_enabled, cfg.backup_dir.is_some(), last_ok, now) {
+        ExitBackupDecision::NotConfigured => {}
+        ExitBackupDecision::Recent => {
+            crate::dlog::log("shadow backup (exit): skipped (recent)");
+        }
+        ExitBackupDecision::Run => {
+            // Ask the flusher (A5: it owns the only RW connection).
+            // A send failure is the shutdown race — log and go on.
+            let reply = match super::runtime::request_backup(app) {
+                Some(rx) => rx.recv_timeout(EXIT_WAIT),
+                None => Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            if let Ok(db) = &reply {
+                if db.ok {
+                    LAST_OK_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            crate::dlog::log(&exit_backup_line(&reply));
+        }
+    }
+}
+
 // --- H4: the run pipeline (flusher side + backup thread) -------------------
 
 /// What the flusher reports back for one `Job::Backup` (the DB half of
@@ -836,6 +961,9 @@ pub(crate) fn start_backup_thread(cfg: ShadowSettings, tx: Sender<Job>) {
                     ));
                     continue;
                 }
+                // J4: stamp the shared clock — the on-exit backup
+                // skips while a DB backup is this fresh.
+                LAST_OK_MS.store(schema::now_ms(), std::sync::atomic::Ordering::Relaxed);
                 // Read-only on the store, on this thread (H4).
                 let store = super::media::media_store_root(&cfg);
                 let media = backup_media(&store, &media_dest);
@@ -1526,6 +1654,122 @@ mod tests {
             assert_eq!(sorted.len(), picks.len(), "picks are distinct");
             assert!(picks.iter().all(|&i| i < len));
         }
+    }
+
+    // --- J4: the on-exit backup decision (pure) -----------------------------
+
+    const NOW: i64 = 1_795_161_374_000; // 2026-11-20T07:56:14Z (the stamp vector)
+
+    #[test]
+    fn exit_decision_runs_when_unconfigured_or_stale() {
+        // Never backed up this process (0) — even with backups on.
+        assert_eq!(
+            exit_backup_decision(true, true, 0, NOW),
+            ExitBackupDecision::Run
+        );
+        // The last success is exactly 30 min old: NOT "< 30 min ago".
+        assert_eq!(
+            exit_backup_decision(true, true, NOW - EXIT_SKIP_RECENT_MS, NOW),
+            ExitBackupDecision::Run
+        );
+        // Older still runs.
+        assert_eq!(
+            exit_backup_decision(true, true, NOW - EXIT_SKIP_RECENT_MS - 1, NOW),
+            ExitBackupDecision::Run
+        );
+    }
+
+    #[test]
+    fn exit_decision_skips_the_unconfigured_and_the_recent() {
+        // Off or dirless — even a second ago.
+        assert_eq!(
+            exit_backup_decision(false, true, 0, NOW),
+            ExitBackupDecision::NotConfigured
+        );
+        assert_eq!(
+            exit_backup_decision(true, false, 0, NOW),
+            ExitBackupDecision::NotConfigured
+        );
+        assert_eq!(
+            exit_backup_decision(false, true, NOW - 1_000, NOW),
+            ExitBackupDecision::NotConfigured,
+            "the switch off wins even when a backup just ran"
+        );
+        // Recent success (1 ms, 1 min, 29 min ago) skips.
+        for age in [1i64, 60_000, EXIT_SKIP_RECENT_MS - 1] {
+            assert_eq!(
+                exit_backup_decision(true, true, NOW - age, NOW),
+                ExitBackupDecision::Recent,
+                "age {age} ms must skip"
+            );
+        }
+        // Clock skew (a future stamp) skips too — fail-safe.
+        assert_eq!(
+            exit_backup_decision(true, true, NOW + 60_000, NOW),
+            ExitBackupDecision::Recent
+        );
+    }
+
+    #[test]
+    fn exit_line_is_exactly_one_of_the_four_outcomes() {
+        let ok = DbBackupOutcome {
+            ok: true,
+            tables: 17,
+            size: 2 * 1_048_576,
+            pruned: 0,
+            kind: None,
+        };
+        assert_eq!(exit_backup_line(&Ok(ok)), "shadow backup (exit): ok (tables=17 size_mb=2.0)");
+        // The failed arm always carries a kind.
+        let failed = DbBackupOutcome::failed("sha256-mismatch");
+        assert_eq!(
+            exit_backup_line(&Ok(failed)),
+            "shadow backup (exit): FAILED (sha256-mismatch)"
+        );
+        assert_eq!(
+            exit_backup_line(&Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "shadow backup (exit): timeout"
+        );
+        assert_eq!(
+            exit_backup_line(&Err(std::sync::mpsc::RecvTimeoutError::Disconnected)),
+            "shadow backup (exit): FAILED (flusher-gone)"
+        );
+    }
+
+    #[test]
+    fn exit_round_trip_and_timeout_over_a_real_channel() {
+        // The exit path's channel mechanics with a fake flusher: the
+        // Job::Backup round trip (reply -> ok line) and the timeout
+        // arm (no reply within a tiny wait) — no tauri, no DB.
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        // Fake flusher: answer one Job::Backup with an ok outcome.
+        std::thread::spawn(move || {
+            if let Ok(Job::Backup { respond }) = rx.recv() {
+                let _ = respond.send(DbBackupOutcome {
+                    ok: true,
+                    tables: 3,
+                    size: 512 * 1024,
+                    pruned: 0,
+                    kind: None,
+                });
+            }
+        });
+        let (rtx, rrx) = std::sync::mpsc::channel::<DbBackupOutcome>();
+        tx.send(Job::Backup { respond: rtx }).unwrap();
+        let reply = rrx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(
+            exit_backup_line(&reply),
+            "shadow backup (exit): ok (tables=3 size_mb=0.5)"
+        );
+
+        // Timeout arm: a reply channel a flusher never answers — the
+        // SENDER stays alive (dropping it would disconnect instead),
+        // so the bounded wait really times out. Tiny in the test; the
+        // real path waits 20 s.
+        let (keep_open, rrx2) = std::sync::mpsc::channel::<DbBackupOutcome>();
+        let reply = rrx2.recv_timeout(Duration::from_millis(20));
+        drop(keep_open);
+        assert_eq!(exit_backup_line(&reply), "shadow backup (exit): timeout");
     }
 }
 

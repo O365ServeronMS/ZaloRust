@@ -95,12 +95,14 @@ async function resetDownloadDir() {
 // Reuses the download-dir folder picker (batch 7 G1): pick_download_dir
 // only chooses a folder and returns the path (null on cancel) — the
 // path is then saved with the other settings and validated by
-// set_settings (media-store checks, KQ9).
+// set_settings (media-store checks, KQ9). Batch 10 J5: `titleKey`
+// makes the dialog show the media-store title instead of the
+// download one.
 async function chooseMediaStore() {
   const input = document.getElementById("media_store");
   const previous = input.value;
   try {
-    const dir = await invoke("pick_download_dir");
+    const dir = await invoke("pick_download_dir", { titleKey: "media" });
     if (!dir) return;
     input.value = dir;
     // save() shows a refusal in the note; then restore the input.
@@ -110,12 +112,13 @@ async function chooseMediaStore() {
 
 // The backup folder uses the same picker and the same rollback (batch
 // 8 H4): set_settings validates it (exists, writable; no same-volume
-// rule — backups may live on any drive).
+// rule — backups may live on any drive). Batch 10 J5: its own dialog
+// title.
 async function chooseBackupDir() {
   const input = document.getElementById("backup_dir");
   const previous = input.value;
   try {
-    const dir = await invoke("pick_download_dir");
+    const dir = await invoke("pick_download_dir", { titleKey: "backup" });
     if (!dir) return;
     input.value = dir;
     if (!(await save())) input.value = previous;

@@ -63,7 +63,9 @@ pub struct Shadow {
 /// `Backup` (batch 8 H4, audit 4.1): the backup thread asks the
 /// flusher to run the DB export on the ONLY RW connection (A5); the
 /// outcome comes back on the one-shot `respond` channel, so the backup
-/// thread can log the run's single line and do the media half itself.
+/// thread can log the run's single line and do the media half itself
+/// (batch 10 J4: the on-exit backup drives the same variant through
+/// `runtime::request_backup`).
 pub(crate) enum Job {
     WsFrame { bytes: Vec<u8>, conn: String, direction: &'static str },
     /// A tracked WS connection closed: wipe its per-connection key.
@@ -77,20 +79,6 @@ pub(crate) enum Job {
     /// reloads the key file itself; the outcome comes back on the
     /// one-shot `respond` channel.
     Backup { respond: Sender<super::backup::DbBackupOutcome> },
-}
-
-impl Job {
-    fn kind(&self) -> &'static str {
-        match self {
-            Job::WsFrame { .. } => "ws",
-            Job::WsClosed { .. } => "ws-closed",
-            Job::RestBody { .. } => "rest",
-            Job::E2ee { .. } => "e2ee",
-            Job::Handshake { .. } => "handshake",
-            Job::MediaDone { .. } => "media",
-            Job::Backup { .. } => "backup",
-        }
-    }
 }
 
 /// Resolve the shadow directory for this install.
@@ -503,6 +491,21 @@ pub fn set_rest_key(app: &tauri::AppHandle, key_b64: String, uid: Option<String>
 /// Settings snapshot helper for the CLI/import side (no app needed there).
 pub fn cfg_from(settings: &Settings) -> ShadowSettings {
     settings.shadow.clone()
+}
+
+/// J4 (batch 10, audit §4 4.1 follow-up): send one `Job::Backup` to
+/// the flusher and hand back its reply channel — the exit path
+/// (`backup::on_exit`) uses this so app exit can run one DB backup on
+/// the ONLY RW connection (A5). `None` when the pipeline is not
+/// running (no `Shadow` state) or the flusher's queue is already gone
+/// (shutdown race): the caller logs and continues exiting.
+pub(crate) fn request_backup(
+    app: &tauri::AppHandle,
+) -> Option<std::sync::mpsc::Receiver<super::backup::DbBackupOutcome>> {
+    let sh = app.try_state::<Shadow>()?;
+    let (rtx, rrx) = std::sync::mpsc::channel();
+    sh.tx.send(Job::Backup { respond: rtx }).ok()?;
+    Some(rrx)
 }
 
 #[cfg(test)]
