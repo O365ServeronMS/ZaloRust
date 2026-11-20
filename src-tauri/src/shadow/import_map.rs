@@ -3,7 +3,6 @@
 //!
 //! The mapping is a DECLARATIVE JSON file — there is NO free SQL in
 //! it, ever. Every value is one of:
-//!
 //! ```json
 //! "target_field": "source_column"
 //! "target_field": { "const": <scalar or "$db_id"> }
@@ -18,6 +17,11 @@
 //! DB FILE NAME (`123.db` → "123"), which is the conversation id the
 //! capture path would derive; plan rejects it for index/stranger
 //! kinds.
+//!
+//! Batch 13: the top level also accepts an optional `"_notes"`
+//! object — free-form `{ "<field path>": "<why uncertain>" }`
+//! documentation for readings that names/types alone cannot settle.
+//! The parser accepts it and DROPS it: `plan`/`extract` never see it.
 //!
 //! Target fields per entity:
 //! - `message` maps the CAPTURE ENVELOPE names (`msgId`, `uidFrom`,
@@ -243,9 +247,21 @@ fn parse_mapping_value(v: &Value) -> Result<Mapping, String> {
         .as_object()
         .ok_or_else(|| String::from("mapping: top level must be a JSON object"))?;
     for k in obj.keys() {
-        if k != "msgType" && k != "entities" {
+        if k != "msgType" && k != "entities" && k != "_notes" {
             return Err(format!(
-                "mapping: unknown key {k:?} (allowed: \"msgType\", \"entities\")"
+                "mapping: unknown key {k:?} (allowed: \"msgType\", \"entities\", \"_notes\")"
+            ));
+        }
+    }
+    // Batch 13: an optional top-level "_notes" object — the mapping
+    // author's uncertainty notes (batch brief: which reading is a
+    // guess pending the batch-14 distinct-values tool). It is
+    // documentation ONLY: free-form, never validated against the
+    // inventory, and neither `plan` nor `extract` ever reads it.
+    if let Some(notes) = obj.get("_notes") {
+        if !notes.is_object() {
+            return Err(String::from(
+                "mapping: \"_notes\" must be an object (field path -> note)",
             ));
         }
     }
@@ -1845,6 +1861,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_mapping_accepts_a_notes_object_and_ignores_it() {
+        // Batch 13: the brief's uncertainty notes ride along in a
+        // top-level "_notes" object. Parsing accepts it and drops it —
+        // a mapping without the notes parses to the exact same Mapping.
+        let doc = r#"{
+          "_notes": { "entities.message.columns.ts": "unit guessed, pending batch 14" },
+          "msgType": {},
+          "entities": {
+            "group": { "db": "index", "table": "grp", "columns": { "group_id": "gid" } }
+          }
+        }"#;
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        assert_eq!(m.entities.len(), 1);
+        let same = parse_mapping(
+            br#"{"msgType": {},"entities": {"group": {"db": "index", "table": "grp", "columns": {"group_id": "gid"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(m, same, "_notes must not change the parsed mapping");
+    }
+
+    #[test]
+    fn parse_mapping_rejects_a_malformed_notes_object() {
+        for bad in [r#"{"_notes": []}"#, r#"{"_notes": "text"}"#, r#"{"_notes": 1}"#] {
+            let e = parse_mapping(bad.as_bytes()).unwrap_err();
+            assert!(e.contains("\"_notes\" must be an object"), "{bad} -> {e}");
+        }
+        // Unknown keys are still refused, with _notes listed as allowed.
+        let e = parse_mapping(br#"{"sql":"SELECT 1"}"#).unwrap_err();
+        assert!(
+            e.contains("unknown key \"sql\" (allowed: \"msgType\", \"entities\", \"_notes\")"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn parse_full_mapping_both_db_forms() {
         let m = parse_mapping(MAPPING_JSON.as_bytes()).unwrap();
         assert_eq!(m.msg_type["chat.text.v2"], "webchat");
@@ -1871,7 +1922,7 @@ mod tests {
             ("[]", "top level must be a JSON object", "not an object"),
             (
                 r#"{"sql":"SELECT 1"}"#,
-                "unknown key \"sql\" (allowed: \"msgType\", \"entities\")",
+                "unknown key \"sql\" (allowed: \"msgType\", \"entities\", \"_notes\")",
                 "free SQL has no place in a mapping",
             ),
             (

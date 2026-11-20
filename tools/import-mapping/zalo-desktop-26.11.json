@@ -1,0 +1,60 @@
+{
+  "_notes": {
+    "_about": "Zalo Desktop 26.11 (snapshot 2026-11-20) -> zalors shadow, written from the --inventory names/types ONLY (batch 13). Every field whose meaning could not be derived from names/types is marked here; batch 14 adds a whitelisted distinct-values tool to settle the code columns.",
+    "msgType": "LEFT EMPTY BY DESIGN: Core/Message/*.db 'message' table stores msgType as INTEGER (numeric Desktop codes) whose meanings are not derivable from names/types. Pass-through keeps messages.type=100 (the honest unknown bucket) until the codes are mapped to web msgType strings by the batch-14 tool.",
+    "entities.message.columns.msgId": "message.msgId is TEXT and the table's pk, matching the capture envelope name exactly; cliMsgId is the client id, carried as an extra envelope field. Confidence: name-match only, not value-verified.",
+    "entities.message.columns.ts": "ts reads serverTime (declared TEXT) as epoch ms (ms_to_ms), chosen by the probe's shape-only comparison: sendDttm agreed 188/263 on matches (per-conv clusters -> sender's device clock), serverTime agreed 253/265 on the same picks. Residual 12/265 ts disagreements (concentrated in 2 conversations) are open for the batch-14 distinct-values tool; sendDttm (client clock) and originTs remain the documented alternatives.",
+    "entities.message.columns.msgType_consequence": "With msgType unmapped every row lands kind=100, so content_json will NOT parse media JSON-text into objects (MEDIA_CODES exclude 100): media 'message' JSON would stay a string and, on a future apply, could fill a NULL text cell with JSON text. Resolve with the code mapping before any apply step (2.5).",
+    "entities.message.columns.content": "Chose the 'message' column (the per-kind Index.db tables image/file/link also carry 'message' as the content blob, so it is read as the wire-content column). Alternatives: 'content', 'msgText'.",
+    "entities.message.columns.uidFrom": "fromUid read as the sender. Self-sent rows may store '0' (capture-path convention -> sender NULL, conv from idTo) or the real own uid (-> conv would become the own uid for 1-1; the probe's per-conv counts expose this).",
+    "entities.message.columns.idTo": "toUid read directly. If the probe shows one2one/group conv misses, the documented fix is {\"const\":\"$db_id\"} on idTo (the DB file-name digits ARE the conversation id).",
+    "entities.message.db": "stranger is included although the stranger_box sample has 0 rows (same schema as the other message DBs).",
+    "entities.conversation": "Index.db 'conversation' has no title/avatar/last_ts columns; nothing is mapped for them. lastSmsLocalId is deliberately NOT mapped to last_msg_id: it is a LOCAL id, not a server msgId, and would poison conversations.last_msg_id.",
+    "entities.contact": "Index.db has both 'friend' (775 rows) and 'friends_info' (638 rows, superset schema with friendRequest* columns); 'friend' is read as the live contact list.",
+    "entities.group.columns.group_id": "The 'group' table's pk is NAMED userId but is read as the GROUP id (the g<id>.db file-name digits / shadow conv id for groups)."
+  },
+  "msgType": {},
+  "entities": {
+    "message": {
+      "db": ["one2one", "group", "stranger"],
+      "table": "message",
+      "columns": {
+        "msgId": "msgId",
+        "cliMsgId": "cliMsgId",
+        "uidFrom": "fromUid",
+        "idTo": "toUid",
+        "ts": { "expr": "ms_to_ms", "of": "serverTime" },
+        "msgType": "msgType",
+        "content": "message"
+      }
+    },
+    "conversation": {
+      "db": "index",
+      "table": "conversation",
+      "columns": {
+        "id": "userId",
+        "is_group": "isGroup",
+        "raw": { "expr": "json_object_of", "of": ["userId", "localType", "isGroup", "numMsg", "pinned", "lastSmsLocalId"] }
+      }
+    },
+    "contact": {
+      "db": "index",
+      "table": "friend",
+      "columns": {
+        "user_id": "userId",
+        "display_name": "displayName",
+        "avatar_url": "avatar",
+        "raw": { "expr": "json_object_of", "of": ["userId", "username", "displayName", "zaloName", "avatar"] }
+      }
+    },
+    "group": {
+      "db": "index",
+      "table": "group",
+      "columns": {
+        "group_id": "userId",
+        "name": "displayName",
+        "raw": { "expr": "json_object_of", "of": ["userId", "displayName", "creatorId", "totalMember", "e2ee"] }
+      }
+    }
+  }
+}

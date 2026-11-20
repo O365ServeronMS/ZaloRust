@@ -102,7 +102,11 @@ those validated, identifier-quoted names.
 Top level: `msgType` (a Desktop→web msgType string table; anything
 unlisted passes through unchanged) and `entities` (only the five
 known names: `conversation`, `contact`, `group`, `message`,
-`attachment`). Each entity names:
+`attachment`), plus an optional `"_notes"` object (batch 13):
+free-form `"{ "<field path>": "<why this reading is uncertain>" }"`
+documentation the parser accepts and IGNORES — neither `plan` nor
+`extract` ever reads it. Use it to mark every field whose meaning
+could not be derived from names/types alone. Each entity names:
 
 - `"db"`: one kind or an array — `"index"` (`Core\Index.db`) or the
   message-DB kinds `"one2one"`, `"group"`, `"stranger"`. A `message`

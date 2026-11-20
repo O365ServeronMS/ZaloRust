@@ -6,10 +6,12 @@ The import (`zalors import --from-snapshot`, shadow/import.rs F3) refuses
 any directory without the snapshot-manifest.json this script writes.
 
 What it does, in order:
-  1. Refuses to run while any process named `Zalo` is running (a snapshot
-     of a live DB would be torn). -Force skips ONLY this check, and only
-     for SYNTHETIC test runs (both dirs under $env:TEMP): never use -Force
-     against the real Desktop data.
+  1. Refuses to run while Zalo Desktop runs (exact process-name match
+     from an explicit list, default just `Zalo` — never a wildcard,
+     never `zalors`; a snapshot of a live DB would be torn). -Force
+     skips ONLY this check, and only for SYNTHETIC test runs (both
+     dirs under $env:TEMP): never use -Force against the real Desktop
+     data.
   2. Refuses a -Dest that already exists, and a -Dest on a different
      volume than -Source (the D9 hardlink step later needs one volume).
   3. Records a manifest of -Source: rel path, size, LastWriteTimeUtc
@@ -57,9 +59,19 @@ if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
     Fail "Source directory not found: $Source"
 }
 
-# Exact process name match only: `Zalo` (never a wildcard -- a wildcard
-# would also catch the user's own zalors.exe, which is allowed to run).
-$zalo = @(Get-Process -Name 'Zalo' -ErrorAction SilentlyContinue)
+# Process guard (M1): refuse while the DESKTOP app runs, and only that.
+# $desktopProcessNames is the EXACT image-name list: `Zalo` is the single
+# Desktop process the audit observed (PID 11604, 2026-11-19); no Desktop
+# helper process names were ever observed, so none are listed. `Get-Process
+# -Name <no-wildcard-chars>` is an exact (case-insensitive) name match,
+# so 'Zalo' can never match 'zalors' -- the user's own zalors.exe (this
+# app) is allowed to run while a snapshot is made. NEVER use a wildcard
+# here: 'zalo*' would refuse on zalors.exe.
+$desktopProcessNames = @('Zalo')
+$zalo = @()
+foreach ($name in $desktopProcessNames) {
+    $zalo += @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+}
 if ($zalo.Count -gt 0 -and -not $Force) {
     $zaloMsg = "Zalo Desktop is running (" + $zalo.Count + " process(es)) - quit it first; " +
         "a snapshot of the live DB would be torn. (-Force skips this check for " +
