@@ -369,5 +369,19 @@
  "This account's Zalo userId (5 to 32 digits). Empty keeps the session-learned one.": "userId Zalo của tài khoản này (5 đến 32 chữ số). Để trống sẽ giữ giá trị học được từ phiên.",
  "UIN hash": "Hash UIN",
  "sha256 of the UIN as 12 lowercase hex characters. Empty skips the accounts row.": "sha256 của UIN dạng 12 ký tự thập lục phân viết thường. Để trống sẽ bỏ qua hàng tài khoản.",
- "Changes in this section take effect after restarting Zalo.": "Các thay đổi trong mục này có hiệu lực sau khi khởi động lại Zalo."
+ "Changes in this section take effect after restarting Zalo.": "Các thay đổi trong mục này có hiệu lực sau khi khởi động lại Zalo.",
+ "The backup folder path must be absolute.": "Đường dẫn thư mục sao lưu phải là đường dẫn tuyệt đối.",
+ "The backup folder does not exist.": "Thư mục sao lưu không tồn tại.",
+ "The backup path is not a folder.": "Đường dẫn sao lưu không phải là một thư mục.",
+ "The backup folder is not writable.": "Thư mục sao lưu không ghi được.",
+ "Automatic shadow backup": "Tự động sao lưu shadow",
+ "Copies the database and media files to the backup folder at regular intervals. Keeps 7 daily and 4 weekly backups.": "Sao lưu cơ sở dữ liệu và các tệp media vào thư mục sao lưu theo chu kỳ định kỳ. Giữ 7 bản sao lưu hằng ngày và 4 bản hằng tuần.",
+ "Backup folder": "Thư mục sao lưu",
+ "Where the database and media copies are written. Choose a folder that already exists.": "Nơi ghi bản sao của cơ sở dữ liệu và media. Hãy chọn một thư mục đã tồn tại.",
+ "Backup interval (hours)": "Chu kỳ sao lưu (giờ)",
+ "Hours between backups; the first one runs about 2 minutes after start.": "Số giờ giữa hai lần sao lưu; lần đầu chạy sau khoảng 2 phút kể từ khi khởi động.",
+ "Disk space warning (%)": "Cảnh báo dung lượng ổ đĩa (%)",
+ "Free percentage on the media folder below which a warning is logged.": "Tỷ lệ phần trăm còn trống của thư mục media, dưới mức này sẽ ghi một cảnh báo.",
+ "Pause media download (%)": "Tạm dừng tải media (%)",
+ "Below this free percentage media downloads pause; text capture continues.": "Dưới tỷ lệ còn trống này việc tải media sẽ tạm dừng; thu thập văn bản vẫn tiếp tục."
 }

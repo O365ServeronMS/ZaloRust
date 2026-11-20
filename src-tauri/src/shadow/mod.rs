@@ -41,8 +41,15 @@ pub mod account;
 /// only (R1, batch 4 review: clear-all eviction killed live capture
 /// state in `capture.rs` and `runtime.rs`).
 pub mod bounded;
+/// Phase 4 backup (audit §4 4.1/4.2, KQ6, batch 8): encrypted DB
+/// export via `sqlcipher_export`, verify, retention, media copy, and
+/// the backup thread (OFF by default).
+pub mod backup;
 pub mod capture;
 pub mod cli;
+/// Disk-space guard for the media store (audit §4 4.3, D13, batch 8):
+/// pure verdict + `GetDiskFreeSpaceExW` (hand-declared — no new crates).
+pub mod disk_space;
 pub mod import;
 pub mod media;
 pub mod normalize;

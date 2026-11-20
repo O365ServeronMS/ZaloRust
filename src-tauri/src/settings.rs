@@ -93,6 +93,23 @@ pub struct ShadowSettings {
     /// never stored). `None` = the accounts row is skipped; a hash is
     /// never invented.
     pub own_uin_hash: Option<String>,
+    /// Phase 4 backup (audit §4 4.1/4.2, batch 8 H4): scheduled
+    /// encrypted DB + media backups. **OFF by default** — nothing runs
+    /// unless this is on AND `backup_dir` is set.
+    pub backup_enabled: bool,
+    /// Where `shadow-<stamp>.db/.json` backups and the `media/` copy
+    /// are written. `None` (or off) = no backup thread. Validated like
+    /// the media store (exists, writable; NO same-volume rule).
+    pub backup_dir: Option<String>,
+    /// Hours between backup runs (the first runs ~2 min after start).
+    pub backup_interval_hours: u32,
+    /// D13 (audit 4.3): free-space percentage at/below which the media
+    /// worker logs a warning transition (downloads continue).
+    pub disk_warn_pct: u8,
+    /// D13 (audit 4.3): free-space percentage at/below which the media
+    /// worker pauses downloading (rows stay `ref`; text capture is
+    /// never affected).
+    pub disk_stop_pct: u8,
 }
 
 impl Default for ShadowSettings {
@@ -109,6 +126,12 @@ impl Default for ShadowSettings {
             // keep the old behaviour (the handshake's learned uid).
             own_uid: None,
             own_uin_hash: None,
+            // H4: the whole Phase 4 feature is opt-in.
+            backup_enabled: false,
+            backup_dir: None,
+            backup_interval_hours: 6,
+            disk_warn_pct: 10,
+            disk_stop_pct: 3,
         }
     }
 }
@@ -256,6 +279,17 @@ impl Settings {
         self.zoom = sanitize_zoom(self.zoom);
         self.language = crate::i18n::sanitize_code(&self.language);
         self.download_dir = self.download_dir.filter(|d| !d.trim().is_empty());
+        // Batch 8 H4: hand-edited backup numbers are clamped into the
+        // ranges the runtime can actually use — a 0-hour interval would
+        // spin the backup thread, a >100 % threshold is meaningless.
+        // `disk_warn_pct < disk_stop_pct` is left alone on purpose: the
+        // verdict checks Stop first, so a warn line below stop is
+        // simply unreachable (benign). `backup_dir` trimming follows
+        // the media_store pattern: normalized in `set_settings`, not
+        // on load.
+        self.shadow.backup_interval_hours = self.shadow.backup_interval_hours.clamp(1, 168);
+        self.shadow.disk_warn_pct = self.shadow.disk_warn_pct.min(100);
+        self.shadow.disk_stop_pct = self.shadow.disk_stop_pct.min(100);
         // Menu-bar-only mode needs WKWebView's inactive-scheduling policy
         // (macOS 14+). Dropping the flag here means a settings file or an
         // older build can never leave the app in a mode it cannot sustain.
@@ -683,6 +717,71 @@ mod tests {
         assert_eq!(back.shadow.media_store.as_deref(), Some("D:\\ZaloRust Data"));
         assert_eq!(back.shadow.own_uid.as_deref(), Some("1234567890123456789"));
         assert_eq!(back.shadow.own_uin_hash.as_deref(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn old_shadow_settings_load_without_backup_fields() {
+        // Batch 8 H4: a settings.json written before this batch carries
+        // none of the five backup fields — `#[serde(default)]` on the
+        // struct fills them with the OFF-by-default values, and every
+        // stored field keeps its value.
+        let s: Settings = serde_json::from_str(
+            r#"{"shadow":{"enabled":true,"media_store":"D:\\ZaloRust Data","own_uid":"1234567890123456789"}}"#,
+        )
+        .unwrap();
+        assert!(s.shadow.enabled);
+        assert!(!s.shadow.backup_enabled, "backups are opt-in");
+        assert_eq!(s.shadow.backup_dir, None);
+        assert_eq!(s.shadow.backup_interval_hours, 6);
+        assert_eq!(s.shadow.disk_warn_pct, 10);
+        assert_eq!(s.shadow.disk_stop_pct, 3);
+        assert_eq!(s.shadow.media_store.as_deref(), Some("D:\\ZaloRust Data"));
+        // The bare shadow object is the same.
+        let s: Settings = serde_json::from_str(r#"{"shadow":{}}"#).unwrap();
+        assert!(!s.shadow.backup_enabled);
+        assert_eq!(s.shadow.backup_interval_hours, 6);
+    }
+
+    #[test]
+    fn backup_settings_roundtrip_and_off_by_default() {
+        // The whole struct survives a save cycle (the flusher and the
+        // backup thread read exactly these fields at start).
+        let mut s = Settings::default();
+        assert!(!s.shadow.backup_enabled, "OFF by default (H4)");
+        assert_eq!(s.shadow.backup_dir, None);
+        s.shadow.backup_enabled = true;
+        s.shadow.backup_dir = Some(r"D:\ZaloRust Backups".into());
+        s.shadow.backup_interval_hours = 12;
+        s.shadow.disk_warn_pct = 15;
+        s.shadow.disk_stop_pct = 5;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.shadow.backup_dir.as_deref(), Some(r"D:\ZaloRust Backups"));
+        assert_eq!(back.shadow.backup_interval_hours, 12);
+        assert_eq!(back.shadow.disk_warn_pct, 15);
+        assert_eq!(back.shadow.disk_stop_pct, 5);
+    }
+
+    #[test]
+    fn hand_edited_backup_numbers_are_clamped() {
+        // A hand-edited settings.json must not leave the backup thread
+        // spinning (0-hour interval) or the thresholds meaningless.
+        let mut s = Settings::default();
+        s.shadow.backup_interval_hours = 0;
+        s.shadow.disk_warn_pct = 200; // > u8 range of a percent
+        s.shadow.disk_stop_pct = 255;
+        let s = s.sanitized();
+        assert_eq!(s.shadow.backup_interval_hours, 1);
+        assert_eq!(s.shadow.disk_warn_pct, 100);
+        assert_eq!(s.shadow.disk_stop_pct, 100);
+        // Sane values pass through untouched.
+        let mut s = Settings::default();
+        s.shadow.backup_interval_hours = 6;
+        s.shadow.disk_warn_pct = 10;
+        s.shadow.disk_stop_pct = 3;
+        let c = s.clone();
+        assert_eq!(s.sanitized().shadow, c.shadow);
     }
 
     #[test]

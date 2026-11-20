@@ -162,6 +162,34 @@
               <span class="row-subtitle">sha256 do UIN em 12 caracteres hexadecimais minúsculos. Vazio não grava a linha da conta.</span></span>
             <input type="text" id="own_uin_hash" autocomplete="off" spellcheck="false" aria-label="Hash UIN" />
           </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Backup automático do shadow</span>
+              <span class="row-subtitle">Copia o banco de dados e os arquivos de mídia para a pasta de backup em intervalos regulares. Mantém 7 backups diários e 4 semanais.</span></span>
+            <input type="checkbox" class="switch" id="backup_enabled" />
+          </label>
+          <div class="row">
+            <span class="row-text"><span class="row-title">Pasta de backup</span>
+              <span class="row-subtitle">Onde o banco de dados e as mídias são copiados. Escolha uma pasta que já exista.</span></span>
+            <div class="hotkey-row">
+              <input type="text" id="backup_dir" class="wide" autocomplete="off" spellcheck="false" aria-label="Pasta de backup" />
+              <button type="button" id="choose_backup_dir" class="secondary">Escolher pasta…</button>
+            </div>
+          </div>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Intervalo de backup (horas)</span>
+              <span class="row-subtitle">Horas entre backups; o primeiro roda cerca de 2 minutos após iniciar.</span></span>
+            <input type="text" id="backup_interval_hours" inputmode="numeric" autocomplete="off" aria-label="Intervalo de backup (horas)" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Aviso de espaço em disco (%)</span>
+              <span class="row-subtitle">Porcentagem livre na pasta de mídia abaixo da qual um aviso é registrado.</span></span>
+            <input type="text" id="disk_warn_pct" inputmode="numeric" autocomplete="off" aria-label="Aviso de espaço em disco (%)" />
+          </label>
+          <label class="row">
+            <span class="row-text"><span class="row-title">Pausar download de mídia (%)</span>
+              <span class="row-subtitle">Abaixo desta porcentagem livre o download de mídia pausa; a captura de texto continua.</span></span>
+            <input type="text" id="disk_stop_pct" inputmode="numeric" autocomplete="off" aria-label="Pausar download de mídia (%)" />
+          </label>
         </div>
         <p class="group-note">As alterações desta seção são aplicadas após reiniciar o Zalo.</p>
       </section>

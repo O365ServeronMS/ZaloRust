@@ -153,6 +153,48 @@ pub fn validate_media_store(
     })
 }
 
+/// `settings.shadow.backup_dir` checks (batch 8 H4): exactly the
+/// media-store checks EXCEPT the same-volume rule — a backup folder
+/// may live on any drive (the D9 hardlink constraint is an
+/// import-media concern, not a backup concern). Same classified error
+/// type so tests assert the REASON.
+pub fn check_backup_dir(path: &Path) -> Result<(), MediaStoreError> {
+    check_media_store(path, None)
+}
+
+/// [`check_backup_dir`] with the classified error mapped to a
+/// translated, value-free message (backup-specific strings — the path
+/// itself is never echoed).
+pub fn validate_backup_dir(path: &Path) -> Result<(), String> {
+    use crate::i18n::tr;
+    check_backup_dir(path).map_err(|e| {
+        tr(match e {
+            MediaStoreError::NotAbsolute => {
+                "O caminho da pasta de backup precisa ser absoluto."
+            }
+            MediaStoreError::Missing => "A pasta de backup não existe.",
+            MediaStoreError::NotADir => "O caminho de backup não é uma pasta.",
+            MediaStoreError::NotWritable => {
+                "Não é possível gravar na pasta de backup."
+            }
+            // Unreachable (no reference root is passed — backups may
+            // live on any drive); kept for match exhaustiveness, and
+            // reuses the translated storage string so the arm can
+            // never render raw source text.
+            MediaStoreError::DifferentVolume => {
+                "A pasta de armazenamento precisa estar na mesma unidade dos dados do Zalo."
+            }
+        })
+        .into_owned()
+    })
+}
+
+/// `settings.shadow.backup_dir`: trimmed; empty becomes `None` (the
+/// documented "not configured" — no backup thread starts).
+pub fn normalize_backup_dir(raw: Option<&str>) -> Option<String> {
+    normalize_media_store(raw)
+}
+
 /// `settings.shadow.media_store`: trimmed; empty becomes `None` (the
 /// documented default root then applies, see `media::media_store_root`).
 pub fn normalize_media_store(raw: Option<&str>) -> Option<String> {
@@ -354,6 +396,59 @@ mod tests {
             "error echoed the path: {err}"
         );
         std::fs::remove_dir_all(scratch("msg")).unwrap();
+    }
+
+    // --- backup_dir (batch 8 H4) -------------------------------------------
+
+    #[test]
+    fn backup_dir_accepts_a_writable_folder_with_no_volume_rule() {
+        // No same-volume rule (H4): there is no reference-root
+        // parameter to pass, so `DifferentVolume` can never be
+        // produced — a backup folder on ANY drive passes the same
+        // existence/writability checks as the media store.
+        let d = scratch("backup-ok");
+        assert_eq!(check_backup_dir(&d), Ok(()));
+        assert_eq!(validate_backup_dir(&d), Ok(()));
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().count(),
+            0,
+            "the probe file must be removed again"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backup_dir_errors_are_classified_and_value_free() {
+        assert_eq!(check_backup_dir(Path::new("relative/backups")), Err(MediaStoreError::NotAbsolute));
+        assert_eq!(
+            check_backup_dir(&scratch("bk").join("never-created")),
+            Err(MediaStoreError::Missing)
+        );
+        let d = scratch("bk-file");
+        let f = d.join("not-a-dir.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(check_backup_dir(&f), Err(MediaStoreError::NotADir));
+        // The user-facing strings never echo the path.
+        let err = validate_backup_dir(&f).unwrap_err();
+        let echoed = f.to_string_lossy();
+        assert!(
+            !err.is_empty()
+                && !err.contains("not-a-dir") && !err.contains(echoed.as_ref()),
+            "error echoed the path: {err}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(scratch("bk")).unwrap();
+    }
+
+    #[test]
+    fn backup_dir_normalization_matches_the_media_store_shape() {
+        assert_eq!(normalize_backup_dir(None), None);
+        assert_eq!(normalize_backup_dir(Some("")), None);
+        assert_eq!(normalize_backup_dir(Some("   ")), None);
+        assert_eq!(
+            normalize_backup_dir(Some(" D:\\ZaloRust Backups ")),
+            Some("D:\\ZaloRust Backups".into())
+        );
     }
 
     // --- own identity (KQ2) ------------------------------------------------

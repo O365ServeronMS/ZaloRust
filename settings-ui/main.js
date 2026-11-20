@@ -108,6 +108,29 @@ async function chooseMediaStore() {
   } catch (e) { flash(String(e)); }
 }
 
+// The backup folder uses the same picker and the same rollback (batch
+// 8 H4): set_settings validates it (exists, writable; no same-volume
+// rule — backups may live on any drive).
+async function chooseBackupDir() {
+  const input = document.getElementById("backup_dir");
+  const previous = input.value;
+  try {
+    const dir = await invoke("pick_download_dir");
+    if (!dir) return;
+    input.value = dir;
+    if (!(await save())) input.value = previous;
+  } catch (e) { flash(String(e)); }
+}
+
+// Numeric shadow field (batch 8): plain digits within the range,
+// anything else falls back to the default. The backend clamps too
+// (Settings::sanitized) — this keeps the payload serializable and
+// the box honest about what will be saved.
+function intField(id, fallback, min, max) {
+  const n = parseInt(document.getElementById(id).value.trim(), 10);
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
+}
+
 async function chooseIcon() {
   try {
     if (await invoke("choose_app_icon")) { showIcon(true); flash("Alterações salvas ✓", 1500); }
@@ -170,6 +193,14 @@ async function load() {
   document.getElementById("media_store").value = s.shadow?.media_store || "";
   document.getElementById("own_uid").value = s.shadow?.own_uid || "";
   document.getElementById("own_uin_hash").value = s.shadow?.own_uin_hash || "";
+  // Shadow backup (batch 8 H4): the five backup fields round-trip the
+  // same way; the numbers fall back to the documented defaults when
+  // an older settings file predates them.
+  document.getElementById("backup_enabled").checked = !!s.shadow?.backup_enabled;
+  document.getElementById("backup_dir").value = s.shadow?.backup_dir || "";
+  document.getElementById("backup_interval_hours").value = String(s.shadow?.backup_interval_hours ?? 6);
+  document.getElementById("disk_warn_pct").value = String(s.shadow?.disk_warn_pct ?? 10);
+  document.getElementById("disk_stop_pct").value = String(s.shadow?.disk_stop_pct ?? 3);
   showIcon(!!s.custom_icon);
   loadProxy(s);
 }
@@ -233,6 +264,14 @@ async function save() {
   s.shadow.media_store = document.getElementById("media_store").value.trim() || null;
   s.shadow.own_uid = document.getElementById("own_uid").value.trim() || null;
   s.shadow.own_uin_hash = document.getElementById("own_uin_hash").value.trim() || null;
+  // Shadow backup (batch 8 H4): empty folder = not configured; the
+  // folder checks (exists, writable, no volume rule) and the number
+  // clamps run in set_settings/Settings::sanitized.
+  s.shadow.backup_enabled = document.getElementById("backup_enabled").checked;
+  s.shadow.backup_dir = document.getElementById("backup_dir").value.trim() || null;
+  s.shadow.backup_interval_hours = intField("backup_interval_hours", 6, 1, 168);
+  s.shadow.disk_warn_pct = intField("disk_warn_pct", 10, 0, 100);
+  s.shadow.disk_stop_pct = intField("disk_stop_pct", 3, 0, 100);
   if (proxySupported) {
     s.proxy_mode = document.getElementById("proxy_mode").value;
     s.proxy_host = document.getElementById("proxy_host").value.trim();
@@ -402,6 +441,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("choose_download_dir").addEventListener("click", chooseDownloadDir);
   document.getElementById("reset_download_dir").addEventListener("click", resetDownloadDir);
   document.getElementById("choose_media_store").addEventListener("click", chooseMediaStore);
+  document.getElementById("choose_backup_dir").addEventListener("click", chooseBackupDir);
   document.getElementById("choose_icon").addEventListener("click", chooseIcon);
   document.getElementById("reset_icon").addEventListener("click", resetIcon);
   // Zoom saves on change rather than on Save: picking a size you cannot see the

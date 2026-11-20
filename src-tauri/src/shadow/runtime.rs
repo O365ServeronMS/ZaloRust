@@ -18,6 +18,9 @@
 //!   over the page's REST decode key; it lives in RAM only.
 //! - `Job::MediaDone` — the media thread's download outcomes (T3/A5:
 //!   the media connection is READ-ONLY; only the flusher writes).
+//! - `Job::Backup` — the backup thread's scheduled request (batch 8
+//!   H4): the flusher runs the DB export on its own connection (A5)
+//!   and reports the outcome back on a one-shot channel.
 //!
 //! The WS per-connection AES key is harvested from frame `cmd=1 subCmd=1`
 //! the same way and never touches disk (redacted before `raw_events`).
@@ -56,6 +59,11 @@ pub struct Shadow {
 /// requestId string. It stays in RAM, is never logged or stored, and
 /// keys the flusher's per-connection decode map; `WsClosed` drops that
 /// connection's key.
+///
+/// `Backup` (batch 8 H4, audit 4.1): the backup thread asks the
+/// flusher to run the DB export on the ONLY RW connection (A5); the
+/// outcome comes back on the one-shot `respond` channel, so the backup
+/// thread can log the run's single line and do the media half itself.
 pub(crate) enum Job {
     WsFrame { bytes: Vec<u8>, conn: String, direction: &'static str },
     /// A tracked WS connection closed: wipe its per-connection key.
@@ -64,6 +72,11 @@ pub(crate) enum Job {
     E2ee { payload: String },
     Handshake { key_b64: String, uid: Option<String> },
     MediaDone { rowid: i64, outcome: writer::MediaOutcome },
+    /// Run one DB backup on the flusher's connection (H4). The flusher
+    /// already holds the shadow dir (it is a `flusher` parameter) and
+    /// reloads the key file itself; the outcome comes back on the
+    /// one-shot `respond` channel.
+    Backup { respond: Sender<super::backup::DbBackupOutcome> },
 }
 
 impl Job {
@@ -75,6 +88,7 @@ impl Job {
             Job::E2ee { .. } => "e2ee",
             Job::Handshake { .. } => "handshake",
             Job::MediaDone { .. } => "media",
+            Job::Backup { .. } => "backup",
         }
     }
 }
@@ -109,16 +123,30 @@ pub fn start(app: &tauri::AppHandle) {
     match open_db(&dir, &s.shadow) {
         Ok(conn) => {
             let media_cfg = s.shadow.clone();
+            // H4 (batch 8): the backup thread starts ONLY when the user
+            // turned backups on AND chose a folder — the feature is
+            // OFF by default (`backup_enabled: false`).
+            let backup_cfg = s.shadow.clone();
+            let flusher_dir = dir.clone();
             std::thread::Builder::new()
                 .name("shadow-flusher".into())
-                .spawn(move || flusher(conn, rx, s.shadow))
+                .spawn(move || flusher(conn, flusher_dir, rx, s.shadow))
                 .ok();
             let media_tx = tx.clone();
+            let backup_tx = tx.clone();
             app.manage(Shadow { tx });
             // P1b/T3: media auto-download on a READ-ONLY connection;
             // every status flip it triggers flows back through the same
             // job queue so the flusher stays the only DB writer.
             super::media::start(dir.clone(), media_cfg, media_tx);
+            // P4/H4: scheduled backups — the flusher owns the only RW
+            // connection (A5), so the DB half arrives as `Job::Backup`
+            // and the media half runs on the backup thread (read-only
+            // on the store).
+            if backup_cfg.backup_enabled && backup_cfg.backup_dir.is_some() {
+                super::backup::start_backup_thread(backup_cfg, backup_tx);
+                crate::dlog::log("shadow: backup thread started");
+            }
             crate::dlog::log("shadow: pipeline started (capture mode cdp)");
         }
         Err(e) => {
@@ -173,7 +201,9 @@ fn open_db(dir: &PathBuf, cfg: &ShadowSettings) -> Result<rusqlite::Connection, 
 const WS_KEYS_CAP: usize = 16;
 
 /// The flusher thread: owns the DB connection and both runtime keys.
-fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
+/// `dir` is the shadow store dir (the `Job::Backup` handler needs it
+/// for the DPAPI key file — batch 8 H4).
+fn flusher(conn: rusqlite::Connection, dir: PathBuf, rx: Receiver<Job>, cfg: ShadowSettings) {
     // D2 (audit M4): one key PER CONNECTION, not one global —
     // overlapping reconnects used to decode with the wrong key.
     // R1: insertion-ordered bounded map — the OLDEST key is evicted
@@ -344,6 +374,16 @@ fn flusher(conn: rusqlite::Connection, rx: Receiver<Job>, cfg: ShadowSettings) {
                     });
                 }
                 Job::MediaDone { rowid, outcome } => media.push((rowid, outcome)),
+                // H4 (batch 8, audit 4.1): the DB export runs on THIS
+                // thread — it owns the only RW connection (A5) —
+                // serialized with every batch write. The media half of
+                // the run is the backup thread's (read-only on the
+                // store); the outcome goes back on the one-shot channel
+                // so that thread can log the run's single line.
+                Job::Backup { respond } => {
+                    let outcome = super::backup::run_db_backup(&conn, &dir, &cfg);
+                    let _ = respond.send(outcome);
+                }
             }
         }
         if items.is_empty() && media.is_empty() {

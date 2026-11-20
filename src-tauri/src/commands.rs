@@ -361,6 +361,19 @@ pub fn set_settings(
             }
         }
         settings.shadow.media_store = media_store;
+        // Batch 8 H4: a NEWLY chosen backup_dir must work now too —
+        // exists, writable, NO same-volume rule (the import hardlink
+        // constraint does not apply to backups). Unchanged values are
+        // not re-checked, and an empty field means "not configured"
+        // (the backup thread only starts when a folder is set).
+        let backup_dir =
+            crate::shadow::settings_check::normalize_backup_dir(settings.shadow.backup_dir.as_deref());
+        if backup_dir != stored.shadow.backup_dir {
+            if let Some(path) = &backup_dir {
+                crate::shadow::settings_check::validate_backup_dir(std::path::Path::new(path))?;
+            }
+        }
+        settings.shadow.backup_dir = backup_dir;
     }
     // The icon is only switched through choose_app_icon / reset_app_icon.
     settings.custom_icon = stored.custom_icon;

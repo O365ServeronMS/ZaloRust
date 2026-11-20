@@ -300,6 +300,12 @@ static EN_TABLE: &[(&str, &str)] = &[
     ("A pasta de armazenamento precisa estar na mesma unidade dos dados do Zalo.", "The storage folder must be on the same drive as the Zalo data."),
     ("O uid configurado não é válido: use de 5 a 32 dígitos.", "The configured uid is not valid: use 5 to 32 digits."),
     ("O hash UIN configurado não é válido: use 12 caracteres hexadecimais minúsculos.", "The configured UIN hash is not valid: use 12 lowercase hexadecimal characters."),
+    // backup folder validation (audit 4.1, batch 8 H4; PT keys only —
+    // the settings window lives in settings-ui/)
+    ("O caminho da pasta de backup precisa ser absoluto.", "The backup folder path must be absolute."),
+    ("A pasta de backup não existe.", "The backup folder does not exist."),
+    ("O caminho de backup não é uma pasta.", "The backup path is not a folder."),
+    ("Não é possível gravar na pasta de backup.", "The backup folder is not writable."),
     // window titles
     ("Zalo — Configurações", "Zalo — Settings"),
     ("Zalo — Conta destacada", "Zalo — Detached account"),

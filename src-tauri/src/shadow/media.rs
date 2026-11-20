@@ -93,10 +93,37 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
             // Rows whose outcome is still in the flusher's queue/hands.
             let mut in_flight: HashSet<i64> = HashSet::new();
             let mut backoff = 30u64;
+            // H3/D13 (batch 8): the last space verdict this thread
+            // logged a transition for. `Ok` is the quiet initial state.
+            let mut disk_state = super::disk_space::SpaceVerdict::Ok;
             loop {
                 std::thread::sleep(Duration::from_secs(backoff.max(5)));
                 if conn.is_none() {
                     conn = open(&dir, &cfg);
+                    continue;
+                }
+                // H3/D13: check the store volume BEFORE each cycle. An
+                // unmeasurable volume (API failure, non-Windows) maps to
+                // Ok — downloads are never paused on missing data. The
+                // bytes themselves never enter a log line.
+                let verdict = super::disk_space::disk_free_space(&root)
+                    .map(|(free, total)| {
+                        super::disk_space::space_verdict(
+                            free,
+                            total,
+                            cfg.disk_warn_pct,
+                            cfg.disk_stop_pct,
+                        )
+                    })
+                    .unwrap_or(super::disk_space::SpaceVerdict::Ok);
+                if let Some(line) = super::disk_space::transition_log(disk_state, verdict) {
+                    crate::dlog::log(line);
+                }
+                disk_state = verdict;
+                if verdict == super::disk_space::SpaceVerdict::Stop {
+                    // 4.3 AC: skip the cycle — rows stay 'ref', nothing
+                    // is marked failed, text capture (the flusher) is
+                    // never affected. Re-checked every cycle.
                     continue;
                 }
                 let c = conn.as_ref().unwrap();
