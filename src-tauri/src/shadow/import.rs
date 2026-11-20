@@ -63,8 +63,10 @@ pub mod distinct;
 pub const SNAPSHOT_MANIFEST: &str = "snapshot-manifest.json";
 
 /// sha256 of `bytes`, first 12 hex chars — the only key fingerprint
-/// ever printed (brief: "only its length and sha256-12").
-fn sha12(bytes: &[u8]) -> String {
+/// ever printed (brief: "only its length and sha256-12"). Batch 16:
+/// `pub(crate)` because the apply step's fixtures build the same fake
+/// D7 captures.
+pub(crate) fn sha12(bytes: &[u8]) -> String {
     let d = Sha256::digest(bytes);
     d.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
@@ -220,7 +222,9 @@ fn immutable_ro_uri(path: &Path) -> Result<String, String> {
 /// passphrase through SQLCipher's KDF — the Desktop DBs are keyed as
 /// passphrases, never as raw `x'hex'` blobs. The assembled statement
 /// and the escaped passphrase copy are zeroized (batch-4 rule).
-fn apply_passphrase_key(conn: &Connection, passphrase: &str) -> Result<(), String> {
+/// Batch 16: `pub(crate)` so the apply step's synthetic fixtures can
+/// key their fake Desktop DBs the same way.
+pub(crate) fn apply_passphrase_key(conn: &Connection, passphrase: &str) -> Result<(), String> {
     let mut escaped = Zeroizing::new(passphrase.replace('\'', "''"));
     let stmt = Zeroizing::new(format!("PRAGMA key = '{}';", escaped.as_str()));
     escaped.zeroize();
@@ -576,7 +580,11 @@ pub fn run(a: &ImportArgs) -> Result<Summary, String> {
     }
 
     if a.apply {
-        return Err("--apply not wired in this rebuild phase yet (dry-run only, fail-closed)".into());
+        return Err(
+            "--apply is dispatched by the CLI before this point (cli::main routes it to \
+             import_apply::run_apply with its preconditions); this default inventory \
+             mode never writes".into(),
+        );
     }
     Ok(s)
 }
@@ -1173,8 +1181,202 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         "import dry-run: dbs opened={dbs_opened} failed={dbs_failed}"
     ));
     lines.push(
-        "import dry-run: no writes performed (dry-run; --apply is not wired — P2 item 2.5)".into(),
+        "import dry-run: no writes performed (dry-run; --apply is a separate, guarded step \
+         — P2 item 2.5, docs/import-mapping.md)"
+            .into(),
     );
+    Ok(lines)
+}
+
+// --- batch 16 P2: media hardlink PREP (item 2.6, dry-run only) --------------
+
+/// One media-metadata table the plan considered (shape only: names,
+/// never values).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTablePlan {
+    /// `Core/Index.db` | `Core/Media.db`.
+    pub source: String,
+    pub table: String,
+    pub path_column: String,
+}
+
+/// The 2.6 dry-run report — counts only, the brief's exact fields.
+/// NO hashing happens anywhere in this plan (sha256 is a later,
+/// apply-step concern); NO hardlink is ever created.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MediaPlanReport {
+    /// The tables rows were read from (a table qualifies when it
+    /// carries a column whose name contains "path", case-insensitive).
+    pub tables: Vec<MediaTablePlan>,
+    /// Rows whose path column held a non-empty ABSOLUTE local path
+    /// (drive letter or UNC — urls and relative values are not rows).
+    pub rows: usize,
+    /// Present files (`std::fs::metadata` says a regular file exists).
+    pub present: usize,
+    /// Everything else (missing, a directory, unreadable).
+    pub missing: usize,
+    /// Sum of the present files' sizes.
+    pub total_bytes: u64,
+    /// Present files on the store's volume (drive-letter comparison —
+    /// the KQ9/D9 rule: hardlinks need one volume; an unresolvable
+    /// drive counts as same, the established `same_volume` semantics).
+    pub same_volume: usize,
+    /// Present files on another volume.
+    pub other_volume: usize,
+    /// Bytes hardlinking would save vs copying: the present,
+    /// same-volume bytes (those are exactly the files a hardlink
+    /// could deduplicate).
+    pub bytes_saved_vs_copy: u64,
+    /// DBs that exist but could not be read (counted, never fatal —
+    /// the plan is a report).
+    pub dbs_failed: usize,
+}
+
+/// A path value that could be a local FILE path: an absolute drive
+/// path (`D:\…`) or a UNC root. Everything else (urls, relatives,
+/// empties) is not a media row. Used internally ONLY — a value that
+/// passes is read with `std::fs::metadata` and never printed.
+fn is_local_absolute(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || p.starts_with(r"\\")
+}
+
+/// One DB's media tables. `named` restricts to a fixed table-name set
+/// (the Index.db rule: `image`, `file`, `media`); `None` considers
+/// every table (the `Core/Media.db` rule — a separate Core DB whose
+/// tables are all media-metadata candidates). A table qualifies when
+/// it carries a column whose name contains "path"
+/// (case-insensitive); the read is exactly that column. Table and
+/// column NAMES are shape (printable); PATH VALUES are internal.
+fn plan_db(
+    conn: &Connection,
+    source: &str,
+    named: Option<&[&str]>,
+    store_root: &Path,
+    report: &mut MediaPlanReport,
+) -> Result<(), String> {
+    let inv = inventory::inventory_db(conn)?;
+    for t in &inv.tables {
+        if let Some(names) = named {
+            if !names.contains(&t.name.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+        }
+        let Some(path_col) = t
+            .columns
+            .iter()
+            .find(|c| c.name.to_ascii_lowercase().contains("path"))
+        else {
+            continue; // no path column: not a media-path table
+        };
+        let qt = inventory::quote_ident(&t.name)?;
+        let qc = inventory::quote_ident(&path_col.name)?;
+        let mut st = conn
+            .prepare(&format!("SELECT {qc} FROM {qt}"))
+            .map_err(|e| format!("{source} {}.{}: {e}", t.name, path_col.name))?;
+        let values = st
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .map_err(|e| format!("{source} {}.{}: {e}", t.name, path_col.name))?;
+        for v in values.flatten().flatten() {
+            if !is_local_absolute(&v) {
+                continue; // url/relative/empty: not a media row
+            }
+            report.rows += 1;
+            // Metadata only (the brief's rule): existence, size, and
+            // the volume of the PATH — no content is ever read, and
+            // hashing is a later apply step, not this plan.
+            match std::fs::metadata(&v) {
+                Ok(m) if m.is_file() => {
+                    report.present += 1;
+                    report.total_bytes += m.len();
+                    if super::settings_check::same_volume(Path::new(&v), store_root) {
+                        report.same_volume += 1;
+                        report.bytes_saved_vs_copy += m.len();
+                    } else {
+                        report.other_volume += 1;
+                    }
+                }
+                _ => report.missing += 1,
+            }
+        }
+        report.tables.push(MediaTablePlan {
+            source: source.to_string(),
+            table: t.name.clone(),
+            path_column: path_col.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The 2.6 dry run (PLAN ONLY): for each Desktop media row with a
+/// local file path — Index.db tables named `image`/`file`/`media`,
+/// plus every `Core/Media.db` table when that DB is present — compute
+/// whether the file exists (`std::fs::metadata`, no content read), its
+/// size, and whether its path is on the same volume as `store_root`.
+/// Counts only; no sha256 anywhere here; no hardlink is created.
+pub fn media_plan(p: &Prepared, store_root: &Path) -> Result<MediaPlanReport, String> {
+    let mut report = MediaPlanReport::default();
+    // Index.db: only the three names the inventory knowledge calls
+    // media metadata.
+    let index_path = p.uid_dir.join("Core").join("Index.db");
+    let index = open_desktop_db(&index_path, p.passphrase.as_str(), p.profile)?;
+    plan_db(
+        &index,
+        "Core/Index.db",
+        Some(&["image", "file", "media"]),
+        store_root,
+        &mut report,
+    )?;
+    drop(index);
+    // Core/Media.db if present: every table with a path column. An
+    // unreadable Media.db is counted, not fatal (the plan is a report).
+    let media_db = p.uid_dir.join("Core").join("Media.db");
+    if media_db.is_file() {
+        match open_desktop_db(&media_db, p.passphrase.as_str(), p.profile) {
+            Ok(conn) => {
+                plan_db(&conn, "Core/Media.db", None, store_root, &mut report)?;
+            }
+            Err(_) => report.dbs_failed += 1,
+        }
+    }
+    Ok(report)
+}
+
+/// The `--media-plan` mode (2.6, dry-run only): counts only. The store
+/// root is resolved exactly the way the media worker resolves it —
+/// `settings.shadow.media_store`, else the documented default — read
+/// read-only through the settings loader; the path itself is never
+/// printed, and the snapshot is opened with the usual immutable
+/// guards. Nothing is written anywhere.
+pub fn run_media_plan(a: &ImportArgs) -> Result<Vec<String>, String> {
+    let p = prepare(a)?;
+    let settings = crate::settings::path_without_app()
+        .map(|path| crate::settings::load_at(&path))
+        .unwrap_or_default();
+    let store_root = super::media::media_store_root(&settings.shadow);
+    let report = media_plan(&p, &store_root)?;
+    let mut lines = vec![
+        "media plan: dry-run — no hashing, no hardlinks, nothing written".to_string(),
+    ];
+    for t in &report.tables {
+        lines.push(format!(
+            "media plan: {} table {} (path column {:?})",
+            t.source, t.table, t.path_column
+        ));
+    }
+    lines.push(format!(
+        "media plan: rows={} present={} missing={} total_bytes={} same_volume=yes:{} no:{} \
+         bytes_hardlinking_saves_vs_copy={} media_dbs_failed={}",
+        report.rows,
+        report.present,
+        report.missing,
+        report.total_bytes,
+        report.same_volume,
+        report.other_volume,
+        report.bytes_saved_vs_copy,
+        report.dbs_failed
+    ));
     Ok(lines)
 }
 
@@ -1316,6 +1518,10 @@ mod tests {
             all_dbs: false,
             own_uid_from_settings: false,
             apply: false,
+            i_have_a_backup_plan: false,
+            target: None,
+            unmapped_as_raw: false,
+            media_plan: false,
             help: false,
         }
     }
@@ -1760,7 +1966,7 @@ mod tests {
         let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
         a.apply = true;
         let e = run(&a).unwrap_err();
-        assert!(e.contains("--apply not wired"), "{e}");
+        assert!(e.contains("dispatched by the CLI"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2542,6 +2748,169 @@ mod tests {
             "{joined}"
         );
         assert!(!joined.contains("1234567890123456789"), "{joined}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 16 P2: --media-plan (item 2.6, plan only) ------------------
+
+    /// A synthetic Desktop-style cipher DB (cross-platform: the
+    /// passphrase key needs no DPAPI).
+    fn make_cipher_db_sql_any(path: &Path, pass: &str, sql: &str) {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        apply_passphrase_key(&conn, pass).unwrap();
+        conn.execute_batch(sql).unwrap();
+        conn.close().map_err(|(_, e)| e).unwrap();
+    }
+
+    /// The media-plan fixture: Index.db with the three named media
+    /// tables (+ a `conv` table that must be ignored) and a
+    /// `Core/Media.db`, all carrying FAKE local paths that point at
+    /// files under the OS temp dir. Returns (Prepared, files dir).
+    fn media_fixture(dir: &Path, files: &Path) -> Prepared {
+        let pass = "fakefakefakefakefakefakefake1234";
+        std::fs::create_dir_all(files).unwrap();
+        std::fs::write(files.join("a.jpg"), vec![0u8; 10]).unwrap();
+        std::fs::write(files.join("b.mp4"), vec![0u8; 20]).unwrap();
+        std::fs::create_dir_all(files.join("subdir")).unwrap(); // a dir, not a file
+        let a = files.join("a.jpg").to_string_lossy().into_owned();
+        let b = files.join("b.mp4").to_string_lossy().into_owned();
+        let gone = files.join("gone.jpg").to_string_lossy().into_owned();
+        let sub = files.join("subdir").to_string_lossy().into_owned();
+        let core = dir.join("Core");
+        std::fs::create_dir_all(&core).unwrap();
+        let index_sql = format!(
+            "CREATE TABLE image (id INTEGER PRIMARY KEY, filePath TEXT, thumbUrl TEXT);
+             INSERT INTO image (id, filePath) VALUES
+               (1, '{a}'), (2, '{gone}'), (3, 'https://fake-cdn.example/x.jpg'), (4, NULL);
+             CREATE TABLE file (id INTEGER PRIMARY KEY, localPath TEXT);
+             INSERT INTO file (id, localPath) VALUES (1, '{b}');
+             CREATE TABLE media (id INTEGER PRIMARY KEY, path TEXT);
+             INSERT INTO media (id, path) VALUES (1, 'relative/x.jpg'), (2, '{sub}');
+             CREATE TABLE conv (id INTEGER PRIMARY KEY, name TEXT);",
+        );
+        make_cipher_db_sql_any(&core.join("Index.db"), pass, &index_sql);
+        let media_sql = format!(
+            "CREATE TABLE mediaItem (itemId INTEGER PRIMARY KEY, filePath TEXT);
+             INSERT INTO mediaItem (itemId, filePath) VALUES (1, '{gone}');",
+        );
+        make_cipher_db_sql_any(&core.join("Media.db"), pass, &media_sql);
+        Prepared {
+            uid_dir: dir.to_path_buf(),
+            passphrase: Zeroizing::new(pass.to_string()),
+            profile: CipherProfile::Compat4,
+            key_sha12: sha12(pass.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn media_plan_counts_rows_files_volumes_and_savings() {
+        let dir = temp_dir("mediaplan");
+        let files = dir.join("files");
+        let p = media_fixture(&dir, &files);
+        // The store root on the SAME volume as the fake files (the
+        // temp dir): every present file is hardlinkable, so the saved
+        // bytes equal the total bytes.
+        let store = dir.join("store-root");
+        std::fs::create_dir_all(&store).unwrap();
+        let r = media_plan(&p, &store).unwrap();
+        // image: 2 rows (a.jpg present, gone missing; the url and the
+        // NULL are not rows). file: 1 row (b.mp4 present). media: 1
+        // row (the subdir — exists but is NOT a file → missing; the
+        // relative path is not a row). Media.db mediaItem: 1 row
+        // (missing). conv: ignored (not a media name, no Index rule).
+        assert_eq!(r.rows, 5, "{r:?}");
+        assert_eq!(r.present, 2);
+        assert_eq!(r.missing, 3);
+        assert_eq!(r.total_bytes, 30);
+        assert_eq!(r.same_volume, 2, "the temp store shares the files' volume");
+        assert_eq!(r.other_volume, 0);
+        assert_eq!(r.bytes_saved_vs_copy, 30);
+        assert_eq!(r.dbs_failed, 0);
+        let tables: Vec<String> = r.tables.iter().map(|t| t.table.clone()).collect();
+        // inventory_db lists tables name-sorted.
+        assert_eq!(tables, vec!["file", "image", "media", "mediaItem"], "{r:?}");
+        assert!(r.tables[1].source == "Core/Index.db");
+        assert!(r.tables[3].source == "Core/Media.db");
+        // A store root on ANOTHER drive (pure drive-letter comparison,
+        // no FS access needed): every present file is on the other
+        // volume, so hardlinking would save nothing.
+        let r2 = media_plan(&p, Path::new(r"Q:\fake-store-root")).unwrap();
+        assert_eq!(r2.rows, 5);
+        assert_eq!(r2.present, 2);
+        assert_eq!(r2.total_bytes, 30, "bytes do not depend on the store");
+        assert_eq!(r2.same_volume, 0);
+        assert_eq!(r2.other_volume, 2);
+        assert_eq!(r2.bytes_saved_vs_copy, 0);
+        // No Media.db at all: only the Index tables, no failure.
+        std::fs::remove_file(dir.join("Core").join("Media.db")).unwrap();
+        let r3 = media_plan(&p, &store).unwrap();
+        assert_eq!(r3.rows, 4);
+        assert_eq!(r3.tables.len(), 3);
+        assert_eq!(r3.dbs_failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_media_plan_prints_counts_only() {
+        // The CLI path: manifest + D7 key + the usual guards, then the
+        // same counts (the store root is resolved from the settings —
+        // only the volume split is machine-dependent, so the asserted
+        // prefix stops before it).
+        let dir = temp_dir("mediarun");
+        let files = dir.join("files");
+        let p = media_fixture(&dir, &files);
+        // The manifest the snapshot guard requires + the D7 key for
+        // the fixture passphrase.
+        write_manifest_json(&dir, valid_manifest_json());
+        let pass = p.passphrase.as_str().to_string();
+        fake_d7_key_file(&dir.join("d7.bin"), &pass);
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&dir.join("d7.bin")));
+        a.media_plan = true;
+        let lines = run_media_plan(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("media plan: dry-run — no hashing, no hardlinks, nothing written"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("media plan: Core/Index.db table image (path column \"filePath\")"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("media plan: Core/Media.db table mediaItem (path column \"filePath\")"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("media plan: rows=5 present=2 missing=3 total_bytes=30 same_volume=yes:"),
+            "{joined}"
+        );
+        // PRIVACY: no path value, no file name, no url ever printed.
+        assert!(!joined.contains("a.jpg"), "{joined}");
+        assert!(!joined.contains("b.mp4"), "{joined}");
+        assert!(!joined.contains("fake-cdn"), "{joined}");
+        assert!(!joined.contains(dir.to_string_lossy().as_ref()), "{joined}");
+        // The snapshot was never touched (immutable proof).
+        let names = listing(&dir.join("Core"));
+        assert_eq!(names, vec!["Index.db".to_string(), "Media.db".to_string()]);
+        // The CLI exit-code path: 0.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            sha12(pass.as_bytes()),
+            "--key-file".to_string(),
+            dir.join("d7.bin").to_string_lossy().into_owned(),
+            "--media-plan".to_string(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

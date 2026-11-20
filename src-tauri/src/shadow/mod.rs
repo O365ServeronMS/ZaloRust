@@ -57,6 +57,12 @@ pub mod cli;
 /// pure verdict + `GetDiskFreeSpaceExW` (hand-declared — no new crates).
 pub mod disk_space;
 pub mod import;
+/// The apply step of the Desktop import (audit §4 item 2.5, batch 16
+/// P1): the ONLY code path that writes into a shadow store, guarded
+/// by its preconditions (explicit flags, no running app, verified
+/// backup, mapped-code preflight), batched savepoint writes with
+/// per-DB resume cursors, and the classify-then-skip idempotence.
+pub mod import_apply;
 /// Configurable Desktop→shadow mapping (batch 12 L2, audit §4 items
 /// 2.3/2.4/2.7): declarative JSON mapping (no free SQL), plan
 /// validation against the snapshot inventory, extraction into the

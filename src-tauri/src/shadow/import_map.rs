@@ -879,6 +879,44 @@ pub fn write_import_cursor(
     )
 }
 
+/// (batch 16 P1, 2.5 resume + idempotence) Write one DB's cursor ONLY
+/// when it actually advanced past the stored one. The apply step calls
+/// this inside each batch's transaction; a re-apply of a fully
+/// imported DB must be a zero-change run (the idempotence AC measures
+/// `total_changes()`), so rewriting an identical cursor row — or,
+/// worse, moving the watermark BACKWARDS when a later batch's max is
+/// lower — is skipped. Returns whether a write happened.
+pub fn write_import_cursor_if_advanced(
+    conn: &Connection,
+    db_rel: &str,
+    c: ImportCursor,
+) -> rusqlite::Result<bool> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT cursor FROM sync_cursors WHERE scope = ?1",
+            params![import_scope(db_rel)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match stored.as_deref() {
+        Some(s) => {
+            let old = decode_cursor(s);
+            let advanced = match old {
+                Some(o) => c.max_ts > o.max_ts || c.max_rowid > o.max_rowid,
+                // A corrupt stored cursor was already refused at read
+                // time (read_import_cursor fails closed); belt only.
+                None => true,
+            };
+            if !advanced {
+                return Ok(false);
+            }
+        }
+        None => {}
+    }
+    write_import_cursor(conn, db_rel, c)?;
+    Ok(true)
+}
+
 /// The cursor an apply pass would WRITE for this DB: max raw ts +
 /// max rowid of the entity's table. `None` for entities without a
 /// unit-declared ts (the cursor is a message-table watermark).
@@ -1006,6 +1044,183 @@ pub fn count_rows(conn: &Connection, ep: &EntityPlan) -> Result<i64, String> {
     let q = quote_ident(&ep.table)?;
     conn.query_row(&format!("SELECT count(*) FROM {q}"), [], |r| r.get(0))
         .map_err(|e| format!("count(*) on {:?} failed: {e}", ep.table))
+}
+
+/// (batch 16 P1, item 2.5) The RAW msgType source column of the message
+/// plan — the apply preflight aggregates exactly THIS column with
+/// batch 15's fixed distinct read. A const/expr msgType is refused
+/// fail-closed (the same rule `extract_msg_codes` applies): the
+/// preflight must see the raw stored code, never a mapping product —
+/// otherwise "every code that occurs is mapped" could not be verified.
+pub fn msg_type_column(ep: &EntityPlan) -> Result<String, String> {
+    let Some(spec) = ep.fields.iter().find(|f| f.target == "msgType") else {
+        return Err(String::from(
+            "entities.message has no 'msgType' target — the apply preflight \
+             cannot verify mapped codes without it",
+        ));
+    };
+    match &spec.res {
+        FieldRes::Col(i) => Ok(ep.select[*i].clone()),
+        _ => Err(String::from(
+            "entities.message.columns.msgType must map a PLAIN source column \
+             (a const/expr value is a mapping product, not the raw Desktop \
+             code the preflight must verify)",
+        )),
+    }
+}
+
+// --- batch 16 P1: coded extraction (the apply step's read path) -----------
+
+/// One extracted message plus the facts the apply step (2.5) needs
+/// and the plain `Write` does not carry:
+/// - the RAW Desktop msgType code the source row held (post-mapping
+///   it only survives in the payload when UNMAPPED — the mapped
+///   string replaced it — so the unmapped decision needs it carried
+///   explicitly);
+/// - whether the row's `uidFrom` was NULL (not "0"): the shared
+///   `normalize::sender_for` rule treats NULL as self when an own uid
+///   is configured, and the reviewer wants that COUNT reported before
+///   deciding whether NULL should stay "self" on the import path (the
+///   rule itself never changes here);
+/// - the source row's rowid and RAW ts (the cursor's own units) so
+///   each committed batch can advance the per-DB resume cursor
+///   exactly as far as it actually wrote.
+#[derive(Debug, Clone)]
+pub struct CodedWrite {
+    pub write: Write,
+    /// The raw msgType code as a string ("19"); `None` when the row's
+    /// msgType was NULL/BLOB.
+    pub raw_code: Option<String>,
+    /// uidFrom was NULL (not "0", not an unmapped column).
+    pub uid_from_null: bool,
+    /// The source row's rowid (the `next_cursor` domain).
+    pub src_rowid: i64,
+    /// The source row's RAW ts value (the `next_cursor` domain — the
+    /// delta comparison runs in the source column's own units).
+    pub src_ts_raw: i64,
+}
+
+/// (batch 16 P1) Is this coded write's msgType code MAPPED by the
+/// plan's msgType table? A NULL raw code cannot be proven mapped —
+/// unmapped, fail closed (the hatch and the refusal both treat it so).
+pub fn code_is_mapped(plan: &Plan, cw: &CodedWrite) -> bool {
+    match &cw.raw_code {
+        Some(code) => plan.msg_type.contains_key(code),
+        None => false,
+    }
+}
+
+/// (batch 16 P1, `--unmapped-as-raw`) The ONE escape hatch for an
+/// unmapped row, in place: `kind` forced to 100 (`msg_type_code`'s
+/// unknown bucket — the mapping has no opinion about this code) and
+/// `text` forced NULL. A media-kind `content` column often holds JSON
+/// text, and without a mapped code the extractor leaves that JSON as a
+/// string — storing it in `text` would put JSON-as-text into the
+/// store. With the hatch the content survives ONLY inside
+/// `payload_json`, which also keeps the RAW code string (the
+/// extractor's pass-through left it there). A later mapping that adds
+/// the code makes a re-apply fill `type`/`text` (import rank 1 >= the
+/// row's import rank) — the hatch is not a dead end.
+pub fn force_unmapped_raw(cw: &mut CodedWrite) {
+    if let Write::Message { kind, text, .. } = &mut cw.write {
+        *kind = 100;
+        *text = None;
+    }
+}
+
+/// `read_source_rows`, plus each row's rowid as the first tuple field
+/// (the coded-extraction read; the cursor domain needs it). Same
+/// identifier quoting, same optional delta filter, same rowid order.
+fn read_source_rows_with_rowid(
+    conn: &Connection,
+    ep: &EntityPlan,
+    delta: Option<(&str, ImportCursor)>,
+) -> Result<Vec<(i64, Vec<SV>)>, String> {
+    let qtable = quote_ident(&ep.table)?;
+    let cols: Vec<String> = ep
+        .select
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Result<Vec<String>, String>>()?;
+    let mut sql = format!("SELECT rowid, {} FROM {qtable}", cols.join(", "));
+    if let Some((ts_col, _)) = delta {
+        let qts = quote_ident(ts_col)?;
+        sql.push_str(&format!(" WHERE (rowid > ?1 OR {qts} > ?2)"));
+    }
+    sql.push_str(" ORDER BY rowid");
+    let mut st = conn
+        .prepare(&sql)
+        .map_err(|e| format!("{}: {e}", ep.table))?;
+    let n = ep.select.len();
+    let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(i64, Vec<SV>)> {
+        let rowid = r.get::<_, SV>(0)?;
+        let id = match rowid {
+            SV::Integer(i) => i,
+            // The delta filter already assumes an integer rowid
+            // (`next_cursor` does `max(rowid)`); anything else means
+            // the table shadows the name — surface it, never guess.
+            _ => return Err(rusqlite::Error::InvalidColumnType(0, "rowid".into(), rusqlite::types::Type::Integer)),
+        };
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(r.get::<_, SV>(i + 1)?);
+        }
+        Ok((id, vals))
+    };
+    let rows = match delta {
+        Some((_, c)) => st
+            .query_map(params![c.max_rowid, c.max_ts], map_row)
+            .map_err(|e| format!("{}: {e}", ep.table))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", ep.table))?,
+        None => st
+            .query_map([], map_row)
+            .map_err(|e| format!("{}: {e}", ep.table))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", ep.table))?,
+    };
+    Ok(rows)
+}
+
+/// (batch 16 P1, item 2.5) The message-entity extraction WITH the raw
+/// codes — the apply step's read path. Same rows, same skips, same
+/// `Write` values as [`extract`] (it is the same `message_row`); the
+/// extra fields are the facts [`CodedWrite`] documents. One source row
+/// still becomes at most one write, so memory stays bounded by one
+/// conversation's history.
+pub fn extract_coded(
+    conn: &Connection,
+    plan: &Plan,
+    opts: &ExtractOpts,
+) -> Result<(Vec<CodedWrite>, usize), String> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let Some(ep) = applicable(&plan.message, &opts.kind) else {
+        return Ok((out, skipped));
+    };
+    let ts_name = ep.ts_col().expect("plan guarantees a unit-declared ts");
+    let delta = opts.cursor.map(|c| (ts_name, c));
+    let rows = read_source_rows_with_rowid(conn, ep, delta)?;
+    let ts_idx = ep.select.iter().position(|c| c == ts_name);
+    for (rowid, vals) in &rows {
+        let uid_from_null = match field_res(ep, "uidFrom") {
+            Some(FieldRes::Col(i)) => matches!(vals[*i], SV::Null | SV::Blob(_)),
+            _ => false,
+        };
+        let raw_ts = ts_idx.map(|i| sv_i64(&vals[i]).unwrap_or(0)).unwrap_or(0);
+        let raw_code = string_field_opt(ep, vals, "msgType", opts.db_id);
+        match message_row(ep, vals, &plan.msg_type, opts.kind, opts.db_id, opts.own_uid) {
+            Some(write) => out.push(CodedWrite {
+                write,
+                raw_code,
+                uid_from_null,
+                src_rowid: *rowid,
+                src_ts_raw: raw_ts,
+            }),
+            None => skipped += 1,
+        }
+    }
+    Ok((out, skipped))
 }
 
 /// (batch 15 O1) The minimal code-cross-tab extractor: one

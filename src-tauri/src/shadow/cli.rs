@@ -41,7 +41,7 @@ const USAGE: &str = "\
 usage: zalors import --from-snapshot <dir> --account <id> --uin-hash <sha256-12>
        [--key-file <file>] [--cipher-compat <3|4>] [--dry-run | --apply] [--help]
 
-modes (one per run; all dry-run only — --apply stays fail-closed):
+modes (one per run; everything except --apply is dry-run only):
   (default)                  F4 snapshot inventory counts (one line)
   --inventory                schema inventory of Core\\Index.db + ONE sample
                              per message-DB kind (names/types/counts only);
@@ -60,6 +60,16 @@ modes (one per run; all dry-run only — --apply stays fail-closed):
   [--delta]                  classify each write READ-ONLY against a temp
                              COPY of that shadow store. Without --mapping the
                              built-in skeleton (maps nothing) is used.
+  --media-plan               2.6 dry run: for each Desktop media row with a
+                             local file path (Core\\Index.db tables
+                             image/file/media + every Core\\Media.db table),
+                             counts files present/missing, total bytes,
+                             same-volume yes/no, and the bytes hardlinking
+                             would save vs copying. Counts only — no hashing,
+                             no hardlinks, nothing written.
+  --apply                    2.5, the guarded write step (see the
+                             preconditions at the bottom) — needs
+                             --mapping, --target and --i-have-a-backup-plan
 
 flags:
 --from-snapshot  cold snapshot dir (made by tools/snapshot.ps1; KQ4: the
@@ -78,13 +88,39 @@ flags:
                   the message kind (one2one/group/stranger), summing
                   per-DB counts (batch 15); an index spec is refused —
                   there is exactly one Core\\Index.db
---own-uid-from-settings   with --mapping/--shadow-copy: seed the import
-                  extraction's self-sent sender from settings.shadow.own_uid
-                  read through the settings loader (never printed; env
-                  ZR_OWN_UID, shape-validated, wins as the override)
+--own-uid-from-settings   with --mapping/--shadow-copy or --apply: seed the
+                  import extraction's self-sent sender from
+                  settings.shadow.own_uid read through the settings loader
+                  (never printed; env ZR_OWN_UID, shape-validated, wins as
+                  the override)
 --dry-run        inventory only, zero writes (the default)
---apply          write into the shadow DB (not wired yet: fail-closed)
---help           this usage, exit 0";
+--target <dir>   with --apply: the shadow STORE dir to write into. No
+                  default — the live store is never silently chosen
+--i-have-a-backup-plan   with --apply: the explicit confirmation flag. The
+                  run still makes its own verified backup first
+                  (<target>\\pre-import-backups\\) before the first write;
+                  this flag says you ALSO have your own way to restore
+--unmapped-as-raw        with --apply: the ONE escape hatch for msgType
+                  codes the mapping does not list (the run refuses
+                  otherwise, listing them with counts). Unmapped rows are
+                  written kind=100 with text NULL — content only in
+                  payload_json, raw code string included — never
+                  JSON-as-text
+--help           this usage, exit 0
+
+the --apply preconditions (each refuses with a clear message, exit 1):
+  1. --apply + --i-have-a-backup-plan + --target + --mapping
+  2. no other zalors.exe process may run (the store has one writer)
+  3. a verified backup of the target before the first write
+  4. every msgType code in the snapshot mapped (or --unmapped-as-raw)
+  5. the target's schema version must match this binary (the run
+     never migrates a store — open it once with the matching build)
+  resume: per-DB cursors, written in the same transaction as each
+  batch; a killed run resumes where it stopped, and after any per-DB
+  error the cursor stays at the last good batch (a re-run retries the
+  failed rows). DBs that open fine but have no mapped table are
+  skipped and counted (dbs_no_table). Idempotent: a second full
+  apply changes 0 rows (the total_changes delta).";
 
 /// Parsed `zalors import` arguments (pure parse result — see `parse`).
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +168,27 @@ pub struct ImportArgs {
     /// with `account::valid_uid` — wins as the per-run override.
     /// Mapping dry-run mode only.
     pub own_uid_from_settings: bool,
-    /// `--apply`: write into the shadow DB (still fail-closed).
+    /// `--target <dir>` (batch 16 P1, 2.5): the shadow STORE dir the
+    /// apply writes into. NO default — the live store is never
+    /// silently chosen; the user passes it. Apply mode only.
+    pub target: Option<PathBuf>,
+    /// `--i-have-a-backup-plan` (batch 16 P1, 2.5): the explicit second
+    /// flag `--apply` demands. The run still makes and verifies its
+    /// own backup first; this flag confirms the user ALSO has their
+    /// own way to restore. Apply mode only.
+    pub i_have_a_backup_plan: bool,
+    /// `--unmapped-as-raw` (batch 16 P1, 2.5): the ONE escape hatch for
+    /// msgType codes the mapping does not list. With it, unmapped rows
+    /// are written kind=100 with text forced NULL (content only in
+    /// payload_json, raw code string included) — never JSON-as-text.
+    /// Without it the apply refuses, listing the unmapped codes with
+    /// counts. Apply mode only.
+    pub unmapped_as_raw: bool,
+    /// `--media-plan` (batch 16 P2, 2.6): the media hardlink PREP dry
+    /// run — counts only, no hashing, no hardlinks. Its own mode.
+    pub media_plan: bool,
+    /// `--apply`: write into the shadow DB (guarded by the
+    /// preconditions in `import_apply`).
     pub apply: bool,
     /// `--help`: print usage, exit 0 (no other flag required).
     pub help: bool,
@@ -208,6 +264,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let (mut dry_run, mut apply, mut help, mut inventory, mut delta) =
         (false, false, false, false, false);
     let (mut all_dbs, mut own_uid_from_settings) = (false, false);
+    let (mut i_have_a_backup_plan, mut unmapped_as_raw, mut media_plan) = (false, false, false);
+    let mut target: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -223,6 +281,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--mapping"
                 | "--shadow-copy"
                 | "--distinct"
+                | "--target"
         );
         if value_flag {
             let value =
@@ -241,6 +300,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 "--out" => set_once(&mut out, flag, PathBuf::from(value))?,
                 "--mapping" => set_once(&mut mapping, flag, PathBuf::from(value))?,
                 "--shadow-copy" => set_once(&mut shadow_copy, flag, PathBuf::from(value))?,
+                // Batch 16 P1 (2.5): the store the apply writes into —
+                // no default, the user passes it.
+                "--target" => set_once(&mut target, flag, PathBuf::from(value))?,
                 // Batch 14 N1: repeatable, max 10 per run. The spec
                 // shape (kind, table, column) is validated HERE, pure;
                 // existence + the code-column whitelist run against
@@ -269,6 +331,10 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             // Batch 15 O2/O4: valueless mode riders.
             "--all-dbs" => set_bool_once(&mut all_dbs, flag)?,
             "--own-uid-from-settings" => set_bool_once(&mut own_uid_from_settings, flag)?,
+            // Batch 16 P1/P2: the apply preconditions + the media plan.
+            "--i-have-a-backup-plan" => set_bool_once(&mut i_have_a_backup_plan, flag)?,
+            "--unmapped-as-raw" => set_bool_once(&mut unmapped_as_raw, flag)?,
+            "--media-plan" => set_bool_once(&mut media_plan, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -284,44 +350,86 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     if dry_run && apply {
         return Err("--dry-run and --apply are mutually exclusive".into());
     }
-    // Batch-12/14 modes stay dry-run only (2.5 is a later,
-    // user-approved step): refuse any combination with --apply,
-    // naming the flag.
+    // Batch-12/14 modes stay dry-run only (2.5 wires writes only
+    // through its own preconditions): refuse any combination with
+    // --apply, naming the flag.
     if apply {
         let conflicting = [
             ("--inventory", inventory),
             ("--delta", delta),
             ("--out", out.is_some()),
-            ("--mapping", mapping.is_some()),
             ("--shadow-copy", shadow_copy.is_some()),
             ("--distinct", !distinct.is_empty()),
+            ("--media-plan", media_plan),
         ]
         .into_iter()
         .find(|(_, on)| *on);
         if let Some((flag, _)) = conflicting {
             return Err(format!(
                 "{flag} is dry-run only and conflicts with --apply \
-                 (P2 item 2.5 wires writes later)"
+                 (2.5 has its own preconditions — docs/import-mapping.md)"
+            ));
+        }
+    }
+    // Batch 16 P1 (2.5 precondition 1): the three explicit apply-only
+    // flags REQUIRE --apply, and --apply requires them + --mapping.
+    if apply {
+        if !i_have_a_backup_plan {
+            return Err(
+                "--apply needs --i-have-a-backup-plan: the apply writes into the \
+                 shadow store — confirm you have a way to restore it (the run \
+                 also makes its own verified backup first)".into(),
+            );
+        }
+        if target.is_none() {
+            return Err(
+                "--apply needs --target <shadow store dir>: there is no default — \
+                 the live store is never silently chosen".into(),
+            );
+        }
+        if mapping.is_none() {
+            return Err(
+                "--apply needs --mapping <file>: the built-in skeleton maps nothing".into(),
+            );
+        }
+    }
+    for (on, flag) in [
+        (target.is_some(), "--target"),
+        (i_have_a_backup_plan, "--i-have-a-backup-plan"),
+        (unmapped_as_raw, "--unmapped-as-raw"),
+    ] {
+        if on && !apply {
+            return Err(format!(
+                "{flag} is an --apply-mode flag: add --apply (and its other \
+                 preconditions) or drop it"
             ));
         }
     }
     if out.is_some() && !inventory {
         return Err("--out needs --inventory (it is the JSON inventory report)".into());
     }
-    if inventory && (mapping.is_some() || shadow_copy.is_some() || delta) {
+    if inventory && (mapping.is_some() || shadow_copy.is_some() || delta || media_plan) {
         return Err(
-            "--inventory cannot be combined with --mapping/--shadow-copy/--delta \
+            "--inventory cannot be combined with --mapping/--shadow-copy/--delta/--media-plan \
              (one mode per run)"
                 .into(),
         );
     }
     // Batch 14 N1: --distinct is its own mode too.
     if !distinct.is_empty()
-        && (inventory || mapping.is_some() || shadow_copy.is_some() || delta)
+        && (inventory || mapping.is_some() || shadow_copy.is_some() || delta || media_plan)
     {
         return Err(
-            "--distinct cannot be combined with --inventory/--mapping/--shadow-copy/--delta \
+            "--distinct cannot be combined with --inventory/--mapping/--shadow-copy/--delta/--media-plan \
              (one mode per run)"
+                .into(),
+        );
+    }
+    // Batch 16 P2: --media-plan is its own dry-run mode.
+    if media_plan && (mapping.is_some() || shadow_copy.is_some() || delta) {
+        return Err(
+            "--media-plan cannot be combined with --mapping/--shadow-copy/--delta \
+             (it needs no mapping — it discovers the media tables itself)"
                 .into(),
         );
     }
@@ -344,11 +452,16 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             ));
         }
     }
-    // Batch 15 O4: --own-uid-from-settings rides the mapping mode
-    // (that is where the import extraction runs).
-    if own_uid_from_settings && mapping.is_none() && shadow_copy.is_none() {
+    // Batch 15 O4 + batch 16: --own-uid-from-settings rides the
+    // mapping mode AND the apply step (the batch-15 rule applies
+    // there too — the brief's P1 item 5).
+    if own_uid_from_settings
+        && mapping.is_none()
+        && shadow_copy.is_none()
+        && !apply
+    {
         return Err(
-            "--own-uid-from-settings needs the mapping mode: add --mapping <file> \
+            "--own-uid-from-settings needs the mapping mode or --apply: add --mapping <file> \
              (it seeds the import extraction's self-sent sender)"
                 .into(),
         );
@@ -375,6 +488,10 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             distinct,
             all_dbs,
             own_uid_from_settings,
+            target,
+            i_have_a_backup_plan,
+            unmapped_as_raw,
+            media_plan,
             apply: false,
             help: true,
         });
@@ -393,6 +510,10 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         distinct,
         all_dbs,
         own_uid_from_settings,
+        target,
+        i_have_a_backup_plan,
+        unmapped_as_raw,
+        media_plan,
         apply,
         help: false,
     })
@@ -406,6 +527,28 @@ pub fn main(args: &[String]) -> i32 {
         Ok(a) if a.help => {
             println!("{USAGE}");
             0
+        }
+        // Batch 16 P1 (2.5): the guarded write step. It must dispatch
+        // BEFORE the mapping mode — an apply carries --mapping too.
+        // The process probe is wired HERE (the real tasklist); the
+        // preconditions themselves are unit-tested with an injected
+        // probe. Batch 16 fix F3: the apply streams every line through
+        // a println sink as it is produced — the backup path and the
+        // progress lines stay visible even when a later step fails
+        // (errors still exit 1).
+        Ok(a) if a.apply => {
+            let mut out = |line: &str| println!("{line}");
+            match super::import_apply::run_apply(
+                &a,
+                &mut out,
+                || super::import_apply::zalors_running_besides(std::process::id()),
+            ) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("import failed: {e}");
+                    1
+                }
+            }
         }
         // Batch 12 L1: the schema inventory mode.
         Ok(a) if a.inventory => match import::run_inventory(&a) {
@@ -437,6 +580,19 @@ pub fn main(args: &[String]) -> i32 {
         }
         // Batch 14 N1: the whitelisted distinct-values mode.
         Ok(a) if !a.distinct.is_empty() => match import::run_distinct(&a) {
+            Ok(lines) => {
+                for line in &lines {
+                    println!("{line}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                1
+            }
+        },
+        // Batch 16 P2 (2.6): the media hardlink PREP dry run.
+        Ok(a) if a.media_plan => match import::run_media_plan(&a) {
             Ok(lines) => {
                 for line in &lines {
                     println!("{line}");
@@ -504,6 +660,8 @@ mod tests {
     fn parse_the_old_bug_apply_key_file_keeps_the_value() {
         // M2-5: the old parser advanced i += 2 even for valueless
         // flags, so `--apply --key-file X` silently LOST --key-file.
+        // The invocation now carries --apply's full precondition set
+        // (the parse-level enforcement of precondition 1).
         let a = parse(&args(&[
             "--from-snapshot",
             r"D:\snap",
@@ -512,12 +670,190 @@ mod tests {
             "--uin-hash",
             "dca62c394a68",
             "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\shadow",
+            "--mapping",
+            "m.json",
             "--key-file",
             "k.bin",
         ]))
         .unwrap();
         assert!(a.apply);
+        assert!(a.i_have_a_backup_plan);
+        assert_eq!(a.target, Some(PathBuf::from(r"D:\shadow")));
         assert_eq!(a.key_file, Some(PathBuf::from("k.bin")));
+        // The escape hatch rides along.
+        let a2 = parse(&args(&[
+            "--from-snapshot",
+            r"D:\snap",
+            "--account",
+            "default",
+            "--uin-hash",
+            "dca62c394a68",
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\shadow",
+            "--mapping",
+            "m.json",
+            "--unmapped-as-raw",
+            "--key-file",
+            "k.bin",
+        ]))
+        .unwrap();
+        assert!(a2.unmapped_as_raw);
+    }
+
+    // --- batch 16 P1: --apply preconditions (parse level) ---------------
+
+    #[test]
+    fn parse_apply_names_every_missing_precondition_flag() {
+        // A consistent base, minus one flag at a time.
+        let base = |skip: &str| {
+            let mut v: Vec<String> = args(&[
+                "--from-snapshot",
+                "s",
+                "--account",
+                "default",
+                "--uin-hash",
+                "dca62c394a68",
+                "--apply",
+                "--i-have-a-backup-plan",
+                "--target",
+                r"D:\shadow",
+                "--mapping",
+                "m.json",
+            ]);
+            v.retain(|a| a != skip && {
+                // drop the value of the skipped value-flag too
+                !(skip == "--target" && a == r"D:\shadow")
+                    && !(skip == "--mapping" && a == "m.json")
+            });
+            v
+        };
+        for (skip, needle) in [
+            ("--i-have-a-backup-plan", "--apply needs --i-have-a-backup-plan"),
+            ("--target", "--apply needs --target <shadow store dir>"),
+            ("--mapping", "--apply needs --mapping <file>"),
+        ] {
+            let e = parse(&base(skip)).unwrap_err();
+            assert!(e.contains(needle), "{skip} -> {e}");
+        }
+    }
+
+    #[test]
+    fn parse_apply_mode_flags_require_apply() {
+        // Each apply-mode flag outside --apply names itself.
+        for (flags, flag) in [
+            (vec!["--target", r"D:\shadow"], "--target"),
+            (vec!["--i-have-a-backup-plan"], "--i-have-a-backup-plan"),
+            (vec!["--unmapped-as-raw"], "--unmapped-as-raw"),
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(
+                e.contains(&format!("{flag} is an --apply-mode flag")),
+                "{flag} -> {e}"
+            );
+        }
+        // Duplicates are still errors inside the mode.
+        let e = parse(&args(&[
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\s",
+            "--mapping",
+            "m.json",
+            "--target",
+            r"D:\s2",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--target given twice"), "{e}");
+        let e = parse(&args(&[
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\s",
+            "--mapping",
+            "m.json",
+            "--i-have-a-backup-plan",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--i-have-a-backup-plan given twice"), "{e}");
+    }
+
+    // --- batch 16 P2: --media-plan (parse level) ------------------------
+
+    #[test]
+    fn parse_media_plan_mode_rules() {
+        // Alone it parses; every other mode conflicts with it.
+        let a = parse(&with_base(&["--media-plan"])).unwrap();
+        assert!(a.media_plan);
+        assert!(!a.apply);
+        for (flags, needle) in [
+            (
+                vec!["--apply", "--i-have-a-backup-plan", "--target", r"D:\s",
+                     "--mapping", "m.json", "--media-plan"],
+                "--media-plan is dry-run only and conflicts with --apply",
+            ),
+            (
+                vec!["--inventory", "--media-plan"],
+                "--inventory cannot be combined",
+            ),
+            (
+                vec!["--mapping", "m.json", "--media-plan"],
+                "--media-plan cannot be combined",
+            ),
+            (
+                vec!["--shadow-copy", r"D:\s", "--media-plan"],
+                "--media-plan cannot be combined",
+            ),
+            (
+                vec!["--delta", "--mapping", "m.json", "--media-plan"],
+                "--media-plan cannot be combined",
+            ),
+            (
+                vec!["--distinct", "one2one:message.msgType", "--media-plan"],
+                "--distinct cannot be combined",
+            ),
+            (
+                vec!["--media-plan", "--media-plan"],
+                "--media-plan given twice",
+            ),
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(e.contains(needle), "{:?} -> {e}", flags);
+        }
+        // A CONSISTENT invocation yields to help; a conflicting pair
+        // beats it (the batch-6 convention).
+        let a = parse(&args(&["--help", "--media-plan"])).unwrap();
+        assert!(a.help);
+    }
+
+    #[test]
+    fn parse_own_uid_from_settings_now_rides_apply_too() {
+        // The batch-15 rule applies to the apply step as well (P1
+        // item 5): the flag is valid with --apply, still refused
+        // outside both modes.
+        let e = parse(&with_base(&["--own-uid-from-settings"])).unwrap_err();
+        assert!(e.contains("needs the mapping mode or --apply"), "{e}");
+        let a = parse(&args(&[
+            "--from-snapshot",
+            "s",
+            "--account",
+            "default",
+            "--uin-hash",
+            "dca62c394a68",
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\shadow",
+            "--mapping",
+            "m.json",
+            "--own-uid-from-settings",
+        ]))
+        .unwrap();
+        assert!(a.own_uid_from_settings && a.apply);
     }
 
     #[test]
@@ -750,9 +1086,10 @@ mod tests {
     #[test]
     fn parse_batch12_modes_conflict_with_apply() {
         // Each dry-run-only flag names itself in the conflict error.
+        // (--mapping is NO LONGER in this list: batch 16 made it an
+        // --apply REQUIREMENT instead of a conflict.)
         for (flags, flag) in [
             (vec!["--inventory"], "--inventory"),
-            (vec!["--mapping", "m.json"], "--mapping"),
             (vec!["--shadow-copy", r"D:\s"], "--shadow-copy"),
             (vec!["--delta", "--mapping", "m.json"], "--delta"),
             (vec!["--inventory", "--out", "o.json"], "--inventory"),

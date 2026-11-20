@@ -193,6 +193,10 @@ fn probe_import_overlap() {
         distinct: Vec::new(),
         all_dbs: false,
         own_uid_from_settings: false,
+        target: None,
+        i_have_a_backup_plan: false,
+        unmapped_as_raw: false,
+        media_plan: false,
         apply: false,
         help: false,
     };
