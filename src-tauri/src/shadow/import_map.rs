@@ -1458,11 +1458,22 @@ fn field_json(ep: &EntityPlan, vals: &[SV], spec: &FieldSpec, db_id: Option<u64>
     }
 }
 
-/// msgType codes whose `content` may arrive as a JSON *text* holding
-/// an object (the wire stores media content as an object; Desktop
-/// serializes it back to a text column). Parsed into the object so
-/// the payload matches the capture shape (H1/KQ1).
-const MEDIA_CODES: &[i64] = &[2, 3, 4, 5, 6, 11, 12];
+/// `msg_type_code` kinds whose WIRE content is a JSON object/array.
+/// The Desktop `message` column stores that value re-serialized as
+/// JSON *text*, so the extraction parses it back into the object —
+/// the capture shape — before it lands in the payload (H1/KQ1; batch
+/// 24 verified the decoded Desktop cell IS the wire `$.content`
+/// value). Parsing only fires on a String cell that parses as an
+/// object/array: a plain-string content (`chat.delete` `""`) is
+/// untouched, and the parsed kinds never leak JSON-as-text into
+/// `messages.text` (an object content never becomes text).
+/// Batch 25 extends the list beyond the downloadable media kinds,
+/// following the Zalo PC 26.11.12 shapes: 8 (the recall family —
+/// `chat.undo`'s content is a `{cliMsgId, deleteMsg, globalMsgId}`
+/// object), 9 (`chat.webcontent`/`.v2` — customMsg/pcItem), 13
+/// (`chat.location.new` — lat/lo), 14 (`chat.list.action` — a JSON
+/// ARRAY), 15 (`chat.ecard`), 16 (`group.poll`), 17 (`chat.todo`).
+const MEDIA_CODES: &[i64] = &[2, 3, 4, 5, 6, 8, 9, 11, 12, 13, 14, 15, 16, 17];
 
 fn content_json(kind_code: i64, j: Value) -> Value {
     if MEDIA_CODES.contains(&kind_code) {
@@ -2748,6 +2759,241 @@ mod tests {
         assert_eq!(text.as_deref(), Some(wrong_cell.as_str()));
         let pay: Value = serde_json::from_str(payload).unwrap();
         assert_eq!(pay["content"], json!(wrong_cell), "kept as it was");
+    }
+
+    #[test]
+    fn parse_mapping_accepts_negative_and_wide_code_keys() {
+        // Batch 25 M1: the Desktop code table has NEGATIVE codes
+        // (MSG_DEL_EVERYONE -27, the local-info rows -4/-1909) and a
+        // 4-digit code (MSG_TODO 2506). Mapping keys are strings, so
+        // the loader must accept and preserve them verbatim — the
+        // extractor coerces an INTEGER msgType cell to the same
+        // string (`sv_str`) and looks THAT up in the table, and the
+        // apply's code census keys its check the same way.
+        let doc = r#"{
+          "msgType": {
+            "11": "chat.photo",
+            "-27": "chat.delete.everyone",
+            "-1909": "LOCAL-INFO-PLACEHOLDER",
+            "2506": "chat.todo"
+          },
+          "entities": {}
+        }"#;
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        assert_eq!(m.msg_type["11"], "chat.photo");
+        assert_eq!(m.msg_type["-27"], "chat.delete.everyone");
+        assert_eq!(m.msg_type["-1909"], "LOCAL-INFO-PLACEHOLDER");
+        assert_eq!(m.msg_type["2506"], "chat.todo");
+        assert_eq!(m.msg_type.len(), 4, "no key was dropped or mangled");
+        // The unchanged rule: keys must be non-empty strings.
+        let e = parse_mapping(br#"{"msgType": {"": "x"}}"#).unwrap_err();
+        assert!(e.contains("msgType keys must be non-empty"), "{e}");
+    }
+
+    #[test]
+    fn extract_maps_negative_and_wide_codes_through_the_table() {
+        // Batch 25 M1/M2 end-to-end: a Desktop row whose INTEGER
+        // msgType cell is a NEGATIVE code (-27 = MSG_DEL_EVERYONE) or
+        // a 4-digit code (2506 = MSG_TODO) maps through the msgType
+        // table exactly like the small positive codes — numeric cell
+        // coerces to its string form, the table maps it to the wire
+        // string, the payload carries the MAPPED string, and the kind
+        // follows normalize::msg_type_code's table.
+        let conn = desktop_like();
+        // INTEGER cells in a TEXT-affinity column come back as
+        // '-27'/'2506' TEXT; an INTEGER-typed column would come back
+        // as INTEGER — `sv_str` coerces both to the same key.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (109, 'c109', 'u1', 'u2', 1690000009, ?1, '')",
+            params![-27i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (110, 'c110', 'u1', 'u2', 1690000010, ?1, '')",
+            params![2506i64],
+        )
+        .unwrap();
+        let doc = r#"{
+          "msgType": {
+            "chat.text.v2": "webchat",
+            "-27": "chat.delete.everyone",
+            "2506": "chat.todo"
+          },
+          "entities": {
+            "message": {
+              "db": ["one2one"], "table": "msg",
+              "columns": {
+                "msgId": "id", "uidFrom": "fromUid", "idTo": "toUid",
+                "ts": { "expr": "s_to_ms", "of": "ts" },
+                "msgType": "type", "content": "content"
+              }
+            }
+          }
+        }"#;
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        let inv = inventories(&conn, &conn);
+        let p = plan(&m, &inv).unwrap();
+        let (writes, _, _) = extract(
+            &conn,
+            &p,
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(123),
+                cursor: None,
+                own_uid: None,
+                passphrase: FAKE_PASS,
+            },
+        )
+        .unwrap();
+        let find = |id: &str| -> &Write {
+            writes
+                .iter()
+                .find(|w| matches!(w, Write::Message { msg_id, .. } if msg_id == id))
+                .unwrap()
+        };
+        // -27 -> chat.delete.everyone: the recall family code 8.
+        let Write::Message { kind, payload, .. } = find("109") else { panic!() };
+        assert_eq!(*kind, 8, "chat.delete.everyone joins the recall family");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["msgType"], json!("chat.delete.everyone"));
+        // 2506 -> chat.todo: the new code 17.
+        let Write::Message { kind, payload, .. } = find("110") else { panic!() };
+        assert_eq!(*kind, 17, "chat.todo is the batch-25 code 17");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["msgType"], json!("chat.todo"));
+    }
+
+    #[test]
+    fn extract_parses_the_batch25_kinds_json_text_content() {
+        // Batch 25 M2: the kinds the Zalo PC 26.11.12 source names
+        // carry their wire content as a JSON object — or, for
+        // chat.list.action, an ARRAY. The Desktop column stores that
+        // value re-serialized as JSON text; MEDIA_CODES re-parses it
+        // so the payload matches the capture shape and messages.text
+        // never receives JSON-as-text (a parsed object/array never
+        // becomes text).
+        let conn = desktop_like();
+        // 109: code 21 (MSG_OA) — a JSON ARRAY content.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (109, 'c109', 'u1', 'u2', 1690000009, '21', ?1)",
+            params![r#"[{"title":"a fake list item","href":"https://fake.example/a"}]"#],
+        )
+        .unwrap();
+        // 110: code 25 (MSG_ECARD) — an object.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (110, 'c110', 'u1', 'u2', 1690000010, '25', ?1)",
+            params![r#"{"versionEcardNewFr":"x","imgUrl":"https://fake.example/e.png"}"#],
+        )
+        .unwrap();
+        // 111: code 17 (MSG_LOCATION) — the {lat, lo} object.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (111, 'c111', 'u1', 'u2', 1690000011, '17', ?1)",
+            params![r#"{"lat":"10.5","lo":"106.7"}"#],
+        )
+        .unwrap();
+        // 112: code 20 (MSG_UNDO) — the undo marker object.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (112, 'c112', 'u1', 'u2', 1690000012, '20', ?1)",
+            params![r#"{"cliMsgId":"c112","deleteMsg":1,"globalMsgId":"g112"}"#],
+        )
+        .unwrap();
+        let doc = r#"{
+          "msgType": {
+            "21": "chat.list.action", "25": "chat.ecard",
+            "17": "chat.location.new", "20": "chat.undo"
+          },
+          "entities": {
+            "message": {
+              "db": ["one2one"], "table": "msg",
+              "columns": {
+                "msgId": "id", "uidFrom": "fromUid", "idTo": "toUid",
+                "ts": { "expr": "s_to_ms", "of": "ts" },
+                "msgType": "type", "content": "content"
+              }
+            }
+          }
+        }"#;
+        let m = parse_mapping(doc.as_bytes()).unwrap();
+        let inv = inventories(&conn, &conn);
+        let p = plan(&m, &inv).unwrap();
+        let (writes, _, _) = extract(
+            &conn,
+            &p,
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(123),
+                cursor: None,
+                own_uid: None,
+                passphrase: FAKE_PASS,
+            },
+        )
+        .unwrap();
+        let find = |id: &str| -> &Write {
+            writes
+                .iter()
+                .find(|w| matches!(w, Write::Message { msg_id, .. } if msg_id == id))
+                .unwrap()
+        };
+        // 21 -> chat.list.action (14): the array content is embedded
+        // AS the parsed array (the wire shape), never JSON-as-text.
+        let Write::Message { kind, text, payload, .. } = find("109") else { panic!() };
+        assert_eq!(*kind, 14);
+        assert!(text.is_none(), "a parsed array never becomes text");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert!(pay["content"].is_array(), "the JSON-text content is parsed");
+        assert_eq!(pay["content"][0]["title"], json!("a fake list item"));
+        // 25 -> chat.ecard (15): the parsed object.
+        let Write::Message { kind, text, payload, .. } = find("110") else { panic!() };
+        assert_eq!(*kind, 15);
+        assert!(text.is_none());
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"]["versionEcardNewFr"], json!("x"));
+        // 17 -> chat.location.new (13): the parsed {lat, lo} object.
+        let Write::Message { kind, text, payload, .. } = find("111") else { panic!() };
+        assert_eq!(*kind, 13);
+        assert!(text.is_none());
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"]["lat"], json!("10.5"));
+        // 20 -> chat.undo (8): the recall family's object content.
+        let Write::Message { kind, text, payload, .. } = find("112") else { panic!() };
+        assert_eq!(*kind, 8);
+        assert!(text.is_none(), "the undo marker's object is not text");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"]["cliMsgId"], json!("c112"));
+        // Belt: a chat.delete-style PLAIN string content ("") is
+        // untouched by the parsing (it does not parse as object/array).
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (113, 'c113', 'u1', 'u2', 1690000013, '20', ?1)",
+            params![""],
+        )
+        .unwrap();
+        let (writes2, _, _) = extract(
+            &conn,
+            &p,
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(123),
+                cursor: None,
+                own_uid: None,
+                passphrase: FAKE_PASS,
+            },
+        )
+        .unwrap();
+        let plain = writes2
+            .iter()
+            .find(|w| matches!(w, Write::Message { msg_id, .. } if msg_id == "113"))
+            .unwrap();
+        let Write::Message { text, payload, .. } = plain else { panic!() };
+        assert_eq!(text.as_deref(), Some(""), "a plain string content stays the string");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"], json!(""));
     }
 
     #[test]

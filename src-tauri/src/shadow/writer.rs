@@ -149,8 +149,10 @@ pub fn apply(conn: &Connection, w: &Write) -> rusqlite::Result<&'static str> {
                         "UPDATE messages SET rev = ?2 WHERE msg_id = ?1",
                         rusqlite::params![msg_id, rev],
                     )?;
-                    // T4: `chat.delete` / the `recall` msgType (the undo
-                    // marker normalize.rs codes as type 8) are recalls.
+                    // T4: the recall-family msgTypes (the undo markers
+                    // normalize.rs codes as type 8: chat.delete,
+                    // chat.undo, chat.delete.everyone, V1 recall) are
+                    // recalls.
                     let revision_kind = if is_recall_msg(payload) { "recall" } else { "edit" };
                     conn.execute(
                         "INSERT OR IGNORE INTO message_revisions (msg_id, rev, ts, kind, payload_json)
@@ -333,16 +335,19 @@ pub fn content_hash(payload: &str) -> Option<String> {
 }
 
 /// Does this payload mark a recall/undo? T4: incoming msgType
-/// `chat.delete`, or `recall` — exactly the two strings the batch-2
-/// `msg_type_code` table codes as 8 (H1: verified alignment, no
-/// change needed). Used ONLY to pick the revision kind.
+/// `chat.delete`, `chat.undo`, `chat.delete.everyone`, or `recall` —
+/// exactly the four strings the `msg_type_code` table codes as 8
+/// (batch 25: the Zalo PC 26.11.12 source adds MSG_UNDO ->
+/// `chat.undo` and MSG_DEL_EVERYONE -> `chat.delete.everyone` to the
+/// family; H1 verified the original alignment). Used ONLY to pick the
+/// revision kind.
 fn is_recall_msg(payload: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return false;
     };
     matches!(
         v.get("msgType").and_then(Value::as_str),
-        Some("chat.delete") | Some("recall")
+        Some("chat.delete") | Some("chat.undo") | Some("chat.delete.everyone") | Some("recall")
     )
 }
 
@@ -711,6 +716,27 @@ mod tests {
             .unwrap();
         assert_eq!(rev, 1, "chat.delete changes the content, so rev bumps");
         assert_eq!(kind, "recall", "msgType chat.delete => revision kind recall");
+        // Batch 25: the Zalo PC 26.11.12 recall-family strings mark
+        // their revisions as recalls too — the whole family codes as
+        // type 8 and is_recall_msg recognises exactly it.
+        for (mid, marker) in [("m5", "chat.undo"), ("m6", "chat.delete.everyone")] {
+            let first = pay(mid, "text", "\"hello\"");
+            apply(&conn, &wmsg(mid, "c1", Some("u1"), 1000, 1, Some("hello"), &first, "capture", None))
+                .unwrap();
+            let undo = pay(mid, marker, "\"\"");
+            apply(&conn, &wmsg(mid, "c1", Some("u1"), 1000, 8, None, &undo, "capture", None))
+                .unwrap();
+            let (rev, kind): (i64, String) = conn
+                .query_row(
+                    "SELECT rev, (SELECT kind FROM message_revisions WHERE msg_id = ?1)
+                     FROM messages WHERE msg_id = ?1",
+                    [mid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(rev, 1, "{marker} changes the content, so rev bumps");
+            assert_eq!(kind, "recall", "msgType {marker} => revision kind recall");
+        }
     }
 
     #[test]

@@ -355,6 +355,19 @@ fn message_to_write(
 /// link/call card, NOT media (7). Unknown strings still land in 100 —
 /// the audit's "type=100 chỉ còn msgType thật sự lạ" gate depends on
 /// that signal staying honest.
+///
+/// Batch 25 completes the table from the Zalo PC 26.11.12 source read
+/// (Claude, static: the `MSG_*` export module + the wire-string switch
+/// in `pc-dist/sync-v2-sub-worker.*.js`, mapped through
+/// `tools/import-mapping/zalo-desktop-26.11.json`): `chat.undo`
+/// (MSG_UNDO) and `chat.delete.everyone` (MSG_DEL_EVERYONE) join the
+/// recall family 8, `chat.webcontent.v2` joins `chat.webcontent` at 9,
+/// and `chat.list.action` (MSG_OA) = 14, `chat.ecard` (MSG_ECARD) =
+/// 15, `group.poll` (MSG_POLL) = 16, `chat.todo` (MSG_TODO) = 17.
+/// Every consumer of these codes is kept in sync: `writer::
+/// is_recall_msg` recognises the whole recall family,
+/// `import_map::MEDIA_CODES` re-parses the object/array content of the
+/// new kinds, and `archive::preview_label` labels them.
 pub fn msg_type_code(t: &str) -> i64 {
     match t {
         // Real wire shapes (H1).
@@ -365,12 +378,23 @@ pub fn msg_type_code(t: &str) -> i64 {
         "chat.voice" => 5,
         "chat.video.msg" => 6,
         "chat.recommended" | "chat.link" => 7,
-        "chat.delete" => 8,
-        "chat.webcontent" => 9,
+        // Recall family (batch 25): the marker strings the Zalo PC
+        // 26.11.12 source names — MSG_UNDO and MSG_DEL_EVERYONE join
+        // chat.delete / V1 recall; writer::is_recall_msg mirrors
+        // exactly this family.
+        "chat.delete" | "chat.undo" | "chat.delete.everyone" => 8,
+        // Web-content family (batch 25: chat.webcontent.v2 joins).
+        "chat.webcontent" | "chat.webcontent.v2" => 9,
         "notification" => 10,
         "chat.gif" => 11,
         "chat.doodle" => 12,
         "chat.location.new" => 13,
+        // Batch 25 new kinds (Zalo PC 26.11.12 MSG_OA / MSG_ECARD /
+        // MSG_POLL / MSG_TODO).
+        "chat.list.action" => 14,
+        "chat.ecard" => 15,
+        "group.poll" => 16,
+        "chat.todo" => 17,
         // V1-era strings keep their codes (back-compat with rows the
         // pre-rebuild writer stored).
         "text" => 1,
@@ -580,8 +604,10 @@ mod tests {
     fn msg_type_table_maps_wire_and_v1_strings() {
         // Real wire shapes (H1, measured on the live DB) + plausible
         // not-yet-seen ones, with the V1-era strings mapped to the SAME
-        // codes for back-compat. Unknown strings stay in the 100 bucket
-        // (the "type=100 only for genuinely unknown msgType" gate).
+        // codes for back-compat. Batch 25: the Zalo PC 26.11.12 source
+        // strings (the recall/webcontent families plus the four new
+        // kinds). Unknown strings stay in the 100 bucket (the "type=100
+        // only for genuinely unknown msgType" gate).
         let table = [
             ("webchat", 1i64),
             ("text", 1),
@@ -602,12 +628,23 @@ mod tests {
             ("links", 7),
             ("chat.delete", 8),
             ("recall", 8),
+            // Batch 25: chat.undo / chat.delete.everyone join the
+            // recall family; chat.webcontent.v2 joins chat.webcontent.
+            ("chat.undo", 8),
+            ("chat.delete.everyone", 8),
             ("chat.webcontent", 9),
+            ("chat.webcontent.v2", 9),
             ("chatContent", 9),
             ("notification", 10),
             ("chat.gif", 11),
             ("chat.doodle", 12),
             ("chat.location.new", 13),
+            // Batch 25 new kinds (Zalo PC 26.11.12: MSG_OA, MSG_ECARD,
+            // MSG_POLL, MSG_TODO).
+            ("chat.list.action", 14),
+            ("chat.ecard", 15),
+            ("group.poll", 16),
+            ("chat.todo", 17),
             ("", 0),
             ("something.brandnew", 100),
         ];
@@ -629,14 +666,25 @@ mod tests {
         };
         assert_eq!(kind, 2, "chat.photo -> table code 2");
         assert!(payload.contains("\"msgType\":\"chat.photo\""), "wire string stays in payload_json");
-        // The recall strings keep their type-8 alignment with
-        // writer::is_recall_msg (no change needed there).
+        // The recall family (batch 25: chat.delete, chat.undo,
+        // chat.delete.everyone, V1 recall) keeps its type-8 alignment
+        // with writer::is_recall_msg — the marker strings below are
+        // exactly the family the table codes as 8.
         let d = json!({"msgId": "md", "uidFrom": "u1", "idTo": "u2", "ts": 1,
                         "msgType": "chat.delete", "content": ""});
         let Some(Write::Message { kind, .. }) = message_to_write(&d, None, "e2ee", None) else {
             panic!()
         };
         assert_eq!(kind, 8);
+        for recall in ["chat.undo", "chat.delete.everyone"] {
+            let u = json!({"msgId": "mu", "uidFrom": "u1", "idTo": "u2", "ts": 1,
+                            "msgType": recall, "content": ""});
+            let Some(Write::Message { kind, .. }) = message_to_write(&u, None, "e2ee", None)
+            else {
+                panic!()
+            };
+            assert_eq!(kind, 8, "{recall} joins the recall family");
+        }
         // Unknown strings land in 100, empty in 0.
         assert_eq!(msg_type_code("chat.brand.new"), 100);
         assert_eq!(msg_type_code(""), 0);

@@ -2,8 +2,9 @@
 
 This is the how-to for the tools batch 12 added to `zalors import`,
 the batch-14 addition, the batch-15 additions, the batch-16
-additions, the batch-23a content-shape additions, and the batch-24
-BasicEncryption decode additions:
+additions, the batch-23a content-shape additions, the batch-24
+BasicEncryption decode additions, and the batch-25 completed msgType
+code table:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
@@ -16,6 +17,9 @@ BasicEncryption decode additions:
   with a read-only classification against a temp COPY of your shadow
   store (item 2.4); batch 24: the extraction now DECODES the Desktop
   `message` cell (BasicEncryption) and reports the outcome counts;
+  batch 25: the summary also prints the unmapped-code census (the
+  SAME fixed aggregation the apply preflight runs), so you see
+  exactly what an apply would refuse on;
 - `probe_import_overlap` — the 2.3 acceptance probe (≥99% msgId
   overlap, 100% type/ts/sender on the matches) that a mapping must
   pass before any apply step is even proposed; batch 15 adds the
@@ -43,7 +47,12 @@ BasicEncryption decode additions:
   zero-change second run; batch 24 adds the decode-census gate
   (refuse when more than 1% of the census rows fail to decode);
 - `--media-plan` (batch 16, §8) — the media hardlink PREP dry run
-  (item 2.6): counts only, no hashing, no hardlinks.
+  (item 2.6): counts only, no hashing, no hardlinks;
+- the batch-25 code table itself (§1g): `msgType` now maps every
+  Desktop code the Zalo PC 26.11.12 source names with a wire string
+  — only the Desktop-LOCAL rows `-4` (MSG_INFO) and `-1909`
+  (MSG_INFO_CHAT) stay unmapped by design, so the preflight/hatch
+  path is only for them (plus any code the source did not name).
 
 Everything here is **dry-run only** up to and including §5: nothing in
 the pipeline writes to the snapshot, the shadow store, or the live
@@ -202,13 +211,15 @@ rest for a re-run after more soak coverage.
 ## 1d. The content shapes (batch 23a)
 
 The cross-tab needs matched rows, and ~12.6k Desktop rows carry
-codes whose matches never reach that bar (19 ×8418, 20 ×2119,
+codes whose matches never reached that bar (19 ×8418, 20 ×2119,
 21 ×459, 52 ×343, 26 ×334, -4 ×278, -1909 ×128, 17 ×120, 7 ×79,
 25 ×65, -27 ×41, 3 ×30, 5 ×1). A second, INDEPENDENT arbiter is the
 SHAPE of the content: the top-level JSON key names and value types.
 A code whose content reads like `{href,params,title}` with `params`
 holding `fileSize/fileExt`, and whose few cross-tab hits say
-`share.file`, can be mapped with confidence.
+`share.file`, can be mapped with confidence. (Every code in that
+list except the local-info pair `-4`/`-1909` is mapped since batch
+25 — §1g; this section keeps the batch-23a motivation.)
 
 Two halves, one shared pure implementation
 (`shadow/import/content_shape.rs`):
@@ -369,6 +380,88 @@ The passphrase is passed in memory only, exactly the way
 prints, stores or hashes it, and no probe or tool ever prints a
 decrypted value.
 
+## 1g. Batch 25 — the completed code table (the Zalo PC 26.11.12 source)
+
+Batch 25 replaces the cross-tab bar with a better source of truth:
+Claude's STATIC read of the Zalo PC 26.11.12 app bundle
+`pc-dist/sync-v2-sub-worker.*.js`. The Desktop `message.msgType`
+column holds a numeric `MSG_*` constant exported by ONE module of
+that bundle, and the same bundle carries the switch that turns each
+constant into its wire msgType string. Combined, numeric code → wire
+string, every code that HAS one is now in the mapping's `msgType`
+table (`tools/import-mapping/zalo-desktop-26.11.json`):
+
+| Desktop code | constant | wire msgType |
+|---|---|---|
+| 1 | MSG_TEXT | webchat |
+| 2 / 11 | MSG_PHOTO / MSG_PHOTO_2 | chat.photo |
+| 3 | MSG_VOICE | chat.voice |
+| 4 | MSG_STICKER | chat.sticker |
+| 5 | MSG_DOODLE | chat.doodle |
+| 6 | MSG_CONTACT | chat.recommended |
+| 7 | MSG_GIF | chat.gif |
+| 17 | MSG_LOCATION | chat.location.new |
+| 18 | MSG_VIDEO | chat.video.msg |
+| 19 | MSG_FILE | share.file |
+| 20 | MSG_UNDO | chat.undo |
+| 21 | MSG_OA | chat.list.action |
+| 25 | MSG_ECARD | chat.ecard |
+| 26 | MSG_POLL | group.poll |
+| 52 | MSG_ZINSTANT | chat.webcontent |
+| -27 | MSG_DEL_EVERYONE | chat.delete.everyone |
+| 2506 | MSG_TODO | chat.todo |
+
+Two codes are DELIBERATELY still unmapped: `-4` (MSG_INFO) and
+`-1909` (MSG_INFO_CHAT). The source's switch has NO wire string for
+them — they are local info rows the Desktop writes into its own
+message table as bookkeeping. There is nothing a Desktop→wire table
+could map them to, so the apply's `--unmapped-as-raw` path (kind 100,
+text NULL, content only in payload_json) is their only import path
+today; skipping them at extract time is a possible later user
+decision (recorded in the mapping's `_notes`, not implemented).
+
+Corroborating evidence (kept in the mapping's `_notes`): the
+batch-15 cross-tab agrees for 1/2/4/6/18, 19→share.file,
+21→chat.list.action and 52→chat.webcontent; the batch-24 decrypted
+content shapes agree (19 has checksum/fileExt/fileSize; 17 has
+lat/lo; 25 has versionEcardNewFr; 52 has customMsg/pcItem; 7 is
+photo-like with contentId; 21 is a JSON array; 20 has
+`{cliMsgId, deleteMsg, globalMsgId}`). ONE conflict was found and
+resolved by the code: a single batch-15 cross-tab hit said
+20→webchat; the source says MSG_UNDO→`chat.undo`, so 20 maps to
+`chat.undo`.
+
+The shadow side changed consistently with the table
+(`normalize::msg_type_code`):
+
+- `chat.undo` and `chat.delete.everyone` join the recall family
+  **8** (with `chat.delete` / V1 `recall`) — `writer::is_recall_msg`
+  recognises the whole family, so their revisions land as `recall`;
+- `chat.webcontent.v2` joins **9** (`chat.webcontent`);
+- new codes: `chat.list.action` = **14**, `chat.ecard` = **15**,
+  `group.poll` = **16**, `chat.todo` = **17**;
+- `import_map::MEDIA_CODES` (the kinds whose wire content is a JSON
+  object/array, so the Desktop's JSON-text cell is re-parsed into
+  the capture shape) extends beyond the downloadable media kinds to
+  8, 9, 13, 14, 15, 16 and 17 — a parsed object/array never becomes
+  `messages.text`, so the new kinds can never leak JSON-as-text;
+- `archive::preview_label` labels 14-17 (`[danh sách]`, `[thiệp]`,
+  `[bình chọn]`, `[to-do]`), and the archive UI's recalled-message
+  rendering (type 8) covers the whole recall family.
+
+The one pre-existing inconsistency left as-is (out of batch-25
+scope, flagged for a follow-up): kind 7 (`chat.recommended`) also
+carries an object content on the wire but is NOT in `MEDIA_CODES` —
+batch 15 scoped the parsing to the "media kinds" only. Its import
+rows keep the JSON text as a string today.
+
+After batch 25, the unmapped-code census has exactly three possible
+kinds of finding, and the dry-run summary (§4) plus the apply
+refusal (§7) both list them clearly: the local-info pair `-4` /
+`-1909`, and any code the Zalo PC 26.11.12 source did not name
+(e.g. an unknown `999`) — treat the latter as new evidence and
+re-run `probe_import_codes` before mapping it.
+
 ## 2. Write the mapping JSON
 
 A mapping is a declarative JSON file. **There is no free SQL in it,
@@ -517,10 +610,23 @@ Output, per entity mapped:
 ```
 import dry-run: messages: extracted=4 new=2 fill_null=1 ignored=1 update_import=0 skipped=0 by_kind=one2one=4
 import dry-run: message content decode: decoded=2 not_encrypted=2 failed=0
+import dry-run: unmapped codes: 406 row(s) carry codes the mapping does not list — at apply time: refused without --unmapped-as-raw, else stored kind=100 with text=NULL (content only in payload_json, the raw code string included):
+import dry-run:   code -4 x 278
+import dry-run:   code -1909 x 128
 ```
 
 - The second line (batch 24) counts the BasicEncryption decode of
   the mapped `content` column (§1f) — counts only, never a value.
+- The last lines (batch 25) are the unmapped-code census — the SAME
+  fixed all-DB aggregation the apply preflight runs (§7 precondition
+  4), so the dry run lists exactly what an apply would refuse on (or
+  hatch). With the batch-25 table on the real snapshot the only
+  codes here are the Desktop-local rows `-4` (MSG_INFO) and `-1909`
+  (MSG_INFO_CHAT, §1g); with every occurring code mapped it prints
+  `import dry-run: unmapped codes: none (every code in the snapshot
+  is mapped)`. A census that itself cannot run (unreadable DB,
+  non-plain `msgType` mapping) prints `census failed: …` — the apply
+  keeps its fail-closed refusal on the same condition.
 
 - `extracted` — rows the mapping turned into `Write`s (`skipped` =
   rows it could not: NULL keys, an unparsable ts, a blob in a direct
@@ -675,11 +781,15 @@ each with a unit test on synthetic fixtures):
    without the hatch aborts the run with the per-code counts:
 
    ```
-   import failed: refusing --apply: 12600 row(s) carry msgType codes the mapping does not list ...
-     - code 19 x 5123
-     - code 20 x 3400
+   import failed: refusing --apply: 406 row(s) carry msgType codes the mapping does not list ...
+     - code -4 x 278
+     - code -1909 x 128
      ...
    ```
+
+   (With the batch-25 table (§1g) the real snapshot's only unmapped
+   codes are the Desktop-local pair `-4`/`-1909` — codes with NO wire
+   msgType, so there is nothing to add to the table for them.)
 
    The ONE escape hatch is `--unmapped-as-raw`: with it, unmapped rows
    are written `kind=100` with `text` forced NULL — content kept only
@@ -688,7 +798,12 @@ each with a unit test on synthetic fixtures):
    and storing that in `text` is exactly what the hatch must never
    do). The preflight prints the per-code counts that will take this
    path. A row with a NULL msgType is unmapped by definition (no code,
-   no mapping) and takes the same path.
+   no mapping) and takes the same path. Codes with no wire msgType
+   (Desktop-local rows, e.g. the negative sentinel codes the Zalo PC
+   26.11.12 source declares without a string) have nothing to add —
+   `--unmapped-as-raw` is their only path today, or a later, explicit
+   skip decision; any OTHER code listed here is new evidence — re-run
+   `probe_import_codes` before mapping it.
 5. The run counts and prints how many rows whose `uidFrom` is **NULL
    (not "0")** received the own-uid substitution via
    `normalize::sender_for` — the shared rule treats NULL as self when

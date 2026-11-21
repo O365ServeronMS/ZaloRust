@@ -191,7 +191,12 @@ fn mapped_table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite:
 /// carries no rows: it can neither break the preflight nor
 /// contribute writes, so it is skipped and counted instead of
 /// failing the run.
-fn unmapped_census(
+///
+/// Batch 25 (M3): `pub(crate)` — the mapping DRY RUN prints this same
+/// census (identical enumeration, identical aggregation) so its
+/// summary lists exactly what the apply preflight would refuse on;
+/// the apply's refusal message keeps its own wording.
+pub(crate) fn unmapped_census(
     p: &import::Prepared,
     plan: &import_map::Plan,
 ) -> Result<(Vec<UnmappedCode>, usize), String> {
@@ -840,7 +845,10 @@ pub fn run_apply_with_limit(
         msg.push_str(
             "Add the codes to the mapping's \"msgType\" table, or pass --unmapped-as-raw to \
              store those rows as kind=100 with NULL text (content only in payload_json, \
-             the raw code string included) — never JSON-as-text.",
+             the raw code string included) — never JSON-as-text. Codes with no wire msgType \
+             (Desktop-LOCAL rows, e.g. the negative sentinel codes the Zalo PC 26.11.12 \
+             source declares without a string) have nothing to add to the table — \
+             --unmapped-as-raw is their only path today, or a later, explicit skip decision.",
         );
         return Err(msg);
     } else {
@@ -1649,6 +1657,109 @@ mod tests {
         // R3 (batch 21): the two fixture DB connections must close
         // BEFORE the cleanup — an open SQLite handle keeps the file
         // locked on Windows and the removal fails silently.
+        drop(msg);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (batch 25 M1) The FULL code table the real
+    /// `tools/import-mapping/zalo-desktop-26.11.json` now carries,
+    /// inlined so the test never reads the repo tree: every Desktop
+    /// code the Zalo PC 26.11.12 source names WITH a wire string,
+    /// including the negative MSG_DEL_EVERYONE (-27) and the
+    /// 4-digit MSG_TODO (2506).
+    const FULL_MAPPING_JSON: &str = r#"{
+      "msgType": {
+        "1": "webchat", "2": "chat.photo", "3": "chat.voice", "4": "chat.sticker",
+        "5": "chat.doodle", "6": "chat.recommended", "7": "chat.gif",
+        "11": "chat.photo", "17": "chat.location.new", "18": "chat.video.msg",
+        "19": "share.file", "20": "chat.undo", "21": "chat.list.action",
+        "25": "chat.ecard", "26": "group.poll", "52": "chat.webcontent",
+        "-27": "chat.delete.everyone", "2506": "chat.todo"
+      },
+      "entities": {
+        "message": {
+          "db": ["one2one"], "table": "msg",
+          "columns": {
+            "msgId": "id", "uidFrom": "fromUid", "idTo": "toUid",
+            "ts": { "expr": "s_to_ms", "of": "ts" },
+            "msgType": "type", "content": "content"
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn unmapped_census_after_batch25_lists_only_local_info_and_unknown() {
+        // Batch 25 M3's acceptance, at census level: a synthetic
+        // snapshot whose msg rows carry EVERY code the batch-25 table
+        // maps (all 18, including -27 and 2506) plus the two local-info
+        // rows (-4 MSG_INFO, -1909 MSG_INFO_CHAT) and an unknown code
+        // 999. Only -4, -1909 and 999 may be reported.
+        let dir = temp_dir("b25census");
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        let codes: [i64; 21] = [
+            1, 2, 3, 4, 5, 6, 7, 11, 17, 18, 19, 20, 21, 25, 26, 52, -27, 2506, -4, -1909, 999,
+        ];
+        let mut sql = String::from(
+            "CREATE TABLE msg (
+               id INTEGER PRIMARY KEY, cliId TEXT, fromUid TEXT, toUid TEXT,
+               ts INTEGER, type INTEGER, content TEXT
+             );",
+        );
+        for (i, c) in codes.iter().enumerate() {
+            sql.push_str(&format!(
+                "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+                 VALUES ({i}, 'c{i}', 'u1', 'u2', 1690000000, {c}, 'x');"
+            ));
+        }
+        make_cipher_db_sql(&core.join("Message").join("111.db"), &sql);
+        make_cipher_db_sql(&core.join("Index.db"), INDEX_DB_APPLY_SQL);
+        let p = import::Prepared {
+            uid_dir: dir.clone(),
+            passphrase: Zeroizing::new(PASS.to_string()),
+            profile: import::CipherProfile::Compat4,
+            key_sha12: import::sha12(PASS.as_bytes()),
+        };
+        let msg = import::open_desktop_db(
+            &core.join("Message").join("111.db"),
+            PASS,
+            import::CipherProfile::Compat4,
+        )
+        .unwrap();
+        let idx = import::open_desktop_db(&core.join("Index.db"), PASS, import::CipherProfile::Compat4)
+            .unwrap();
+        let plan = fixture_plan(FULL_MAPPING_JSON, &msg, &idx);
+        let (unmapped, no_table) = unmapped_census(&p, &plan).unwrap();
+        assert_eq!(no_table, 0, "the fixture DB has the mapped table");
+        // Exactly the local-info pair and the unknown code — each row
+        // once, rendered through the batch-14 renderer (an INTEGER
+        // cell prints as its number, negatives included).
+        let mut got: Vec<(String, i64)> =
+            unmapped.iter().map(|u| (u.rendered.clone(), u.rows)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("-1909".to_string(), 1), ("-4".to_string(), 1), ("999".to_string(), 1)],
+            "only -4, -1909 and 999 may be reported"
+        );
+        // Belt: none of the 18 mapped codes leaked into the list.
+        for c in codes.iter().filter(|c| ![&-4i64, &-1909i64, &999i64].contains(c)) {
+            assert!(
+                !unmapped.iter().any(|u| u.rendered == c.to_string()),
+                "code {c} is mapped by the batch-25 table and must not be reported"
+            );
+        }
+        // The apply's census wording over the same finding stays clear
+        // about what would happen to them.
+        let lines = unmapped_lines(&unmapped, false);
+        let joined = lines.join("\n");
+        assert!(joined.contains("3 row(s) carry codes the mapping does not list"), "{joined}");
+        assert!(joined.contains("code -4 x 1"), "{joined}");
+        assert!(joined.contains("code -1909 x 1"), "{joined}");
+        assert!(joined.contains("code 999 x 1"), "{joined}");
+        // R3 (batch 21): close the fixture connections before cleanup.
         drop(msg);
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);

@@ -26,7 +26,9 @@
   }
 
   function isRecalled(msg) {
-    return msg.type === 8; // normalize::msg_type_code's chat.delete/recall
+    // normalize::msg_type_code's recall family (batch 25: chat.delete,
+    // chat.undo, chat.delete.everyone, V1 recall — all code 8).
+    return msg.type === 8;
   }
   function isGone(msg) {
     return !!(msg.deleted || msg.type === 8);

@@ -1448,6 +1448,46 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
             "import dry-run: message content decode: decoded={} not_encrypted={} failed={}",
             decode_total.decoded, decode_total.not_encrypted, decode_total.failed
         ));
+        // Batch 25 (M3): the unmapped-code census — the SAME preflight
+        // the apply runs (identical DB enumeration, identical fixed
+        // aggregation), so the dry-run summary lists exactly the codes
+        // the apply would refuse on (or, with --unmapped-as-raw, hatch)
+        // before any apply step is even proposed. Counts and
+        // code-shaped tokens only — the renderer never prints a value.
+        match super::import_apply::unmapped_census(&p, &plan) {
+            Ok((unmapped, census_no_table)) => {
+                if census_no_table > 0 {
+                    lines.push(format!(
+                        "import dry-run: unmapped-code census: dbs_no_table={census_no_table} \
+                         (DBs that open fine but have no mapped table — skipped, counted)"
+                    ));
+                }
+                if unmapped.is_empty() {
+                    lines.push(
+                        "import dry-run: unmapped codes: none (every code in the snapshot \
+                         is mapped)"
+                            .into(),
+                    );
+                } else {
+                    let total: i64 = unmapped.iter().map(|u| u.rows).sum();
+                    lines.push(format!(
+                        "import dry-run: unmapped codes: {total} row(s) carry codes the \
+                         mapping does not list — at apply time: refused without \
+                         --unmapped-as-raw, else stored kind=100 with text=NULL (content \
+                         only in payload_json, the raw code string included):"
+                    ));
+                    for u in &unmapped {
+                        lines.push(format!("import dry-run:   code {} x {}", u.rendered, u.rows));
+                    }
+                }
+            }
+            Err(e) => {
+                // Reported, not fatal: the dry run is a report — the
+                // apply keeps the fail-closed behaviour on the same
+                // condition.
+                lines.push(format!("import dry-run: unmapped codes: census failed: {e}"));
+            }
+        }
     }
     if plan.attachment.is_some() {
         lines.push(format!(
@@ -2540,6 +2580,9 @@ mod tests {
         assert!(joined.contains("no writes performed"), "{joined}");
         // No entity lines when nothing is mapped.
         assert!(!joined.contains("import dry-run: messages:"), "{joined}");
+        // Batch 25: no message entity -> no census section either
+        // (there is no code column to aggregate).
+        assert!(!joined.contains("import dry-run: unmapped codes:"), "{joined}");
         // The store files never changed (only file-copied).
         assert_eq!(
             (file_sha256(&super::super::db_file(&store)), file_sha256(&super::super::key_file(&store))),
@@ -2626,6 +2669,22 @@ mod tests {
                 "import dry-run: message content decode: decoded=0 not_encrypted=4 failed=0"
             ),
             "{joined}"
+        );
+        // Batch 25 (M3): the unmapped-code census — the SAME preflight
+        // the apply runs, so the dry-run summary lists what an apply
+        // would refuse on. DRY_MAPPING lists only chat.text.v2, so
+        // the fixture's other two codes surface with their counts.
+        assert!(
+            joined.contains(
+                "import dry-run: unmapped codes: 2 row(s) carry codes the mapping does not list"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("import dry-run:   code chat.photo x 1"), "{joined}");
+        assert!(joined.contains("import dry-run:   code webchat x 1"), "{joined}");
+        assert!(
+            !joined.contains("unmapped codes: none"),
+            "chat.photo and webchat ARE unmapped here: {joined}"
         );
         // The delta line: no cursor yet (nothing applied ever), the
         // raw-table totals, and the cursor an apply would write. Note

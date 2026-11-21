@@ -97,6 +97,10 @@ pub fn clamp_page(limit: Option<u32>) -> usize {
 /// The msg-type label table for previews (codes are
 /// `normalize::msg_type_code`'s stable numbers). Text kinds (0/1)
 /// have no label — a text row without text has nothing to preview.
+/// Batch 25: the Zalo PC 26.11.12 kinds (`chat.list.action`,
+/// `chat.ecard`, `group.poll`, `chat.todo`) join the table; the
+/// recall label at 8 now also covers `chat.undo` /
+/// `chat.delete.everyone`, and 9 covers `chat.webcontent.v2`.
 pub fn preview_label(kind: i64) -> Option<&'static str> {
     match kind {
         2 => Some("[ảnh]"),           // chat.photo
@@ -105,12 +109,16 @@ pub fn preview_label(kind: i64) -> Option<&'static str> {
         5 => Some("[giọng nói]"),     // chat.voice
         6 => Some("[video]"),         // chat.video.msg
         7 => Some("[liên kết]"),      // chat.recommended / chat.link
-        8 => Some("[đã thu hồi]"),    // chat.delete (recall)
-        9 => Some("[nội dung web]"),  // chat.webcontent
+        8 => Some("[đã thu hồi]"),    // chat.delete / chat.undo / chat.delete.everyone (recall)
+        9 => Some("[nội dung web]"),  // chat.webcontent / chat.webcontent.v2
         10 => Some("[thông báo]"),    // notification
         11 => Some("[gif]"),           // chat.gif
         12 => Some("[doodle]"),       // chat.doodle
         13 => Some("[vị trí]"),       // chat.location.new
+        14 => Some("[danh sách]"),    // chat.list.action (batch 25)
+        15 => Some("[thiệp]"),         // chat.ecard (batch 25)
+        16 => Some("[bình chọn]"),    // group.poll (batch 25)
+        17 => Some("[to-do]"),         // chat.todo (batch 25)
         100 => Some("[khác]"),        // genuinely unknown msgType
         _ => None,                    // 0/1: text — no label
     }
@@ -655,6 +663,11 @@ mod tests {
         assert_eq!(preview_of(None, 3).as_deref(), Some("[sticker]"));
         assert_eq!(preview_of(None, 5).as_deref(), Some("[giọng nói]"));
         assert_eq!(preview_of(None, 8).as_deref(), Some("[đã thu hồi]"));
+        // Batch 25: the Zalo PC 26.11.12 kinds carry their labels too.
+        assert_eq!(preview_of(None, 14).as_deref(), Some("[danh sách]"));
+        assert_eq!(preview_of(None, 15).as_deref(), Some("[thiệp]"));
+        assert_eq!(preview_of(None, 16).as_deref(), Some("[bình chọn]"));
+        assert_eq!(preview_of(None, 17).as_deref(), Some("[to-do]"));
         assert_eq!(preview_of(None, 100).as_deref(), Some("[khác]"));
         // A media message WITH text previews the text.
         assert_eq!(preview_of(Some("xem ảnh nhé"), 2).as_deref(), Some("xem ảnh nhé"));

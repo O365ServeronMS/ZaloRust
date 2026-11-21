@@ -26,7 +26,12 @@
 //!   like;
 //! - recompute `messages.type` from the payload msgType through the
 //!   SAME table the writer uses (B6/H1) — so V1 rows (0/1/2/5/8/9/99
-//!   codes) and 100-bucket rows land on the batch-2 codes;
+//!   codes) and 100-bucket rows land on the batch-2/25 codes; a
+//!   repair re-run after batch 25 also moves rows whose payload
+//!   msgType is one of the newly-coded strings (chat.list.action /
+//!   chat.ecard / group.poll / chat.todo → 14-17, chat.undo /
+//!   chat.delete.everyone → 8, chat.webcontent.v2 → 9) off the 100
+//!   bucket;
 //! - (e) KQ2 backfill: fill `sender_id` for self-sent rows stuck at
 //!   NULL from the configured own uid (audit §1.2 migration bullet);
 //! - (f) H4 ping-pong revisions: delete edit revisions whose payload
