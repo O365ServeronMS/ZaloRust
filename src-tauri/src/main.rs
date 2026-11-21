@@ -103,6 +103,17 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Batch 26 M1: `zalors media …` — the read-only media SHAPE CLI.
+    // It never writes and needs no process check, so it is safe to
+    // run while the app is up; dispatched like `repair` (parent
+    // console attached, CLI exit codes, never a second app instance).
+    if argv.get(1).map(String::as_str) == Some("media") {
+        #[cfg(windows)]
+        attach_parent_console();
+        let code = zalors_lib::shadow::media_cli::main(&argv[2..]);
+        std::process::exit(code);
+    }
+
     zalors_lib::run();
 }
 

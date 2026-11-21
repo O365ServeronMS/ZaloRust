@@ -163,11 +163,11 @@ pub fn apply(conn: &Connection, w: &Write) -> rusqlite::Result<&'static str> {
                 // Attachment refs mirror the STORED payload: only (re)extract
                 // when this write actually stored its payload.
                 if replaced {
-                    extract_attachments(conn, msg_id, payload)?;
+                    extract_attachments(conn, msg_id, payload, source)?;
                 }
             } else {
                 // Fresh row: this payload is now the stored one.
-                extract_attachments(conn, msg_id, payload)?;
+                extract_attachments(conn, msg_id, payload, source)?;
             }
             // T7/H4-e: a message always owns (at least) a stub conversation
             // row, so conversation-first listings never orphan it. B5: a
@@ -363,6 +363,11 @@ pub enum MediaOutcome {
     /// keeps its url (`status='ref-encrypted'`) instead of going
     /// `failed`, so a future decode path can pick it up.
     RefEncrypted,
+    /// M2 (batch 26): the link is GONE (403/404/410) — expired CDN
+    /// history is not a broken row. Nothing is kept; the row keeps its
+    /// url with `status='expired` so it is never retried by the live
+    /// thread, and the opt-in import backfill skips it too.
+    Expired,
     Failed,
 }
 
@@ -378,6 +383,10 @@ pub fn media_done(conn: &Connection, rowid: i64, outcome: &MediaOutcome) -> rusq
         ),
         MediaOutcome::RefEncrypted => conn.execute(
             "UPDATE attachments SET status='ref-encrypted' WHERE rowid = ?1",
+            rusqlite::params![rowid],
+        ),
+        MediaOutcome::Expired => conn.execute(
+            "UPDATE attachments SET status='expired' WHERE rowid = ?1",
             rusqlite::params![rowid],
         ),
         MediaOutcome::Failed => conn.execute(
@@ -402,24 +411,51 @@ pub fn media_done(conn: &Connection, rowid: i64, outcome: &MediaOutcome) -> rusq
 /// object is accepted too. Only values that are strings starting with
 /// `https://` survive.
 pub fn pick_attachments(msg_type: &str, content: &Value) -> Vec<(&'static str, String)> {
+    pick_attachments_fields(msg_type, content)
+        .into_iter()
+        .map(|(kind, url, _field)| (kind, url))
+        .collect()
+}
+
+/// Batch 26 (M1): the SAME pick as [`pick_attachments`] — identical
+/// priority, identical urls, identical kinds (the wrapper above is the
+/// exact old behaviour) — with the SOURCE FIELD named:
+/// `params.hdUrl`, `params.hd`, `params.rawUrl`, `href`, `params.url`.
+/// The media shape CLI re-runs this over stored payloads to report
+/// which field a row's url came from; field NAMES only, never values.
+pub fn pick_attachments_fields(
+    msg_type: &str,
+    content: &Value,
+) -> Vec<(&'static str, String, String)> {
     let Some(obj) = content.as_object() else {
         return Vec::new(); // webchat-style plain-string content
     };
     let params = parsed_params(obj);
-    let one = |kind: &'static str, url: Option<String>| {
-        url.map(|u| vec![(kind, u)]).unwrap_or_default()
+    let one = |kind: &'static str, cand: Option<(String, String)>| {
+        cand.map(|(field, url)| vec![(kind, url, field)]).unwrap_or_default()
+    };
+    let param_field = |keys: &[&'static str]| -> Option<(String, String)> {
+        param_str(params.as_ref(), keys).map(|(k, u)| (format!("params.{k}"), u))
     };
     match msg_type {
         "chat.photo" | "photo" | "image" => one(
             "image",
-            param_str(params.as_ref(), &["hdUrl", "hd", "rawUrl"])
-                .or_else(|| https_str(obj.get("href"))),
+            param_field(&["hdUrl", "hd", "rawUrl"])
+                .or_else(|| https_str(obj.get("href")).map(|u| ("href".into(), u))),
         ),
-        "chat.video.msg" | "video" => one("video", https_str(obj.get("href"))),
-        "share.file" | "file" => one("file", https_str(obj.get("href"))),
+        "chat.video.msg" | "video" => one(
+            "video",
+            https_str(obj.get("href")).map(|u| ("href".into(), u)),
+        ),
+        "share.file" | "file" => one(
+            "file",
+            https_str(obj.get("href")).map(|u| ("href".into(), u)),
+        ),
         "chat.voice" | "voice" => one(
             "voice",
-            https_str(obj.get("href")).or_else(|| param_str(params.as_ref(), &["url"])),
+            https_str(obj.get("href"))
+                .map(|u| ("href".into(), u))
+                .or_else(|| param_field(&["url"])),
         ),
         _ => Vec::new(),
     }
@@ -446,9 +482,12 @@ fn parsed_params(obj: &serde_json::Map<String, Value>) -> Option<Value> {
 /// First https candidate among `params` keys, in the given priority
 /// order — a non-https value in a higher-priority key is SKIPPED (the
 /// filter is per value), never falls through to a lower key's failure.
-fn param_str(params: Option<&Value>, keys: &[&str]) -> Option<String> {
+/// Batch 26 M1: returns the KEY alongside the url (the caller prefixes
+/// it for the field name the media shape CLI reports).
+fn param_str(params: Option<&Value>, keys: &[&'static str]) -> Option<(&'static str, String)> {
     let p = params?.as_object()?;
-    keys.iter().find_map(|k| https_str(p.get(*k)))
+    keys.iter()
+        .find_map(|k| https_str(p.get(*k)).map(|u| (*k, u)))
 }
 
 /// Pull attachment refs out of the message payload (the msgType string
@@ -457,21 +496,34 @@ fn param_str(params: Option<&Value>, keys: &[&str]) -> Option<String> {
 /// in place when a higher-rank payload carries a different url (KQ1:
 /// e2ee `hdUrl` after capture `href`); `downloaded`/`failed` rows are
 /// never touched.
-fn extract_attachments(conn: &Connection, msg_id: &str, payload: &str) -> rusqlite::Result<()> {
+///
+/// M3 (batch 26): the initial status follows the write's SOURCE. A row
+/// created for an import-sourced message starts as `ref-import` — a
+/// KNOWN url from imported history that the live media thread must NOT
+/// pick (the media module's "never a backfill scan of history"). A
+/// later live capture of the SAME (msg_id, idx) improves the row's url
+/// through the shared rule below but never silently upgrades its
+/// status: `ref-import` keeps meaning "history, not live-queued".
+fn extract_attachments(conn: &Connection, msg_id: &str, payload: &str, source: &str) -> rusqlite::Result<()> {
     let Ok(v) = serde_json::from_str::<Value>(payload) else {
         return Ok(());
     };
     let msg_type = v.get("msgType").and_then(Value::as_str).unwrap_or("");
     let content = v.get("content").cloned().unwrap_or(Value::Null);
+    let initial_status: &str = if source == "import" { "ref-import" } else { "ref" };
     for (idx, (kind, url)) in pick_attachments(msg_type, &content).into_iter().enumerate() {
         conn.execute(
             "INSERT OR IGNORE INTO attachments (msg_id, idx, kind, url, status)
-             VALUES (?1, ?2, ?3, ?4, 'ref')",
-            rusqlite::params![msg_id, idx as i64, kind, url],
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![msg_id, idx as i64, kind, url, initial_status],
         )?;
+        // M3: the improve rule treats `ref-import` like `ref` (a live
+        // capture upgrades the url of the SAME message) but the UPDATE
+        // only ever sets `url` — the history status is kept, never
+        // silently upgraded to the live queue.
         conn.execute(
             "UPDATE attachments SET url = ?3
-              WHERE msg_id = ?1 AND idx = ?2 AND status = 'ref' AND url <> ?3",
+              WHERE msg_id = ?1 AND idx = ?2 AND status IN ('ref', 'ref-import') AND url <> ?3",
             rusqlite::params![msg_id, idx as i64, url],
         )?;
     }
@@ -1240,5 +1292,148 @@ mod tests {
             .query_row("SELECT status FROM attachments WHERE rowid = ?1", [rowid], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "ref-encrypted");
+    }
+
+    // --- batch 26: M2 Expired outcome + M3 ref-import rows -------------------
+
+    #[test]
+    fn media_done_expired() {
+        // M2: a gone link (403/404/410) is EXPIRED, not failed — the
+        // row keeps its url and is never retried by the live thread.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO attachments (msg_id, idx, kind, url, status)
+             VALUES ('mg', 0, 'image', 'https://h/x', 'ref')",
+            [],
+        )
+        .unwrap();
+        let rowid: i64 = conn
+            .query_row("SELECT rowid FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        media_done(&conn, rowid, &MediaOutcome::Expired).unwrap();
+        let (status, url): (String, String) = conn
+            .query_row(
+                "SELECT status, url FROM attachments WHERE rowid = ?1",
+                [rowid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(url, "https://h/x", "the url is kept");
+    }
+
+    #[test]
+    fn import_write_creates_ref_import_rows() {
+        // M3: an import-sourced message's attachment starts life as
+        // `ref-import` — history the live thread must never pick. The
+        // live capture path is unchanged (still 'ref').
+        let conn = db();
+        let imp = pay(
+            "mi",
+            "chat.photo",
+            r#"{"href":"https://fake-photo-stal.zdn.vn/low.jpg","params":"{\"hd\":\"https://fake-photo-stal.zdn.vn/hd.jpg\"}"}"#,
+        );
+        apply(&conn, &wmsg("mi", "c1", Some("u1"), 1000, 2, None, &imp, "import", None)).unwrap();
+        let (kind, url, status): (String, String, String) = conn
+            .query_row(
+                "SELECT kind, url, status FROM attachments WHERE msg_id='mi'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), url.as_str(), status.as_str()),
+            ("image", "https://fake-photo-stal.zdn.vn/hd.jpg", "ref-import")
+        );
+        // The live capture path is unchanged: same shape, 'ref'.
+        let cap = pay(
+            "mc",
+            "chat.photo",
+            r#"{"href":"https://fake-photo-stal.zdn.vn/low.jpg"}"#,
+        );
+        apply(&conn, &wmsg("mc", "c1", Some("u1"), 1000, 2, None, &cap, "capture", None)).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM attachments WHERE msg_id='mc'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "ref");
+    }
+
+    #[test]
+    fn capture_improves_a_ref_import_url_but_never_its_status() {
+        // M3: a live capture delivering the SAME (msg_id, idx) improves
+        // the row's url through the shared rule but must not silently
+        // upgrade `ref-import` into the live queue.
+        let conn = db();
+        let imp = pay(
+            "mq",
+            "chat.photo",
+            r#"{"href":"https://fake-photo-stal.zdn.vn/low.jpg"}"#,
+        );
+        apply(&conn, &wmsg("mq", "c1", Some("u1"), 1000, 2, None, &imp, "import", None)).unwrap();
+        // A capture (higher rank) arrives carrying the hd url.
+        let cap = pay(
+            "mq",
+            "chat.photo",
+            r#"{"href":"https://fake-photo-stal.zdn.vn/low.jpg","params":"{\"hdUrl\":\"https://fake-photo-stal.zdn.vn/hd.jpg\"}"}"#,
+        );
+        apply(&conn, &wmsg("mq", "c1", Some("u1"), 1000, 2, None, &cap, "capture", None)).unwrap();
+        let (url, status): (String, String) = conn
+            .query_row(
+                "SELECT url, status FROM attachments WHERE msg_id='mq'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (url.as_str(), status.as_str()),
+            ("https://fake-photo-stal.zdn.vn/hd.jpg", "ref-import"),
+            "the url improves; the history status stays"
+        );
+        // Downgraded (lower-rank) writes never touch the row either.
+        let imp2 = pay(
+            "mq",
+            "chat.photo",
+            r#"{"href":"https://fake-photo-stal.zdn.vn/other.jpg"}"#,
+        );
+        apply(&conn, &wmsg("mq", "c1", Some("u1"), 1000, 2, None, &imp2, "import", None)).unwrap();
+        let url: String = conn
+            .query_row("SELECT url FROM attachments WHERE msg_id='mq'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(url, "https://fake-photo-stal.zdn.vn/hd.jpg");
+    }
+
+    #[test]
+    fn pick_attachments_fields_names_the_source_field() {
+        // M1: the field-name picker picks the SAME urls as the plain
+        // picker and names where each came from.
+        let content = json!({
+            "href": "https://fake-photo-stal.zdn.vn/low.jpg",
+            "params": "{\"hd\":\"https://fake-photo-stal.zdn.vn/hd.jpg\",\"rawUrl\":\"https://fake-photo-stal.zdn.vn/raw.jpg\"}"
+        });
+        assert_eq!(
+            pick_attachments_fields("chat.photo", &content),
+            vec![(
+                "image",
+                "https://fake-photo-stal.zdn.vn/hd.jpg".to_string(),
+                "params.hd".to_string()
+            )]
+        );
+        assert_eq!(
+            pick_attachments("chat.photo", &content),
+            vec![("image", "https://fake-photo-stal.zdn.vn/hd.jpg".to_string())],
+            "the wrapper keeps the exact old behaviour"
+        );
+        // Every dispatch names its own field.
+        assert_eq!(
+            pick_attachments_fields("chat.video.msg", &json!({"href": "https://fake-video-stal.dlmd.me/v.mp4"})),
+            vec![("video", "https://fake-video-stal.dlmd.me/v.mp4".to_string(), "href".to_string())]
+        );
+        assert_eq!(
+            pick_attachments_fields("chat.voice", &json!({"params": "{\"url\":\"https://fake-voc.dlfl.vn/a.wav\"}"})),
+            vec![("voice", "https://fake-voc.dlfl.vn/a.wav".to_string(), "params.url".to_string())]
+        );
+        // Nothing picked -> nothing named.
+        assert!(pick_attachments_fields("chat.sticker", &content).is_empty());
+        assert!(pick_attachments_fields("chat.photo", &json!("plain")).is_empty());
     }
 }

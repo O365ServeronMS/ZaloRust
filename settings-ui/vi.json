@@ -399,6 +399,8 @@
  "Recalled message": "Tin nhắn đã thu hồi",
  "Deleted message": "Tin nhắn đã bị xoá",
  "Media not downloaded ({0})": "Media chưa tải xuống ({0})",
+ "Media not downloaded (history)": "Media chưa tải xuống (lịch sỬ)",
+ "Link expired": "Liên kết đã hết hạn",
  "No more messages.": "Không còn tin nhắn nào.",
  "Unknown": "Không rõ",
  "Loading…": "Đang tải…",

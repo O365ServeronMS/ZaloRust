@@ -110,6 +110,15 @@ pub struct ShadowSettings {
     /// worker pauses downloading (rows stay `ref`; text capture is
     /// never affected).
     pub disk_stop_pct: u8,
+    /// Batch 26 M3: opt-in backfill of IMPORT-sourced media history.
+    /// **OFF by default** — the live media thread only ever picks
+    /// `status='ref'` rows (the module doc's "never a backfill scan of
+    /// history"), and the Desktop import's `ref-import` rows are not
+    /// live traffic. When ON, the thread may pick `ref-import` rows too,
+    /// but only after the `ref` queue is empty in that cycle, at most 2
+    /// per cycle, and a circuit breaker pauses the picks for the rest
+    /// of the session after 20 consecutive gone/http_other outcomes.
+    pub media_backfill_import: bool,
 }
 
 impl Default for ShadowSettings {
@@ -132,6 +141,8 @@ impl Default for ShadowSettings {
             backup_interval_hours: 6,
             disk_warn_pct: 10,
             disk_stop_pct: 3,
+            // Batch 26 M3: import-history media backfill is opt-in.
+            media_backfill_import: false,
         }
     }
 }

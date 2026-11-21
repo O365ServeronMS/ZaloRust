@@ -3,6 +3,20 @@
 //! Rules (handoff + audit H3/T3, M1/B3/B4 batch 2):
 //! - Only NEW media (attachments rows with status='ref' created by the
 //!   writer from live traffic) — never a backfill scan of history.
+//! - Batch 26 M3: rows created for IMPORT-sourced messages carry
+//!   `status='ref-import'` and are never picked by default — picking
+//!   them would turn the import into exactly the history backfill the
+//!   first rule forbids. The opt-in
+//!   `settings.shadow.media_backfill_import` (default false) may pick
+//!   them: at most 2 per cycle, only once the live `ref` queue produced
+//!   no rows that cycle, and a circuit breaker pauses the picks for
+//!   the rest of the session after 20 consecutive gone/http_other
+//!   outcomes on import rows.
+//! - Batch 26 M2: a failed GET is classified into kinds (gone /
+//!   http_other / timeout / net / store — kinds only, the ureq error
+//!   text embeds the request url). A GONE link (403/404/410) lands as
+//!   `status='expired'`, not `failed`: expired CDN history is not a
+//!   broken row.
 //! - M1 SSRF guard: every url must pass [`host_allowed`] BEFORE any
 //!   request (https + CDN host allowlist, no userinfo/IP/non-default
 //!   ports). Automatic redirects are DISABLED (`max_redirects(0)`);
@@ -73,11 +87,28 @@ struct CycleCounts {
     blocked_redirect: usize,
     /// B4/KQ1: bytes failed the magic sniff (kept nothing).
     ref_encrypted: usize,
+    /// M2: the `failed` total split by kind. Kinds only — the ureq
+    /// error text embeds the request url, so it never reaches a log.
+    failed_gone: usize,
+    failed_http_other: usize,
+    failed_timeout: usize,
+    failed_net: usize,
+    failed_store: usize,
 }
 
 impl CycleCounts {
     fn total(&self) -> usize {
         self.ok + self.failed + self.blocked_host + self.blocked_redirect + self.ref_encrypted
+    }
+
+    /// M2: the appended `failed_kinds=(…)` field — kinds and counts
+    /// only, in the brief's fixed order.
+    fn failed_kinds_field(&self) -> String {
+        format!(
+            "failed_kinds=(gone {} http_other {} timeout {} net {} store {})",
+            self.failed_gone, self.failed_http_other, self.failed_timeout, self.failed_net,
+            self.failed_store
+        )
     }
 }
 
@@ -102,6 +133,9 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
             crate::dlog::log(&format!("shadow media: store at {}", root.display()));
             // Rows whose outcome is still in the flusher's queue/hands.
             let mut in_flight: HashSet<i64> = HashSet::new();
+            // M3: the opt-in import-history backfill state (session
+            // scoped — the breaker pause lasts until restart).
+            let mut import = ImportBackfill::new(cfg.media_backfill_import);
             let mut backoff = 30u64;
             // H3/D13 (batch 8): the last space verdict this thread
             // logged a transition for. `Ok` is the quiet initial state.
@@ -143,18 +177,21 @@ pub(crate) fn start(dir: PathBuf, cfg: ShadowSettings, done: Sender<Job>) {
                 let Some(conn) = open(&dir, &cfg) else {
                     continue;
                 };
-                match download_one_cycle(&conn, &root, &done, &mut in_flight) {
+                match download_one_cycle(&conn, &root, &done, &mut in_flight, &mut import) {
                     Ok(counts) if counts.total() == 0 => backoff = 30,
                     Ok(counts) => {
                         backoff = 10;
                         // Counts only (H-rule): no urls, no error text.
+                        // M2 appends the failed-kinds split — every
+                        // existing field keeps its name and position.
                         crate::dlog::log(&format!(
-                            "shadow media: cycle reported ok={} failed={} blocked_host={} blocked_redirect={} ref_encrypted={}",
+                            "shadow media: cycle reported ok={} failed={} blocked_host={} blocked_redirect={} ref_encrypted={} {}",
                             counts.ok,
                             counts.failed,
                             counts.blocked_host,
                             counts.blocked_redirect,
-                            counts.ref_encrypted
+                            counts.ref_encrypted,
+                            counts.failed_kinds_field(),
                         ));
                     }
                     Err(CycleError::Db(e)) => {
@@ -230,11 +267,13 @@ fn open(dir: &Path, cfg: &ShadowSettings) -> Option<Connection> {
 /// re-picked (at worst re-downloaded) by a later cycle.
 const IN_FLIGHT_CAP: usize = 1024;
 
-/// F1: drop ids whose row is no longer `status='ref'` — the flusher has
+/// F1: drop ids whose row is no longer live-queued — the flusher has
 /// applied their outcome (or the row is gone), so they are safe to
 /// select again. Ids still `ref` STAY in flight: their outcome is
 /// queued but has not landed yet, so re-selecting one would download
-/// the same url a second time.
+/// the same url a second time. M3: with the import backfill on, a
+/// picked `ref-import` row obeys exactly the same rule while its
+/// outcome is pending.
 ///
 /// One query; the `IN (...)` list is built from `i64::to_string()`
 /// (pure digits), so there is no quoting or injection surface.
@@ -254,7 +293,7 @@ fn prune_in_flight(conn: &Connection, in_flight: &mut HashSet<i64>) -> rusqlite:
     let mut still_ref = HashSet::with_capacity(in_flight.len());
     {
         let mut st = conn.prepare(&format!(
-            "SELECT rowid FROM attachments WHERE status = 'ref' AND rowid IN ({ids})"
+            "SELECT rowid FROM attachments WHERE status IN ('ref','ref-import') AND rowid IN ({ids})"
         ))?;
         let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
         for id in rows {
@@ -280,6 +319,60 @@ pub fn media_store_root(cfg: &ShadowSettings) -> PathBuf {
         .join("ZaloRust Data")
 }
 
+/// M3 opt-in import backfill state (settings key
+/// `shadow.media_backfill_import`, default false). The history queue
+/// (`ref-import`) is picked only when `enabled`, at most
+/// [`MAX_PER_CYCLE`](Self::MAX_PER_CYCLE) rows per cycle, and only once
+/// the live `ref` queue produced no rows that cycle. The circuit
+/// breaker pauses the picks for the rest of the session after 20
+/// consecutive `gone`/`http_other` outcomes on import rows — expired or
+/// signed CDN history is the normal case there, and the thread must not
+/// spend every cycle on it. Pure: the unit tests drive the fold
+/// directly, no network.
+#[derive(Debug)]
+struct ImportBackfill {
+    enabled: bool,
+    consecutive_fail: u32,
+    paused: bool,
+}
+
+impl ImportBackfill {
+    /// Backfill rows per cycle (the batch's cap).
+    const MAX_PER_CYCLE: usize = 2;
+    /// Consecutive gone/http_other import outcomes that trip the
+    /// breaker (the batch's limit).
+    const BREAKER_LIMIT: u32 = 20;
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            consecutive_fail: 0,
+            paused: false,
+        }
+    }
+
+    /// Pure breaker fold over one import-row outcome. A `gone`/
+    /// `http_other` failure extends the streak; ANY other outcome
+    /// resets it (one servable row proves the history is not uniformly
+    /// dead). Returns `true` exactly ONCE — on the transition to
+    /// paused — so the caller logs one line, never one per row.
+    fn record_import_outcome(&mut self, gone_or_http_other: bool) -> bool {
+        if self.paused {
+            return false;
+        }
+        if !gone_or_http_other {
+            self.consecutive_fail = 0;
+            return false;
+        }
+        self.consecutive_fail += 1;
+        if self.consecutive_fail >= Self::BREAKER_LIMIT {
+            self.paused = true;
+            return true;
+        }
+        false
+    }
+}
+
 /// One cycle: pick pending refs (oldest first, skipping rows whose
 /// outcome is still in flight), download up to a small cap, report each
 /// outcome to the flusher. The counts are disjoint categories (see
@@ -290,11 +383,17 @@ pub fn media_store_root(cfg: &ShadowSettings) -> PathBuf {
 /// connection's transaction, and until then the row still reads
 /// `status='ref'`. Only `prune_in_flight` (start of the next cycle)
 /// drops ids whose outcome has actually landed.
+///
+/// M3: the selection stays `status='ref'` ONLY. The `ref-import`
+/// history queue is a separate, opt-in second pick (`import`), which
+/// runs when the backfill setting is on, the live queue produced no
+/// rows this cycle, and the breaker has not paused it.
 fn download_one_cycle(
     conn: &Connection,
     root: &Path,
     done: &Sender<Job>,
     in_flight: &mut HashSet<i64>,
+    import: &mut ImportBackfill,
 ) -> Result<CycleCounts, CycleError> {
     let cap = 8usize;
     // F1: first drop the ids the flusher has already applied (row no
@@ -318,51 +417,152 @@ fn download_one_cycle(
         .filter(|(rowid, _, _)| !in_flight.contains(rowid))
         .collect();
     drop(st);
+    // M3: the import history queue — only when the backfill is on, the
+    // breaker has not paused it, and the live `ref` queue produced no
+    // rows this cycle (the history must never preempt live media).
+    // In-flight ids are excluded IN THE QUERY: unlike the live pick
+    // (whose cap is just a candidate window), a backfill cycle must
+    // not spend its 2-row budget on rows whose outcome is already
+    // pending with the flusher. Pure digits from `i64::to_string()` —
+    // the same no-injection surface `prune_in_flight` uses.
+    let import_rows: Vec<(i64, Option<String>, String)> =
+        if rows.is_empty() && import.enabled && !import.paused {
+            let skip = if in_flight.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " AND rowid NOT IN ({})",
+                    in_flight
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            let mut st = conn
+                .prepare(&format!(
+                    "SELECT rowid, kind, url FROM attachments \
+                     WHERE status = 'ref-import' AND url IS NOT NULL AND url LIKE 'https://%'\
+                     {skip} \
+                     ORDER BY rowid LIMIT ?1"
+                ))
+                .map_err(CycleError::Db)?;
+            // Bound to a local FIRST: the iterator chain holds a
+            // borrow of `st`, and a temporary at the end of the block
+            // would outlive it.
+            let picked = st
+                .query_map([ImportBackfill::MAX_PER_CYCLE as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map_err(CycleError::Db)?
+                .filter_map(Result::ok)
+                .filter(|(rowid, _, _)| !in_flight.contains(rowid))
+                .collect();
+            picked
+        } else {
+            Vec::new()
+        };
     let mut counts = CycleCounts::default();
     for (rowid, kind, url) in rows {
-        in_flight.insert(rowid);
-        // M1: allowlist BEFORE any request — a rejected url costs no
-        // network I/O at all and is reported Failed to the flusher.
-        let outcome = if !host_allowed(&url) {
-            counts.blocked_host += 1;
-            MediaOutcome::Failed
-        } else {
-            match fetch_to_store(&url, root, kind.as_deref()) {
-                FetchOutcome::Downloaded { rel, sha, size } => {
-                    counts.ok += 1;
-                    MediaOutcome::Downloaded { path: rel, sha256: sha, size: size as i64 }
-                }
-                FetchOutcome::RefEncrypted => {
-                    counts.ref_encrypted += 1;
-                    MediaOutcome::RefEncrypted
-                }
-                FetchOutcome::BlockedHost => {
-                    counts.blocked_host += 1;
-                    MediaOutcome::Failed
-                }
-                FetchOutcome::BlockedRedirect => {
-                    counts.blocked_redirect += 1;
-                    MediaOutcome::Failed
-                }
-                FetchOutcome::Failed => {
-                    counts.failed += 1;
-                    MediaOutcome::Failed
-                }
-            }
-        };
-        if done.send(Job::MediaDone { rowid, outcome }).is_err() {
-            // Receiver dropped (shutdown): stop the thread. The row
-            // stays 'ref' — it is retried on the next launch.
-            return Err(CycleError::FlusherGone);
+        download_one(rowid, kind, url, root, done, in_flight, &mut counts)?;
+    }
+    for (rowid, kind, url) in import_rows {
+        let gone_or_http_other =
+            download_one(rowid, kind, url, root, done, in_flight, &mut counts)?;
+        if import.record_import_outcome(gone_or_http_other) {
+            // One line per session — the transition itself, never a
+            // per-row log (counts/kinds only, H-rule).
+            crate::dlog::log(&format!(
+                "shadow media: import backfill paused (consecutive_fail={})",
+                ImportBackfill::BREAKER_LIMIT
+            ));
         }
-        // F1: the id STAYS in `in_flight` — the flusher applies this
-        // outcome in its own transaction up to `batch_ms` later, and
-        // until that lands the row still reads 'ref'. Removing it here
-        // would let the next cycle SELECT the same row and download it
-        // twice; `prune_in_flight` drops it once the outcome landed.
-        std::thread::sleep(Duration::from_millis(700));
     }
     Ok(counts)
+}
+
+/// Download one picked row and report its outcome (shared by the live
+/// `ref` queue and the M3 import backfill). Bumps exactly one
+/// [`CycleCounts`] category, sends the `Job::MediaDone`, keeps the F1
+/// in-flight rule, and returns whether the outcome was a
+/// `gone`/`http_other` failure — the import breaker's input.
+fn download_one(
+    rowid: i64,
+    kind: Option<String>,
+    url: String,
+    root: &Path,
+    done: &Sender<Job>,
+    in_flight: &mut HashSet<i64>,
+    counts: &mut CycleCounts,
+) -> Result<bool, CycleError> {
+    in_flight.insert(rowid);
+    // M1: allowlist BEFORE any request — a rejected url costs no
+    // network I/O at all and is reported Failed to the flusher.
+    let (outcome, gone_or_http_other) = if !host_allowed(&url) {
+        counts.blocked_host += 1;
+        (MediaOutcome::Failed, false)
+    } else {
+        match fetch_to_store(&url, root, kind.as_deref()) {
+            FetchOutcome::Downloaded { rel, sha, size } => {
+                counts.ok += 1;
+                (
+                    MediaOutcome::Downloaded { path: rel, sha256: sha, size: size as i64 },
+                    false,
+                )
+            }
+            FetchOutcome::RefEncrypted => {
+                counts.ref_encrypted += 1;
+                (MediaOutcome::RefEncrypted, false)
+            }
+            FetchOutcome::BlockedHost => {
+                counts.blocked_host += 1;
+                (MediaOutcome::Failed, false)
+            }
+            FetchOutcome::BlockedRedirect => {
+                counts.blocked_redirect += 1;
+                (MediaOutcome::Failed, false)
+            }
+            // M2: a gone link is EXPIRED, not failed.
+            FetchOutcome::Gone => {
+                counts.failed += 1;
+                counts.failed_gone += 1;
+                (MediaOutcome::Expired, true)
+            }
+            FetchOutcome::HttpOther => {
+                counts.failed += 1;
+                counts.failed_http_other += 1;
+                (MediaOutcome::Failed, true)
+            }
+            FetchOutcome::Timeout => {
+                counts.failed += 1;
+                counts.failed_timeout += 1;
+                (MediaOutcome::Failed, false)
+            }
+            FetchOutcome::Net => {
+                counts.failed += 1;
+                counts.failed_net += 1;
+                (MediaOutcome::Failed, false)
+            }
+            FetchOutcome::Store => {
+                counts.failed += 1;
+                counts.failed_store += 1;
+                (MediaOutcome::Failed, false)
+            }
+        }
+    };
+    if done.send(Job::MediaDone { rowid, outcome }).is_err() {
+        // Receiver dropped (shutdown): stop the thread. The row keeps
+        // its status — it is retried on the next launch.
+        return Err(CycleError::FlusherGone);
+    }
+    // F1: the id STAYS in `in_flight` — the flusher applies this
+    // outcome in its own transaction up to `batch_ms` later, and
+    // until that lands the row still reads its queued status.
+    // Removing it here would let the next cycle SELECT the same row
+    // and download it twice; `prune_in_flight` drops it once the
+    // outcome landed.
+    std::thread::sleep(Duration::from_millis(700));
+    Ok(gone_or_http_other)
 }
 
 /// M1 allowlist: the media hosts this build may ever contact (audit
@@ -442,6 +642,28 @@ pub fn host_allowed(raw: &str) -> bool {
     ALLOWED_HOST_SUFFIXES.iter().any(|s| host.ends_with(s))
 }
 
+/// Batch 26 M1 (shape tool): for a url that passes [`host_allowed`],
+/// the ONE allowlist suffix its host ends with (`.zdn.vn`, …);
+/// `None` for any other url (non-https included). The shape CLI prints
+/// the SUFFIX — never the host itself or the url.
+pub fn allowed_suffix(raw: &str) -> Option<&'static str> {
+    if !host_allowed(raw) {
+        return None;
+    }
+    // host_allowed guarantees the https prefix, no userinfo and a
+    // default-or-absent port, so this re-parse cannot fail the same
+    // way; the `?` arms are unreachable belt.
+    let rest = raw.strip_prefix("https://")?;
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let host = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let host = host.to_ascii_lowercase();
+    ALLOWED_HOST_SUFFIXES.iter().copied().find(|s| host.ends_with(s))
+}
+
 /// One manual redirect hop (M1, pure — no network):
 /// - `None`: the status is not a 3xx, the response is final;
 /// - `Some(Follow(url))`: the resolved Location stays inside the
@@ -514,12 +736,38 @@ enum FetchOutcome {
     BlockedHost,
     /// M1: redirect outside the allowlist or past the hop cap.
     BlockedRedirect,
-    /// Transport/IO failure (expired CDN urls are normal).
-    Failed,
+    /// M2: the link is GONE (403/404/410) — expired CDN history; the
+    /// row lands as `status='expired'`, never retried.
+    Gone,
+    /// M2: any other HTTP status error (4xx/5xx beyond the gone trio).
+    HttpOther,
+    /// M2: a configured timeout fired (either ureq timeout form).
+    Timeout,
+    /// M2: dns/tls/io/protocol transport failure.
+    Net,
+    /// M2: the local store write failed (the network was fine).
+    Store,
 }
 
 /// Follow at most this many redirect hops manually (B3/M1).
 const MAX_REDIRECT_HOPS: u32 = 3;
+
+/// The ONE place the download agent's config lives (B3/M1): no
+/// automatic redirects (every hop is a manual, allowlist-checked
+/// decision) and the connect/response/body timeouts. Batch 26 M1: the
+/// media shape CLI's `--probe-http` builds the SAME agent so its
+/// status classes match what the live thread would see.
+pub(crate) fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
+        // M1: no automatic redirects — every hop is a manual,
+        // allowlist-checked decision.
+        .max_redirects(0)
+        .build()
+        .into()
+}
 
 /// GET the url into the content-addressed store (B3/B4). Redirects
 /// are followed MANUALLY (the agent has them disabled,
@@ -533,23 +781,16 @@ fn fetch_to_store(url: &str, root: &Path, kind: Option<&str>) -> FetchOutcome {
     if !host_allowed(url) {
         return FetchOutcome::BlockedHost;
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_recv_body(Some(Duration::from_secs(60)))
-        // M1: no automatic redirects — every hop is a manual,
-        // allowlist-checked decision.
-        .max_redirects(0)
-        .build()
-        .into();
+    let agent: ureq::Agent = download_agent();
     let mut current = url.to_string();
     let mut hops = 0u32;
     loop {
-        // Transport errors are reported as Failed; the error text is
-        // deliberately NOT logged: it embeds the request URL (H-rule).
+        // M2: transport errors are classified by KIND. The error text
+        // is deliberately NOT logged: it embeds the request URL
+        // (H-rule).
         let resp = match agent.get(&current).call() {
             Ok(r) => r,
-            Err(_) => return FetchOutcome::Failed,
+            Err(e) => return classify_ureq_error(&e),
         };
         let status = resp.status().as_u16();
         let location = resp
@@ -566,7 +807,8 @@ fn fetch_to_store(url: &str, root: &Path, kind: Option<&str>) -> FetchOutcome {
                         FetchOutcome::Downloaded { rel, sha, size }
                     }
                     Err(StoreError::Sniff) => FetchOutcome::RefEncrypted,
-                    Err(_) => FetchOutcome::Failed,
+                    // M2: a local write failure is its own kind.
+                    Err(_) => FetchOutcome::Store,
                 };
             }
             // Follow the hop — unless the cap is spent (then it is a
@@ -577,6 +819,22 @@ fn fetch_to_store(url: &str, root: &Path, kind: Option<&str>) -> FetchOutcome {
             }
             Some(_) => return FetchOutcome::BlockedRedirect,
         }
+    }
+}
+
+/// M2: classify one transport error into the cycle's failure kinds
+/// (pure; kinds only — the ureq error text embeds the request url and
+/// never reaches a log). 403/404/410 are GONE links — expired CDN
+/// history is not a broken row; every other status error is
+/// `http_other`; a configured timeout in either ureq form is
+/// `timeout`; everything else (dns/tls/io/protocol) is `net`.
+fn classify_ureq_error(e: &ureq::Error) -> FetchOutcome {
+    match e {
+        ureq::Error::StatusCode(403 | 404 | 410) => FetchOutcome::Gone,
+        ureq::Error::StatusCode(_) => FetchOutcome::HttpOther,
+        ureq::Error::Timeout(_) => FetchOutcome::Timeout,
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => FetchOutcome::Timeout,
+        _ => FetchOutcome::Net,
     }
 }
 
@@ -1109,8 +1367,14 @@ mod tests {
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut in_flight = HashSet::new();
-        let counts =
-            download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight).unwrap();
+        let counts = download_one_cycle(
+            &conn,
+            &PathBuf::from("unused-root"),
+            &tx,
+            &mut in_flight,
+            &mut ImportBackfill::new(false),
+        )
+        .unwrap();
         assert_eq!(counts.blocked_host, 1);
         assert_eq!(counts.total(), 1);
         match rx.recv() {
@@ -1122,9 +1386,246 @@ mod tests {
         }
         // A second cycle re-picks nothing: the outcome is still in the
         // flusher's hands (row still reads 'ref').
-        let counts =
-            download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight).unwrap();
+        let counts = download_one_cycle(
+            &conn,
+            &PathBuf::from("unused-root"),
+            &tx,
+            &mut in_flight,
+            &mut ImportBackfill::new(false),
+        )
+        .unwrap();
         assert_eq!(counts.total(), 0, "in-flight row must not be re-picked");
+    }
+
+    // --- batch 26 M2/M3: gone links, the import queue, the breaker -------
+
+    #[test]
+    fn prune_keeps_ref_import_rows_in_flight_too() {
+        // M3: with the backfill on, a picked import row's outcome is
+        // queued with the flusher; until it lands the row still reads
+        // 'ref-import' and must not be re-picked.
+        let conn = db();
+        let r_still = ref_row(&conn, "m_still");
+        conn.execute(
+            "INSERT INTO attachments (msg_id, idx, kind, url, status)
+             VALUES ('m_imp', 0, 'image', 'https://h/x', 'ref-import')",
+            [],
+        )
+        .unwrap();
+        let r_imp: i64 = conn
+            .query_row("SELECT max(rowid) FROM attachments", [], |r| r.get(0))
+            .unwrap();
+        let mut in_flight = HashSet::from([r_still, r_imp]);
+        prune_in_flight(&conn, &mut in_flight).unwrap();
+        assert_eq!(in_flight, HashSet::from([r_still, r_imp]));
+        // Once the outcome lands (status moves), the id is dropped —
+        // exactly like a live row.
+        conn.execute(
+            "UPDATE attachments SET status='expired' WHERE rowid = ?1",
+            [r_imp],
+        )
+        .unwrap();
+        prune_in_flight(&conn, &mut in_flight).unwrap();
+        assert_eq!(in_flight, HashSet::from([r_still]));
+    }
+
+    #[test]
+    fn cycle_never_picks_ref_import_rows_by_default() {
+        // M3: one 'ref' and one 'ref-import' row — only the 'ref' row
+        // is picked. Both urls are off-allowlist so the test never
+        // touches the network.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO attachments (msg_id, idx, kind, url, status)
+             VALUES ('m-live', 0, 'image', 'https://evil-zdn.vn/live.jpg', 'ref')",
+            [],
+        )
+        .unwrap();
+        let live_id: i64 = conn
+            .query_row(
+                "SELECT rowid FROM attachments WHERE msg_id='m-live'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO attachments (msg_id, idx, kind, url, status)
+             VALUES ('m-imp', 0, 'image', 'https://evil-zdn.vn/imp.jpg', 'ref-import')",
+            [],
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut in_flight = HashSet::new();
+        let counts = download_one_cycle(
+            &conn,
+            &PathBuf::from("unused-root"),
+            &tx,
+            &mut in_flight,
+            &mut ImportBackfill::new(false),
+        )
+        .unwrap();
+        assert_eq!(counts.total(), 1, "only the live row");
+        assert_eq!(counts.blocked_host, 1);
+        match rx.try_recv() {
+            Ok(Job::MediaDone { rowid, outcome }) => {
+                assert_eq!(rowid, live_id, "the import row was never picked");
+                assert_eq!(outcome, MediaOutcome::Failed);
+            }
+            _ => panic!("expected exactly one MediaDone"),
+        }
+        assert!(rx.try_recv().is_err(), "no second outcome");
+    }
+
+    #[test]
+    fn backfill_picks_ref_import_only_after_the_ref_queue_empties() {
+        // M3 opt-in: with the backfill on, `ref-import` rows are picked
+        // only once the live queue produced no rows that cycle, and at
+        // most 2 per cycle. All urls are off-allowlist (no network).
+        let conn = db();
+        for (msg, status) in [
+            ("m-live", "ref"),
+            ("m-i1", "ref-import"),
+            ("m-i2", "ref-import"),
+            ("m-i3", "ref-import"),
+        ] {
+            conn.execute(
+                "INSERT INTO attachments (msg_id, idx, kind, url, status)
+                 VALUES (?1, 0, 'image', 'https://evil-zdn.vn/x.jpg', ?2)",
+                [msg, status],
+            )
+            .unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut in_flight = HashSet::new();
+        let mut import = ImportBackfill::new(true);
+        // Cycle 1: the live row wins; the history queue is invisible.
+        let counts = download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight, &mut import).unwrap();
+        assert_eq!((counts.total(), counts.blocked_host), (1, 1), "live media preempts history");
+        assert!(matches!(rx.try_recv(), Ok(Job::MediaDone { .. })));
+        // Cycle 2: the live row is still in flight (queue empty this
+        // cycle) -> the backfill picks at most TWO history rows.
+        let counts = download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight, &mut import).unwrap();
+        assert_eq!((counts.total(), counts.blocked_host), (2, 2), "at most 2 per cycle");
+        assert!(matches!(rx.try_recv(), Ok(Job::MediaDone { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Job::MediaDone { .. })));
+        // Cycle 3: the two picked rows are in flight; only the third
+        // history row remains eligible.
+        let counts = download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight, &mut import).unwrap();
+        assert_eq!((counts.total(), counts.blocked_host), (1, 1));
+        assert!(matches!(rx.try_recv(), Ok(Job::MediaDone { .. })));
+        // Cycle 4: everything is in flight -> an idle cycle.
+        let counts = download_one_cycle(&conn, &PathBuf::from("unused-root"), &tx, &mut in_flight, &mut import).unwrap();
+        assert_eq!(counts.total(), 0);
+    }
+
+    #[test]
+    fn import_backfill_breaker_pauses_after_20_consecutive_failures() {
+        // The pure breaker fold (the brief's unit test).
+        let mut b = ImportBackfill::new(true);
+        for i in 1..ImportBackfill::BREAKER_LIMIT {
+            assert!(
+                !b.record_import_outcome(true),
+                "no pause before the limit (step {i})"
+            );
+        }
+        assert!(
+            b.record_import_outcome(true),
+            "the 20th consecutive gone/http_other pauses exactly once"
+        );
+        assert!(b.paused);
+        // Paused is a session state: further outcomes never re-pause.
+        assert!(!b.record_import_outcome(true));
+        assert!(!b.record_import_outcome(false));
+        assert!(b.paused);
+        // Any non-gone/http_other outcome resets the streak BEFORE the
+        // limit.
+        let mut b2 = ImportBackfill::new(true);
+        for _ in 1..ImportBackfill::BREAKER_LIMIT {
+            b2.record_import_outcome(true);
+        }
+        assert!(!b2.record_import_outcome(false), "one servable row resets the streak");
+        assert!(!b2.paused);
+        for _ in 1..ImportBackfill::BREAKER_LIMIT {
+            assert!(!b2.record_import_outcome(true));
+        }
+        assert!(b2.record_import_outcome(true), "20 in a row after the reset still trips");
+        // A disabled backfill still folds (it is simply never picked).
+        let mut b3 = ImportBackfill::new(false);
+        for _ in 0..100 {
+            b3.record_import_outcome(true);
+        }
+        assert!(b3.paused, "the counter itself is independent of `enabled`");
+    }
+
+    #[test]
+    fn ureq_errors_classify_into_failure_kinds() {
+        // M2: the pure classifier. 403/404/410 are gone links; other
+        // statuses are http_other; both timeout forms are timeout;
+        // dns/tls/io are net. Constructed errors only — no network.
+        use ureq::Error;
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(403)),
+            FetchOutcome::Gone
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(404)),
+            FetchOutcome::Gone
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(410)),
+            FetchOutcome::Gone
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(401)),
+            FetchOutcome::HttpOther
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(429)),
+            FetchOutcome::HttpOther
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::StatusCode(500)),
+            FetchOutcome::HttpOther
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::Timeout(ureq::Timeout::Global)),
+            FetchOutcome::Timeout
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "crafted"
+            ))),
+            FetchOutcome::Timeout
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::HostNotFound),
+            FetchOutcome::Net
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::Tls("crafted")),
+            FetchOutcome::Net
+        ));
+        assert!(matches!(
+            classify_ureq_error(&Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "crafted"
+            ))),
+            FetchOutcome::Net
+        ));
+        // The log line's shape: the kinds field in the brief's order.
+        let c = CycleCounts {
+            failed_gone: 3,
+            failed_http_other: 2,
+            failed_timeout: 1,
+            failed_net: 4,
+            failed_store: 0,
+            ..CycleCounts::default()
+        };
+        assert_eq!(
+            c.failed_kinds_field(),
+            "failed_kinds=(gone 3 http_other 2 timeout 1 net 4 store 0)"
+        );
     }
 
     // --- F2 (batch-18 review): the per-cycle open follows the key cell ----

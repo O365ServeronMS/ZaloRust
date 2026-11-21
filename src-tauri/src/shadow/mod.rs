@@ -72,6 +72,14 @@ pub mod import_apply;
 /// `sync_cursors` delta groundwork.
 pub mod import_map;
 pub mod media;
+/// Batch 26 M1 (media for imported history): the `zalors media` CLI —
+/// a READ-ONLY shape tool over the media queue (census of attachments
+/// joined to messages, which field the picker took on import rows,
+/// the import content's url-bearing key names, an optional bounded
+/// `--probe-http`). Dispatched in `main.rs` before Tauri starts; the
+/// store opens with the normal key resolution and the app may keep
+/// running.
+pub mod media_cli;
 pub mod normalize;
 /// Batch 18 (portable password-protected store, "Option A"): the
 /// `passphrase` key mode — mode marker, DPAPI remember file, validation,

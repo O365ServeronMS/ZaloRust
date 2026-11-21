@@ -52,7 +52,11 @@ code table:
   Desktop code the Zalo PC 26.11.12 source names with a wire string
   — only the Desktop-LOCAL rows `-4` (MSG_INFO) and `-1909`
   (MSG_INFO_CHAT) stay unmapped by design, so the preflight/hatch
-  path is only for them (plus any code the source did not name).
+  path is only for them (plus any code the source did not name);
+- batch 26 (§9) — what happens to MEDIA refs from imported history:
+  the `ref-import`/`expired` statuses, the `media_import_requeue`
+  repair step, the opt-in `shadow.media_backfill_import` backfill,
+  and the read-only `zalors media --shape` census tool.
 
 Everything here is **dry-run only** up to and including §5: nothing in
 the pipeline writes to the snapshot, the shadow store, or the live
@@ -918,3 +922,99 @@ they are also the knobs to adjust if the real Desktop schema turns
 out to name its media tables or path columns differently: run
 `--inventory` and check what the three Index tables and `Media.db`
 actually carry.
+
+## 9. Imported history in the media queue (batch 26)
+
+The batch-25 apply writes every message through `writer::apply` with
+`source='import'`, and the writer derives attachment refs from media
+payloads at apply time — so the import filled `attachments` with
+KNOWN urls from history (58,665 rows on the real store). The live
+media thread picks any `status='ref'` row, which silently turned the
+import into exactly the history backfill scan the media module doc
+forbids. Batch 26 separates the two queues; the import tool itself
+is unchanged.
+
+**Statuses** (`attachments.status` — still NO CHECK constraint, no
+migration, no schema VERSION bump; the writer stays the single status
+authority):
+
+- `ref` — a live capture's url; the ONLY thing the live thread picks.
+- `ref-import` — a known url from imported history. Rows created for
+  a `source='import'` write start here (the writer passes the
+  write's source into the extraction), and the live thread never
+  picks them by default. A later live capture of the same
+  `(msg_id, idx)` improves the row's url through the shared rule but
+  never upgrades the status.
+- `expired` — the link is gone (HTTP 403/404/410). Expired CDN
+  history is not a broken row: the url is kept and the row is never
+  retried. Every other download failure still lands as `failed`.
+
+**The repair step** moves the pre-batch-26 import rows into the
+history queue. The report line appends `media_import_requeued=` as
+its LAST field and the maintenance counts line appends
+`media_import_requeue=` (every existing field keeps its name and
+order); the step itself moves exactly the import-sourced rows still
+carrying a live-queue status (`ref`/`failed`) to `ref-import`. It is
+idempotent (a second run reports 0), never demotes
+`downloaded`/`ref-encrypted`/`expired` rows, and never touches
+capture-sourced rows:
+
+```powershell
+target\debug\zalors.exe repair --target "<shadow store dir>" --dry-run
+```
+
+**The opt-in backfill** — `shadow.media_backfill_import` (bool,
+DEFAULT FALSE): with it true the app may also drain the history, but
+only after the `ref` queue produced no rows in that cycle, at most 2
+rows per cycle. A circuit breaker pauses the picks for the rest of
+the session after 20 consecutive `gone`/`http_other` outcomes on
+import rows and logs exactly one line:
+
+```
+shadow media: import backfill paused (consecutive_fail=20)
+```
+
+The cycle log itself gains the failure split, appended after every
+existing field (kinds only — the ureq error text embeds the request
+url and never reaches a log):
+
+```
+shadow media: cycle reported ok=… failed=… blocked_host=… blocked_redirect=… ref_encrypted=… failed_kinds=(gone … http_other … timeout … net … store …)
+```
+
+**The shape tool** answers "why does a pick fail" without ever
+printing a url (`shadow/media_cli.rs`, dispatched from `main.rs` like
+`repair`):
+
+```powershell
+target\debug\zalors.exe media --target "<shadow store dir>" --shape
+target\debug\zalors.exe media --target "<shadow store dir>" --shape --probe-http 5
+```
+
+READ-ONLY with the normal key resolution (the raw DPAPI key file, or
+the passphrase remember file; a Locked store refuses — this CLI
+never accepts a password), no process check, no backup: safe to run
+while the app keeps running. It prints:
+
+- the census, grouped by `messages.source` (capture / e2ee / import /
+  no-message) × `kind` × `status` × host verdict (the allowlist
+  SUFFIX, `blocked` or `nourl`) × path shape (segment count and the
+  first segment's charset CLASS, never a value) × sorted query KEY
+  names, with a flag when any key looks like expiry/signature
+  (`exp`, `expires`, `e`, `sig`, `signature`, `token`, `x-amz-*`,
+  case-insensitive);
+- for import rows: which payload FIELD the picker took each url from
+  (`params.hd`, `href`, …) and whether the pick still matches the
+  stored url, plus every url-bearing key NAME Desktop content
+  carries at all (names + counts).
+
+`--probe-http <n>` (1..=20, default OFF) is the batch's ONLY network
+code path: for up to n import-sourced
+`status IN ('ref','failed','expired')` rows PER KIND whose url
+passes the allowlist, ONE GET with the download agent's own config
+(no automatic redirects, the same timeouts), reading at most the
+first 16 bytes, reporting the class — 2xx with the `magic_ok`
+verdict, 3xx with an allowed or blocked Location, 403/404/410, other
+4xx, 5xx, timeout, tls/dns/io. Nothing is stored, no url is ever
+printed, and no test calls it. `--out <file>` also writes the report
+to a file and REFUSES if the file already exists.

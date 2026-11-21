@@ -924,9 +924,11 @@ mod tests {
         sqlcipher::open_with_key(&db_file(dir), &key).unwrap()
     }
 
-    /// The expected report line for the seeded defects.
+    /// The expected report line for the seeded defects (batch 26 M3
+    /// appends its counter; the fixture store has no attachments).
     const SEEDED_REPORT: &str = "report: conv_stubs_created=1 last_msg_fixed=3 \
-content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 revs_reset=1";
+content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 revs_reset=1 \
+media_import_requeued=0";
 
     fn dry_args(target: &Path) -> RepairArgs {
         RepairArgs {

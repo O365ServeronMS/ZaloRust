@@ -50,8 +50,10 @@ pub struct ConvRow {
 
 /// One attachment of a message, as the archive needs it. `status` is
 /// the raw DB status (`ref` | `downloaded` | `failed` |
-/// `ref-encrypted`); `has_local` says a file exists to serve through
-/// the media scheme.
+/// `ref-encrypted` | `expired` (batch 26 M2: the link is gone) |
+/// `ref-import` (batch 26 M3: import history the live thread never
+/// picks)); `has_local` says a file exists to serve through the media
+/// scheme.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AttRow {
     pub idx: i64,

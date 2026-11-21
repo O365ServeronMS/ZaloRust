@@ -70,7 +70,9 @@
 
   // One attachment: a downloaded image/video through the media scheme;
   // other downloaded kinds as a label; anything not downloaded shows
-  // its status (ref | failed | ref-encrypted).
+  // its state — ref-import is import HISTORY the live thread never
+  // picks ("not downloaded (history)"), expired is a dead link ("link
+  // expired"), the rest show their raw status. Never a url.
   function renderAttachment(doc, msgId, a) {
     var wrap = doc.createElement("div");
     wrap.className = "msg-att att-" + String(a.kind || "other");
@@ -93,6 +95,16 @@
       lbl.className = "att-label";
       lbl.textContent = t("Anexo") + " · " + String(a.kind || "");
       wrap.appendChild(lbl);
+    } else if (a.status === "ref-import") {
+      var hist = doc.createElement("span");
+      hist.className = "att-missing att-history";
+      hist.textContent = t("Mídia não baixada (histórico)");
+      wrap.appendChild(hist);
+    } else if (a.status === "expired") {
+      var dead = doc.createElement("span");
+      dead.className = "att-missing att-expired";
+      dead.textContent = t("Link expirado");
+      wrap.appendChild(dead);
     } else {
       var miss = doc.createElement("span");
       miss.className = "att-missing";

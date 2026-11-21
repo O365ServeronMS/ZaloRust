@@ -198,6 +198,8 @@
     "Mensagem desfeita": "Recalled message",
     "Mensagem excluída": "Deleted message",
     "Mídia não baixada ({0})": "Media not downloaded ({0})",
+    "Mídia não baixada (histórico)": "Media not downloaded (history)",
+    "Link expirado": "Link expired",
     "Não há mais mensagens.": "No more messages.",
     "Desconhecido": "Unknown",
     "Carregando…": "Loading…",

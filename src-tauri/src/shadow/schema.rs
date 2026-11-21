@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   local_path TEXT,                        -- RELATIVE to the media root: ab/cd/<sha> (KQ9)
   size       INTEGER,
   sha256     TEXT,
-  status     TEXT NOT NULL DEFAULT 'ref', -- ref | downloaded | failed | ref-encrypted (B4/KQ1)
+  status     TEXT NOT NULL DEFAULT 'ref', -- ref | downloaded | failed | ref-encrypted (B4/KQ1) | expired (M2: link gone) | ref-import (M3: import history, live thread never picks). Deliberately NO CHECK constraint — batch 26 added the two statuses without a migration or VERSION bump; SQLite has no ALTER ADD CONSTRAINT anyway, and the writer is the single status authority.
   PRIMARY KEY (msg_id, idx)
 );
 CREATE TABLE IF NOT EXISTS contacts (

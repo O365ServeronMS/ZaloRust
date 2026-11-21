@@ -39,6 +39,13 @@
 //!   CURRENT payload — representation-only noise — then set each
 //!   touched message's `rev` to the number of remaining revisions.
 //!   Recall/delete revisions are never touched.
+//! - (g, batch 26 M3) import media requeue: attachment rows whose
+//!   message is import-sourced but whose status is still a LIVE-queue
+//!   one (`ref`/`failed` — the pre-batch-26 import wrote them) move to
+//!   `ref-import`, the history queue the live media thread never
+//!   picks. `downloaded`/`ref-encrypted`/`expired` rows are untouched
+//!   (a real download is never demoted); idempotent — a second run
+//!   reports 0.
 
 use rusqlite::Connection;
 use serde_json::Value;
@@ -63,10 +70,14 @@ pub struct RepairReport {
     /// (f) H4: touched messages whose `rev` was set to the remaining
     /// revision count.
     pub revs_reset: usize,
+    /// (g, batch 26 M3) import-sourced attachment rows moved from the
+    /// live queue (`ref`/`failed`) to the history queue
+    /// (`ref-import`). The LAST field — the report line appends only.
+    pub media_import_requeued: usize,
 }
 
 /// Step names carried by [`RepairError::step`] — one per repair step
-/// (a)-(f), plus the dry run's BEGIN. Stable strings: the CLI prints
+/// (a)-(g), plus the dry run's BEGIN. Stable strings: the CLI prints
 /// them verbatim in its failure line.
 pub const STEP_CONV_STUBS: &str = "conv_stubs";
 pub const STEP_LAST_MSG: &str = "last_msg";
@@ -74,6 +85,8 @@ pub const STEP_CONTENT_HASH: &str = "content_hash";
 pub const STEP_TYPE_REMAP: &str = "type_remap";
 pub const STEP_SENDER_BACKFILL: &str = "sender_backfill";
 pub const STEP_REV_PRUNE: &str = "rev_prune";
+/// (g, batch 26 M3) the import media requeue.
+pub const STEP_MEDIA_REQUEUE: &str = "media_requeue";
 /// The dry run's `BEGIN IMMEDIATE`.
 pub const STEP_BEGIN: &str = "begin";
 
@@ -371,6 +384,26 @@ fn repair_v1_impl(
     r.revisions_pruned = pruned;
     r.revs_reset = reset;
 
+    // (g, batch 26 M3) import media requeue — the LAST step. An
+    // attachment row whose message has source='import' belongs to the
+    // history queue: the live media thread picking it would be exactly
+    // the history backfill the media module's doc forbids (the
+    // pre-batch-26 import wrote every row as 'ref'). Only the two
+    // live-queue statuses move; downloaded/ref-encrypted/expired rows
+    // are untouched (a real download is never demoted, and a gone
+    // link is already terminal). The UPDATE only lands on rows that
+    // still carry a live-queue status, so a second run reports 0.
+    r.media_import_requeued = soft!(
+        STEP_MEDIA_REQUEUE,
+        conn.execute(
+            "UPDATE attachments SET status = 'ref-import'
+              WHERE status IN ('ref', 'failed')
+                AND msg_id IN (SELECT msg_id FROM messages WHERE source = 'import')",
+            [],
+        ),
+        0
+    );
+
     (r, first_err)
 }
 
@@ -591,7 +624,9 @@ fn dry_run_impl(
 /// The two counts lines the maintenance probe (`maint_repair`) and the
 /// repair CLI print — moved from the probe (batch 20) so both print
 /// IDENTICAL shapes. Counts only (H-rule: no row data, ids or
-/// content); a query that fails reads -1.
+/// content); a query that fails reads -1. Batch 26 M3 appends the
+/// requeueable-import-media census to the END of the second line —
+/// existing fields keep their names and order.
 pub fn counts_lines(conn: &Connection) -> Vec<String> {
     let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
     vec![
@@ -606,23 +641,31 @@ pub fn counts_lines(conn: &Connection) -> Vec<String> {
             q("SELECT COUNT(*) FROM groups"),
         ),
         format!(
-            "sender_null={} self_sent_sender_null={} msgs_without_conv_row={} convs_lastmsg_not_newest={} rev_gt0={}",
+            "sender_null={} self_sent_sender_null={} msgs_without_conv_row={} convs_lastmsg_not_newest={} rev_gt0={} media_import_requeue={}",
             q("SELECT COUNT(*) FROM messages WHERE sender_id IS NULL"),
             q("SELECT COUNT(*) FROM messages WHERE json_extract(payload_json,'$.uidFrom')='0' AND sender_id IS NULL"),
             q("SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id=m.conv_id)"),
             q("SELECT COUNT(*) FROM conversations c JOIN messages m ON m.msg_id=c.last_msg_id
                  WHERE m.ts < (SELECT MAX(ts) FROM messages x WHERE x.conv_id=c.id)"),
             q("SELECT COUNT(*) FROM messages WHERE rev>0"),
+            // (g, batch 26): import-sourced attachment rows still in a
+            // live-queue status — what the requeue step would move.
+            q("SELECT COUNT(*) FROM attachments
+                 WHERE status IN ('ref','failed')
+                   AND msg_id IN (SELECT msg_id FROM messages WHERE source = 'import')"),
         ),
     ]
 }
 
 /// The report as ONE line, one counter per field — the CLI's printable
 /// shape (counts only; the caller adds its own `report: ` prefix).
+/// Batch 26 M3 appends its counter at the END — existing fields and
+/// their order are untouched.
 pub fn report_fields(r: &RepairReport) -> String {
     format!(
         "conv_stubs_created={} last_msg_fixed={} content_hash_filled={} \
-         types_remapped={} senders_backfilled={} revisions_pruned={} revs_reset={}",
+         types_remapped={} senders_backfilled={} revisions_pruned={} revs_reset={} \
+         media_import_requeued={}",
         r.conv_stubs_created,
         r.last_msg_fixed,
         r.content_hash_filled,
@@ -630,6 +673,7 @@ pub fn report_fields(r: &RepairReport) -> String {
         r.senders_backfilled,
         r.revisions_pruned,
         r.revs_reset,
+        r.media_import_requeued,
     )
 }
 
@@ -1145,5 +1189,127 @@ mod tests {
     /// fixture hashes equal to it — the representation-only case).
     fn legacy_payload(msg_id: &str) -> String {
         format!(r#"{{"msgId":"{msg_id}","msgType":"text","content":"c"}}"#)
+    }
+
+    // --- (g, batch 26 M3): the import media requeue -----------------------
+
+    /// One attachment row (FAKE url — never a real one) for a message.
+    fn att_row(conn: &Connection, msg_id: &str, idx: i64, status: &str) {
+        conn.execute(
+            "INSERT INTO attachments (msg_id, idx, kind, url, status)
+             VALUES (?1, ?2, 'image', 'https://fake-stal.zdn.vn/x.jpg', ?3)",
+            rusqlite::params![msg_id, idx, status],
+        )
+        .unwrap();
+    }
+
+    /// A message row with an explicit source (minimal columns).
+    fn src_msg(conn: &Connection, msg_id: &str, source: &str) {
+        conn.execute(
+            "INSERT INTO messages (msg_id, conv_id, ts, type, source)
+             VALUES (?1, 'cM', 1, 1, ?2)",
+            rusqlite::params![msg_id, source],
+        )
+        .unwrap();
+    }
+
+    fn status_of(conn: &Connection, msg_id: &str, idx: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM attachments WHERE msg_id = ?1 AND idx = ?2",
+            rusqlite::params![msg_id, idx],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repair_v1_requeues_import_media_and_is_idempotent() {
+        // (g): import-sourced `ref`/`failed` rows move to the history
+        // queue; downloaded/ref-encrypted/expired rows stay; a capture
+        // row NEVER moves; a second run reports 0.
+        let conn = db();
+        src_msg(&conn, "im1", "import");
+        src_msg(&conn, "im2", "import");
+        src_msg(&conn, "im3", "import");
+        src_msg(&conn, "im4", "import");
+        src_msg(&conn, "im5", "import");
+        src_msg(&conn, "cm1", "capture");
+        att_row(&conn, "im1", 0, "ref");          // -> ref-import
+        att_row(&conn, "im2", 0, "failed");      // -> ref-import
+        att_row(&conn, "im3", 0, "downloaded");  // untouched
+        att_row(&conn, "im4", 0, "ref-encrypted"); // untouched
+        att_row(&conn, "im5", 0, "expired");     // untouched
+        att_row(&conn, "cm1", 0, "failed");      // capture: untouched
+        // An attachment with NO message row at all: untouched (nothing
+        // proves it is import-sourced).
+        att_row(&conn, "ghost", 0, "ref");
+
+        let r1 = repair_v1(&conn, None);
+        assert_eq!(r1.media_import_requeued, 2, "exactly the two live-queued import rows");
+        assert_eq!(status_of(&conn, "im1", 0), "ref-import");
+        assert_eq!(status_of(&conn, "im2", 0), "ref-import");
+        assert_eq!(status_of(&conn, "im3", 0), "downloaded");
+        assert_eq!(status_of(&conn, "im4", 0), "ref-encrypted");
+        assert_eq!(status_of(&conn, "im5", 0), "expired");
+        assert_eq!(status_of(&conn, "cm1", 0), "failed", "capture-sourced rows are untouched");
+        assert_eq!(status_of(&conn, "ghost", 0), "ref", "no message row: untouched");
+
+        // Idempotent: nothing left in a live-queue import status.
+        let r2 = repair_v1(&conn, None);
+        assert_eq!(r2.media_import_requeued, 0, "second run reports 0");
+        // The counts-line census agrees before/after.
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let still: i64 = q(
+            "SELECT COUNT(*) FROM attachments
+              WHERE status IN ('ref','failed')
+                AND msg_id IN (SELECT msg_id FROM messages WHERE source = 'import')",
+        );
+        assert_eq!(still, 0);
+
+        // The checked core reports the same step (fail-fast paths all
+        // succeed on a healthy DB).
+        let r3 = repair_v1_checked(&conn, None).unwrap();
+        assert_eq!(r3.media_import_requeued, 0);
+    }
+
+    #[test]
+    fn repair_v1_requeue_step_is_last_in_the_report_and_counts() {
+        // Shape pins: the new counter is APPENDED — every existing
+        // field keeps its name and position.
+        let line = report_fields(&RepairReport::default());
+        assert!(
+            line.ends_with("media_import_requeued=0"),
+            "the batch-26 counter is the last field: {line}"
+        );
+        let prefix = "conv_stubs_created=0 last_msg_fixed=0 content_hash_filled=0 \
+                      types_remapped=0 senders_backfilled=0 revisions_pruned=0 revs_reset=0";
+        assert!(
+            line.starts_with(prefix),
+            "the existing fields keep their names and order: {line}"
+        );
+        let conn = db();
+        let lines = counts_lines(&conn);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "messages=0 conversations=0 revisions=0 attachments=0 raw_events=0 contacts=0 groups=0",
+            "the first counts line is unchanged");
+        assert!(
+            lines[1].starts_with(
+                "sender_null=0 self_sent_sender_null=0 msgs_without_conv_row=0 \
+                 convs_lastmsg_not_newest=0 rev_gt0=0"
+            ),
+            "the second line's existing fields keep their order: {lines:?}"
+        );
+        assert!(lines[1].ends_with("media_import_requeue=0"), "appended at the END");
+        // With import rows present the census counts them (the dry-run
+        // visibility the CLI prints before/after).
+        src_msg(&conn, "im1", "import");
+        att_row(&conn, "im1", 0, "ref");
+        let lines = counts_lines(&conn);
+        assert!(lines[1].ends_with("media_import_requeue=1"));
+        // The dry run reports the WOULD-BE count and persists nothing.
+        let before = counts_lines(&conn);
+        let dry = repair_v1_dry_run(&conn, None);
+        assert_eq!(dry.media_import_requeued, 1);
+        assert_eq!(counts_lines(&conn), before, "the dry run moved nothing");
     }
 }
