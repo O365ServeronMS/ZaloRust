@@ -11,6 +11,47 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
+# Batch 27b M2: the deployed app is a DEBUG build, and the archive viewer
+# decodes JPEG XL (jxl-oxide) and encodes a PNG per image. Unoptimised those
+# crates are an order of magnitude too slow, so they build at opt-level 3 in
+# dev profiles. Everything else stays at the dev defaults.
+[profile.dev.package.jxl-oxide]
+opt-level = 3
+[profile.dev.package.jxl-oxide-common]
+opt-level = 3
+[profile.dev.package.jxl-bitstream]
+opt-level = 3
+[profile.dev.package.jxl-coding]
+opt-level = 3
+[profile.dev.package.jxl-color]
+opt-level = 3
+[profile.dev.package.jxl-frame]
+opt-level = 3
+[profile.dev.package.jxl-grid]
+opt-level = 3
+[profile.dev.package.jxl-image]
+opt-level = 3
+[profile.dev.package.jxl-jbr]
+opt-level = 3
+[profile.dev.package.jxl-modular]
+opt-level = 3
+[profile.dev.package.jxl-render]
+opt-level = 3
+[profile.dev.package.jxl-threadpool]
+opt-level = 3
+[profile.dev.package.jxl-vardct]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+
 [lib]
 name = "zalors_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -27,6 +68,13 @@ argon2 = { version = "0.5.3", features = ["std"] }  # Argon2id password hashing 
 ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
 semver = "1"
 sha2 = "0.10"
+# Batch 27b M2: the archive viewer shows JPEG XL (WebView2 cannot decode it)
+# by decoding to PNG with this pure-Rust decoder. default-features = false
+# drops rayon (single-threaded decode, no CMS) -- the only new crate family.
+jxl-oxide = { version = "0.12.6", default-features = false }
+# Already in Cargo.lock through tauri (0.18.1); named directly, pinned to
+# that version, to encode the decoded JXL frame. Not a new crate.
+png = "=0.18.1"
 
 # --- Shadow DB (feat/shadow-db-rebuild) --------------------------------------
 # SQLCipher storage for the shadow DB. `bundled-sqlcipher-vendored-openssl`

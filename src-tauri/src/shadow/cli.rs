@@ -132,6 +132,34 @@ modes (one per run; everything except --apply is dry-run only):
                              never accepts a password). NO writes of any
                              kind: no DB, no files, no temp copies. Needs
                              --local-media-root and --target.
+  --local-media-copy        batch 27b: copy the Zalo PC local media files the
+                             plan v2 selects into the shadow media store
+                             (content-addressed, real copies, no hardlinks).
+                             Without --apply it is a DRY RUN: the selection
+                             report only, no writes. With --apply
+                             --i-have-a-backup-plan it writes, after: no other
+                             zalors.exe, the store opens read-write (a Locked
+                             store refuses), the schema version matches, the
+                             disk check (planned bytes x 1.05 + 1 GiB must be
+                             below the free space of the MEDIA root's volume),
+                             and a verified store backup into
+                             <target>\\pre-localmedia-backups\\. Only rows
+                             in status ref-import/ref/failed/expired are
+                             eligible; downloaded and ref-encrypted rows are
+                             never touched. Extra outcomes: ambiguous_key (a
+                             cliMsgId on more than one Desktop message row),
+                             multi_attachment, size_mismatch (file/video vs the
+                             Desktop fileSize). Idempotent: a second --apply
+                             copies 0. Rides --include-video and --limit N.
+                             Needs --local-media-root and --target; no
+                             --mapping.
+  --include-video            with --local-media-copy: also create + copy an
+                             attachment row (idx 0, kind video, status
+                             ref-import) for Desktop msgType-18 messages that
+                             have none, only when a video candidate is
+                             selected. Without it videos are only counted
+  --limit <N>                with --local-media-copy: stop after N copies (a
+                             first small real run)
   --apply                    2.5, the guarded write step (see the
                              preconditions at the bottom) — needs
                              --mapping, --target and --i-have-a-backup-plan
@@ -288,6 +316,19 @@ pub struct ImportArgs {
     /// `media` child holds the per-uid `ZaloDownloads` trees). Never
     /// read from the snapshot. Required by both local-media modes.
     pub local_media_root: Option<PathBuf>,
+    /// `--local-media-copy` (batch 27b M1): copy the chosen Zalo PC
+    /// local media files into the shadow media store. Without
+    /// `--apply` it is a DRY RUN; with `--apply
+    /// --i-have-a-backup-plan` it writes after the guards. Its own
+    /// mode; requires `--local-media-root` and `--target`.
+    pub local_media_copy: bool,
+    /// `--include-video` (batch 27b M1, `--local-media-copy` only):
+    /// also create + copy attachment rows for Desktop msgType-18
+    /// messages that have no attachment row.
+    pub include_video: bool,
+    /// `--limit N` (batch 27b M1, `--local-media-copy` only): stop
+    /// after N copies (a first small real run).
+    pub limit: Option<u64>,
     /// `--content-shape <kind>:<table>.<content_col>` (batch 23a C1):
     /// the content-SHAPE probe mode — per distinct value of the
     /// whitelisted `--by` code column, the row count, the JSON-shape
@@ -387,6 +428,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let (mut all_dbs, mut own_uid_from_settings, mut decrypt_basic) = (false, false, false);
     let (mut i_have_a_backup_plan, mut unmapped_as_raw, mut media_plan) = (false, false, false);
     let (mut local_media_probe, mut local_media_plan) = (false, false);
+    let (mut local_media_copy, mut include_video) = (false, false);
+    let mut limit: Option<u64> = None;
     let mut local_media_root: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
 
@@ -408,6 +451,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--content-shape"
                 | "--by"
                 | "--local-media-root"
+                | "--limit"
         );
         if value_flag {
             let value =
@@ -434,6 +478,17 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 // snapshot.
                 "--local-media-root" => {
                     set_once(&mut local_media_root, flag, PathBuf::from(value))?
+                }
+                // Batch 27b: `--limit N` (local-media-copy), N >= 1.
+                "--limit" => {
+                    let n: u64 = value
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| {
+                            format!("--limit must be a whole number >= 1, got {value:?}")
+                        })?;
+                    set_once(&mut limit, flag, n)?
                 }
                 // Batch 14 N1: repeatable, max 10 per run. The spec
                 // shape (kind, table, column) is validated HERE, pure;
@@ -493,6 +548,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             // Batch 27 M2/M3: the two local-media modes.
             "--local-media-probe" => set_bool_once(&mut local_media_probe, flag)?,
             "--local-media-plan" => set_bool_once(&mut local_media_plan, flag)?,
+            // Batch 27b: the copy mode and its video rider.
+            "--local-media-copy" => set_bool_once(&mut local_media_copy, flag)?,
+            "--include-video" => set_bool_once(&mut include_video, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -561,7 +619,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                  the live store is never silently chosen".into(),
             );
         }
-        if mapping.is_none() {
+        if mapping.is_none() && !local_media_copy {
             return Err(
                 "--apply needs --mapping <file>: the built-in skeleton maps nothing".into(),
             );
@@ -571,7 +629,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         // Batch 27 M3: --target also rides --local-media-plan (a
         // read-only mode), so the apply-mode refusal is conditional.
         (
-            target.is_some() && !local_media_plan,
+            target.is_some() && !local_media_plan && !local_media_copy,
             "--target",
         ),
         (i_have_a_backup_plan, "--i-have-a-backup-plan"),
@@ -580,8 +638,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         if on && !apply {
             if flag == "--target" {
                 return Err(
-                    "--target is an --apply/--local-media-plan-mode flag: add --apply (and \
-                                         its other preconditions) or --local-media-plan, or drop it"
+                    "--target is an --apply/--local-media-plan/--local-media-copy-mode flag: \
+                     add --apply (and its other preconditions), --local-media-plan or \
+                     --local-media-copy, or drop it"
                         .into(),
                 );
             }
@@ -665,6 +724,51 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 .into(),
         );
     }
+    // Batch 27b: --local-media-copy is its own mode too (dry run
+    // without --apply, the guarded copy with it).
+    if local_media_copy {
+        let conflicting = [
+            ("--inventory", inventory),
+            ("--mapping", mapping.is_some()),
+            ("--shadow-copy", shadow_copy.is_some()),
+            ("--delta", delta),
+            ("--media-plan", media_plan),
+            ("--distinct", !distinct.is_empty()),
+            ("--content-shape", content_shape.is_some()),
+            ("--local-media-probe", local_media_probe),
+            ("--local-media-plan", local_media_plan),
+            ("--out", out.is_some()),
+            ("--unmapped-as-raw", unmapped_as_raw),
+        ]
+        .into_iter()
+        .find(|(_, on)| *on);
+        if let Some((flag, _)) = conflicting {
+            return Err(format!(
+                "--local-media-copy cannot be combined with {flag} (one mode per run)"
+            ));
+        }
+        if local_media_root.is_none() {
+            return Err(
+                "--local-media-copy needs --local-media-root <dir>: the Zalo PC local media \
+                 root (a user setting)"
+                    .into(),
+            );
+        }
+        if target.is_none() {
+            return Err(
+                "--local-media-copy needs --target <shadow store dir>: there is no default — \
+                 the live store is never silently chosen"
+                    .into(),
+            );
+        }
+    }
+    if (include_video || limit.is_some()) && !local_media_copy {
+        return Err(
+            "--include-video/--limit are --local-media-copy flags: add --local-media-copy or \
+             drop them"
+                .into(),
+        );
+    }
     // Both modes need the root (a user setting, never a snapshot
     // value); the root without either mode is an error too.
     if (local_media_probe || local_media_plan) && local_media_root.is_none() {
@@ -675,10 +779,11 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 .into(),
         );
     }
-    if local_media_root.is_some() && !local_media_probe && !local_media_plan {
+    if local_media_root.is_some() && !local_media_probe && !local_media_plan && !local_media_copy
+    {
         return Err(
-            "--local-media-root needs --local-media-probe or --local-media-plan (it is the \
-             local-media modes' root argument)"
+            "--local-media-root needs --local-media-probe, --local-media-plan or \
+             --local-media-copy (it is the local-media modes' root argument)"
                 .into(),
         );
     }
@@ -781,6 +886,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             local_media_probe,
             local_media_plan,
             local_media_root,
+            local_media_copy,
+            include_video,
+            limit,
             content_shape,
             by,
             decrypt_basic,
@@ -809,6 +917,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         local_media_probe,
         local_media_plan,
         local_media_root,
+        local_media_copy,
+        include_video,
+        limit,
         content_shape,
         by,
         decrypt_basic,
@@ -834,6 +945,23 @@ pub fn main(args: &[String]) -> i32 {
         // a println sink as it is produced — the backup path and the
         // progress lines stay visible even when a later step fails
         // (errors still exit 1).
+        // Batch 27b: the local-media COPY mode (dry run or guarded
+        // apply) — it carries --apply but NOT --mapping, so it must
+        // dispatch before the mapping apply below.
+        Ok(a) if a.local_media_copy => {
+            let mut out = |line: &str| println!("{line}");
+            match import::run_local_media_copy(
+                &a,
+                &mut out,
+                || super::import_apply::zalors_running_besides(std::process::id()),
+            ) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("import failed: {e}");
+                    1
+                }
+            }
+        }
         Ok(a) if a.apply => {
             let mut out = |line: &str| println!("{line}");
             match super::import_apply::run_apply(
@@ -1088,7 +1216,7 @@ mod tests {
         // names BOTH modes; the two pure apply flags keep theirs.
         let e = parse(&with_base(&["--target", r"D:\shadow"])).unwrap_err();
         assert!(
-            e.contains("--target is an --apply/--local-media-plan-mode flag"),
+            e.contains("--target is an --apply/--local-media-plan/--local-media-copy-mode flag"),
             "{e}"
         );
         for flag in ["--i-have-a-backup-plan", "--unmapped-as-raw"] {
@@ -1122,6 +1250,102 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(e.contains("--i-have-a-backup-plan given twice"), "{e}");
+    }
+
+    // --- batch 27b M1: --local-media-copy (parse) ---------------------------
+
+    #[test]
+    fn parse_local_media_copy_rules() {
+        // A dry run needs only the root and the store (no --mapping).
+        let a = parse(&with_base(&[
+            "--local-media-copy",
+            "--local-media-root",
+            r"D:\Zalo Data",
+            "--target",
+            r"D:\shadow",
+        ]))
+        .unwrap();
+        assert!(a.local_media_copy && !a.apply && !a.include_video);
+        assert_eq!(a.limit, None);
+        // The riders.
+        let a = parse(&with_base(&[
+            "--local-media-copy",
+            "--local-media-root",
+            r"D:\Zalo Data",
+            "--target",
+            r"D:\shadow",
+            "--include-video",
+            "--limit",
+            "25",
+        ]))
+        .unwrap();
+        assert!(a.include_video);
+        assert_eq!(a.limit, Some(25));
+        // The guarded apply needs --i-have-a-backup-plan but NOT --mapping.
+        let a = parse(&with_base(&[
+            "--local-media-copy",
+            "--local-media-root",
+            r"D:\Zalo Data",
+            "--target",
+            r"D:\shadow",
+            "--apply",
+            "--i-have-a-backup-plan",
+        ]))
+        .unwrap();
+        assert!(a.apply && a.local_media_copy && a.i_have_a_backup_plan);
+        assert!(a.mapping.is_none());
+
+        let base = ["--local-media-copy", "--local-media-root", r"D:\Z", "--target", r"D:\s"];
+        for (extra, needle) in [
+            (vec!["--apply"], "--apply needs --i-have-a-backup-plan"),
+            (
+                vec!["--i-have-a-backup-plan"],
+                "--i-have-a-backup-plan is an --apply-mode flag",
+            ),
+            (vec!["--limit", "0"], "--limit must be a whole number >= 1"),
+            (vec!["--limit", "x"], "--limit must be a whole number >= 1"),
+            (vec!["--limit", "5", "--limit", "6"], "--limit given twice"),
+            (vec!["--include-video", "--include-video"], "--include-video given twice"),
+            (vec!["--inventory"], "--local-media-copy cannot be combined with --inventory"),
+            (
+                vec!["--mapping", "m.json"],
+                "--local-media-copy cannot be combined with --mapping",
+            ),
+            (
+                vec!["--local-media-plan"],
+                "--local-media-copy cannot be combined with --local-media-plan",
+            ),
+            (
+                vec!["--local-media-probe"],
+                "--local-media-copy cannot be combined with --local-media-probe",
+            ),
+            (vec!["--out", "x"], "--out needs --inventory"),
+        ] {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend(extra.iter().copied());
+            let e = parse(&with_base(&v)).unwrap_err();
+            assert!(e.contains(needle), "{v:?} -> {e}");
+        }
+        // Missing root / store name themselves.
+        let e = parse(&with_base(&["--local-media-copy", "--target", r"D:\s"])).unwrap_err();
+        assert!(e.contains("--local-media-copy needs --local-media-root"), "{e}");
+        let e = parse(&with_base(&["--local-media-copy", "--local-media-root", r"D:\Z"]))
+            .unwrap_err();
+        assert!(e.contains("--local-media-copy needs --target"), "{e}");
+        // The riders need the mode.
+        for flags in [vec!["--include-video"], vec!["--limit", "3"]] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(e.contains("are --local-media-copy flags"), "{flags:?} -> {e}");
+        }
+        // The apply of the mapping mode still needs its --mapping.
+        let e = parse(&with_base(&[
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\s",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--apply needs --mapping"), "{e}");
     }
 
     // --- batch 27 M2/M3: --local-media-probe / --local-media-plan (parse) ---
@@ -1177,7 +1401,7 @@ mod tests {
             ),
             (
                 vec!["--local-media-root", r"D:\Z"],
-                "--local-media-root needs --local-media-probe or --local-media-plan",
+                "--local-media-root needs --local-media-probe, --local-media-plan or",
             ),
             (
                 vec!["--local-media-probe", "--local-media-plan"],
@@ -1185,7 +1409,7 @@ mod tests {
             ),
             (
                 vec!["--local-media-probe", "--local-media-root", r"D:\Z", "--target", r"D:\s"],
-                "--target is an --apply/--local-media-plan-mode flag",
+                "--target is an --apply/--local-media-plan/--local-media-copy-mode flag",
             ),
             (
                 vec!["--local-media-plan", "--local-media-root", r"D:\Z", "--out", "x"],

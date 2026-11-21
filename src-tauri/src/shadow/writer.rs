@@ -371,16 +371,32 @@ pub enum MediaOutcome {
     Failed,
 }
 
+/// The ONE statement that marks an attachment downloaded: status,
+/// store-relative path, sha and size. `media_done` (the live download
+/// path) and the batch-27b local-media copy both go through it, so the
+/// two can never write a different column set.
+pub fn media_downloaded(
+    conn: &Connection,
+    rowid: i64,
+    path: &str,
+    sha256: &str,
+    size: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE attachments SET status='downloaded', local_path=?1, sha256=?2, size=?3 \
+         WHERE rowid = ?4",
+        rusqlite::params![path, sha256, size, rowid],
+    )
+}
+
 /// Apply one media outcome to its `attachments` row (T3). Only the
 /// flusher calls this, on its own connection; the media thread itself
 /// holds a READ-ONLY connection.
 pub fn media_done(conn: &Connection, rowid: i64, outcome: &MediaOutcome) -> rusqlite::Result<usize> {
     match outcome {
-        MediaOutcome::Downloaded { path, sha256, size } => conn.execute(
-            "UPDATE attachments SET status='downloaded', local_path=?1, sha256=?2, size=?3 \
-             WHERE rowid = ?4",
-            rusqlite::params![path, sha256, size, rowid],
-        ),
+        MediaOutcome::Downloaded { path, sha256, size } => {
+            media_downloaded(conn, rowid, path, sha256, *size)
+        }
         MediaOutcome::RefEncrypted => conn.execute(
             "UPDATE attachments SET status='ref-encrypted' WHERE rowid = ?1",
             rusqlite::params![rowid],

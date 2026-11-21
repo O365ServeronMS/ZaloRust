@@ -357,7 +357,7 @@ pub(crate) fn serve_media(
     if !meta.is_file() {
         return not_found();
     }
-    let len = meta.len();
+    let mut len = meta.len();
     if len == 0 {
         return not_found();
     }
@@ -368,9 +368,34 @@ pub(crate) fn serve_media(
     //     a media row that fails the sniff serves nothing.
     let mut head = [0u8; 16];
     let head_len = file.read(&mut head).unwrap_or(0);
-    let Some(content_type) = archive::content_type_for(kind.as_deref(), &head[..head_len]) else {
+    let Some(mut content_type) = archive::content_type_for(kind.as_deref(), &head[..head_len])
+    else {
         return not_found();
     };
+    // (d2) batch 27b M2: WebView2 cannot render JPEG XL. An image row
+    //      whose bytes are JXL is decoded (first frame, 8-bit sRGB) to
+    //      a PNG cached under <media root>\cache\jxl-png\<sha>.png
+    //      and THAT is served as image/png. A decode failure behaves
+    //      like a refused content type (404); nothing is logged (no
+    //      paths).
+    if content_type == "image/jxl" {
+        let root = crate::shadow::media::media_store_root(&cfg);
+        let Ok(png_path) = crate::shadow::jxl_png::cached_png(&path, &root) else {
+            return not_found();
+        };
+        let Ok(png_meta) = std::fs::metadata(&png_path) else {
+            return not_found();
+        };
+        let Ok(png_file) = std::fs::File::open(&png_path) else {
+            return not_found();
+        };
+        if !png_meta.is_file() || png_meta.len() == 0 {
+            return not_found();
+        }
+        file = png_file;
+        len = png_meta.len();
+        content_type = "image/png";
+    }
     // (e) range: a single range within a bounded window; a rangeless
     //     request gets the head of the file (images are far below the
     //     cap; a media element asks with Range for the rest).

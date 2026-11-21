@@ -841,11 +841,14 @@ fn classify_ureq_error(e: &ureq::Error) -> FetchOutcome {
 /// B4/KQ1: why `store_stream` refused the bytes. `Sniff` maps to the
 /// `ref-encrypted` outcome; the rest are plain failures.
 #[derive(Debug)]
-enum StoreError {
+pub(crate) enum StoreError {
     /// Magic-byte mismatch on an image/video (B4): E2EE CDN bytes may
     /// be ciphertext — keep nothing.
     Sniff,
     Io(std::io::Error),
+    /// Batch 27b: the stream passed the 512 MB cap (the local-media
+    /// copy counts it as `too_big`; downloads treat it like `Other`).
+    TooBig,
     Other(String),
 }
 
@@ -855,6 +858,7 @@ impl std::fmt::Display for StoreError {
             // Kind only — no file paths or urls in error text.
             StoreError::Sniff => write!(f, "sniff mismatch"),
             StoreError::Io(_) => write!(f, "io error"),
+            StoreError::TooBig => write!(f, "file exceeds 512 MB cap"),
             StoreError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -929,7 +933,7 @@ pub(crate) fn magic_ok(kind: Option<&str>, head: &[u8]) -> bool {
 /// a mismatch stores nothing. Returns (RELATIVE path `ab/cd/<sha>` —
 /// KQ9, forward slashes — sha hex, size). Pure w.r.t. the network:
 /// any `impl Read` works, which is what the tests use.
-fn store_stream(
+pub(crate) fn store_stream(
     mut reader: impl std::io::Read,
     root: &Path,
     kind: Option<&str>,
@@ -957,7 +961,7 @@ fn store_stream(
         std::io::Write::write_all(&mut file, &buf[..n]).map_err(StoreError::Io)?;
         size += n as u64;
         if size > 512 * 1024 * 1024 {
-            return Err(StoreError::Other("file exceeds 512 MB cap".into()));
+            return Err(StoreError::TooBig);
         }
     }
     if !magic_ok(kind, &head[..head_len]) {

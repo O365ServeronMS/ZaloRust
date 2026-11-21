@@ -118,6 +118,11 @@ use super::distinct::render_value;
 use super::inventory::quote_ident;
 use super::{open_top_level, Prepared, TopOpen};
 
+/// Batch 27b M1: the guarded copy into the shadow media store
+/// (`import --local-media-copy`). A child module so it reuses this
+/// file's private plan machinery.
+pub mod copy;
+
 // --- the fixed shape vocabularies -----------------------------------------
 
 /// The fixed `<sub>` vocabulary (the brief's M2 list) plus `sticker`
@@ -2806,6 +2811,10 @@ struct AttRow {
 struct DeskRow {
     /// The coerced `msgType` (the videos census).
     msg_type: Option<i64>,
+    /// The coerced Desktop `fileSize` (batch 27b: the `size_mismatch`
+    /// rule for `file` and `video`; the plan's decision still uses the
+    /// FILE's size).
+    file_size: Option<i64>,
     /// The `resource` candidates' key.
     cli_msg_id: Option<String>,
     /// The batch-27 localPath route.
@@ -2925,6 +2934,116 @@ const CHOICE_FIELDS: [Choice; 6] = [
 /// The brief's five winner labels, in print order.
 const WINNER_FIELDS: [&str; 5] = ["picture", "video", "resource", "file", "localPath"];
 
+/// What one pass over the snapshot's message DBs yields (batch 27b
+/// factored this out of [`plan_report`] so the copy mode runs the very
+/// same tolerant scan): the Desktop row facts of every `needed` msgId,
+/// the `cliMsgId`s those rows carry, the scan statistics and — when
+/// asked — how many Desktop message rows carry each `cliMsgId` across
+/// ALL message DBs (the `ambiguous_key` rule).
+struct DeskScan {
+    desk_rows: BTreeMap<String, DeskRow>,
+    cli_needed: HashSet<String>,
+    scan: DbStats,
+    /// `cliMsgId` → number of Desktop message rows (saturating at
+    /// `u32::MAX`); empty unless `count_cli`.
+    cli_counts: std::collections::HashMap<String, u32>,
+}
+
+fn scan_desktop_rows(
+    p: &Prepared,
+    needed: &HashSet<String>,
+    count_cli: bool,
+) -> Result<DeskScan, String> {
+    preflight_columns(p, &PLAN_COLS)?;
+    let sql = msg_scan_sql(&PLAN_COLS)?;
+    let names = super::message_db_names(&p.uid_dir)?;
+    let msg_dir = p.uid_dir.join("Core").join("Message");
+    let mut desk_rows: BTreeMap<String, DeskRow> = BTreeMap::new();
+    let mut cli_needed: HashSet<String> = HashSet::new();
+    let mut scan = DbStats::default();
+    let mut cli_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for (name, kind) in &names {
+        match kind {
+            super::DbKind::OneToOne(_) | super::DbKind::Group(_) | super::DbKind::StrangerBox => {}
+            _ => continue,
+        }
+        scan.dbs += 1;
+        let Ok(dconn) =
+            super::open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile)
+        else {
+            scan.open_failed += 1;
+            continue;
+        };
+        scan.opened += 1;
+        if !has_message_table(&dconn) {
+            scan.no_table += 1;
+            continue;
+        }
+        let Ok(mut st) = dconn.prepare(&sql) else {
+            scan.query_failed += 1;
+            continue;
+        };
+        let Ok(rows) = st.query_map([], |r| {
+            Ok((
+                r.get::<_, SV>(0)?, // msgId
+                r.get::<_, SV>(1)?, // msgType
+                r.get::<_, SV>(2)?, // cliMsgId
+                r.get::<_, SV>(3)?, // localPath
+                r.get::<_, SV>(4)?, // folderPath
+                r.get::<_, SV>(5)?, // fileSize (counted, not used)
+            ))
+        }) else {
+            scan.query_failed += 1;
+            continue;
+        };
+        for row in rows {
+            let Ok((mid, mtype, cli, local, folder, fsize)) = row else {
+                scan.row_failed += 1;
+                continue;
+            };
+            scan.rows += 1;
+            let mid = v_to_string(mid, "msgId", &mut scan.coerce_none);
+            let mtype = v_to_i64(mtype, "msgType", &mut scan.coerce_none);
+            let cli = v_to_string(cli, "cliMsgId", &mut scan.coerce_none);
+            let lp = v_to_string(local, "localPath", &mut scan.coerce_none);
+            let fp = v_to_string(folder, "folderPath", &mut scan.coerce_none);
+            // The decision uses the FILE's size, never this cell — it
+            // is coerced so the header counts a surprise in it
+            // exactly like the probe does.
+            let fsize = v_to_i64(fsize, "fileSize", &mut scan.coerce_none);
+            if count_cli {
+                if let Some(c) = cli.as_ref() {
+                    let n = cli_counts.entry(c.clone()).or_insert(0);
+                    *n = n.saturating_add(1);
+                }
+            }
+            let Some(mid) = mid else { continue };
+            if needed.contains(&mid) {
+                if let Some(c) = cli.as_ref() {
+                    cli_needed.insert(c.clone());
+                }
+                desk_rows.insert(
+                    mid.clone(),
+                    DeskRow {
+                        msg_type: mtype,
+                        file_size: fsize,
+                        cli_msg_id: cli,
+                        local_path: lp,
+                        folder_path: fp,
+                    },
+                );
+            }
+        }
+    }
+    Ok(DeskScan {
+        desk_rows,
+        cli_needed,
+        scan,
+        cli_counts,
+    })
+}
+
 /// The `--local-media-plan` report, v2 (batch 27e, DRY RUN ONLY — no
 /// writes of any kind). Called by `import::run_local_media_plan`
 /// after parse guaranteed `--target` + `--local-media-root`; the root
@@ -3036,79 +3155,12 @@ pub fn plan_report(
     // each needed msgId's Desktop row — its cliMsgId (the resource
     // candidates' key), its localPath (the batch-27 route) and its
     // msgType (the videos census).
-    preflight_columns(&p, &PLAN_COLS)?;
-    let sql = msg_scan_sql(&PLAN_COLS)?;
-    let names = super::message_db_names(&p.uid_dir)?;
-    let msg_dir = p.uid_dir.join("Core").join("Message");
-    let mut desk_rows: BTreeMap<String, DeskRow> = BTreeMap::new();
-    let mut cli_needed: HashSet<String> = HashSet::new();
-    let mut scan = DbStats::default();
-    for (name, kind) in &names {
-        match kind {
-            super::DbKind::OneToOne(_) | super::DbKind::Group(_) | super::DbKind::StrangerBox => {}
-            _ => continue,
-        }
-        scan.dbs += 1;
-        let Ok(dconn) =
-            super::open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile)
-        else {
-            scan.open_failed += 1;
-            continue;
-        };
-        scan.opened += 1;
-        if !has_message_table(&dconn) {
-            scan.no_table += 1;
-            continue;
-        }
-        let Ok(mut st) = dconn.prepare(&sql) else {
-            scan.query_failed += 1;
-            continue;
-        };
-        let Ok(rows) = st.query_map([], |r| {
-            Ok((
-                r.get::<_, SV>(0)?, // msgId
-                r.get::<_, SV>(1)?, // msgType
-                r.get::<_, SV>(2)?, // cliMsgId
-                r.get::<_, SV>(3)?, // localPath
-                r.get::<_, SV>(4)?, // folderPath
-                r.get::<_, SV>(5)?, // fileSize (counted, not used)
-            ))
-        }) else {
-            scan.query_failed += 1;
-            continue;
-        };
-        for row in rows {
-            let Ok((mid, mtype, cli, local, folder, fsize)) = row else {
-                scan.row_failed += 1;
-                continue;
-            };
-            scan.rows += 1;
-            let mid = v_to_string(mid, "msgId", &mut scan.coerce_none);
-            let mtype = v_to_i64(mtype, "msgType", &mut scan.coerce_none);
-            let cli = v_to_string(cli, "cliMsgId", &mut scan.coerce_none);
-            let lp = v_to_string(local, "localPath", &mut scan.coerce_none);
-            let fp = v_to_string(folder, "folderPath", &mut scan.coerce_none);
-            // The decision uses the FILE's size, never this cell — it
-            // is coerced so the header counts a surprise in it
-            // exactly like the probe does.
-            v_to_i64(fsize, "fileSize", &mut scan.coerce_none);
-            let Some(mid) = mid else { continue };
-            if needed.contains(&mid) {
-                if let Some(c) = cli.as_ref() {
-                    cli_needed.insert(c.clone());
-                }
-                desk_rows.insert(
-                    mid.clone(),
-                    DeskRow {
-                        msg_type: mtype,
-                        cli_msg_id: cli,
-                        local_path: lp,
-                        folder_path: fp,
-                    },
-                );
-            }
-        }
-    }
+    let DeskScan {
+        desk_rows,
+        cli_needed,
+        scan,
+        ..
+    } = scan_desktop_rows(&p, &needed, false)?;
 
     // M1: the candidate index — ONE read-only walk of the root.
     let ix = walk_candidate_index(root);
@@ -4213,6 +4265,9 @@ mod tests {
                 local_media_probe: false,
                 local_media_plan: false,
                 local_media_root: None,
+                local_media_copy: false,
+                include_video: false,
+                limit: None,
                 content_shape: None,
                 by: None,
                 decrypt_basic: false,
@@ -5739,6 +5794,582 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&snap);
             let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // --- batch 27b M1: the copy mode, synthetic end to end -------------------
+
+        use super::super::copy;
+        use sha2::{Digest, Sha256};
+
+        fn cid(n: i64) -> String {
+            format!("{}", DTTM + n)
+        }
+
+        /// A synthetic world for the copy mode: a snapshot, a media
+        /// root (the Zalo PC tree), a shadow store and a separate
+        /// media STORE root. Message letters → ids: A=1 B=2 C=3 D=4
+        /// E=5 F=6 G=7 H=8 I=9 J=10 K=11 L=12, decoy E2=50.
+        struct CopyFx {
+            snap: PathBuf,
+            key: PathBuf,
+            root: PathBuf,
+            store: PathBuf,
+            media: PathBuf,
+        }
+
+        const JPG6: [u8; 6] = [0xFF, 0xD8, 0xFF, 0xE0, 1, 2];
+        const JPG7: [u8; 7] = [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3];
+        const JXL7: [u8; 7] = [0xFF, 0x0A, 1, 2, 3, 4, 5];
+
+        fn copy_fixture() -> CopyFx {
+            let root = temp_dir("root27b");
+            let zdl = root.join("media").join("19").join("ZaloDownloads");
+            let (pic, res, vid, fil) = (
+                zdl.join("picture"),
+                zdl.join("resource"),
+                zdl.join("video"),
+                zdl.join("file"),
+            );
+            for d in [&pic, &res, &vid, &fil] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let hex = "00ff00112233445566778899aabbccdd";
+            // A: renderable jpg. B: jxl only. C: downloaded decoy. D:
+            // ref-encrypted decoy. F: multi-attachment. K: failed -> jpg.
+            std::fs::write(pic.join(format!("p{}_{hex}.jpg", cid(1))), JPG6).unwrap();
+            std::fs::write(pic.join(format!("p{}_{hex}.jxl", cid(2))), JXL7).unwrap();
+            std::fs::write(pic.join(format!("p{}_{hex}.jpg", cid(3))), JPG6).unwrap();
+            std::fs::write(pic.join(format!("p{}_{hex}.jpg", cid(4))), JPG6).unwrap();
+            std::fs::write(pic.join(format!("p{}_{hex}.jpg", cid(6))), JPG6).unwrap();
+            std::fs::write(pic.join(format!("p{}_{hex}.jpg", cid(11))), JPG7).unwrap();
+            // E: only a resource copy keyed by a cliMsgId that sits on
+            // TWO Desktop rows -> ambiguous_key.
+            std::fs::write(
+                res.join(format!("{}_{hex}.jpg", cid(105))),
+                [0xFFu8, 0xD8, 0xFF, 0xE0, 9],
+            )
+            .unwrap();
+            // G: the best candidate by preference (file sub, 5 B) has the
+            // wrong size; the resource copy (9 B) matches fileSize 9.
+            std::fs::write(fil.join(format!("{}.bin", cid(7))), [7u8; 5]).unwrap();
+            std::fs::write(res.join(format!("{}_{hex}.dat", cid(107))), [9u8; 9]).unwrap();
+            // H: only a wrong-size file candidate -> size_mismatch.
+            std::fs::write(fil.join(format!("{}.bin", cid(8))), [8u8; 5]).unwrap();
+            // L: an mp4 for an existing video row; I: an mp4 for a
+            // msgType-18 message with NO attachment row.
+            std::fs::write(
+                vid.join(cid(12)),
+                [0u8, 0, 0, 0, b'f', b't', b'y', b'p', 1, 2, 3, 4],
+            )
+            .unwrap();
+            std::fs::write(
+                vid.join(cid(9)),
+                [0u8, 0, 0, 0, b'f', b't', b'y', b'p', 1, 2],
+            )
+            .unwrap();
+
+            let row = |n: i64, cli: String, ty: i64, fsize: Option<i64>| {
+                format!(
+                    "INSERT INTO message (msgId, cliMsgId, msgType, localPath, folderPath, \
+                     previewThumb, fileSize, sendDttm, message) VALUES \
+                     ('{}', '{cli}', {ty}, NULL, NULL, NULL, {}, {DTTM}, 'x'); ",
+                    cid(n),
+                    fsize.map(|v| v.to_string()).unwrap_or_else(|| "NULL".into())
+                )
+            };
+            let mut rows = String::new();
+            rows += &row(1, "c1".into(), 2, None);
+            rows += &row(2, "c2".into(), 2, None);
+            rows += &row(3, "c3".into(), 2, None);
+            rows += &row(4, "c4".into(), 2, None);
+            rows += &row(5, cid(105), 2, None); // E (ambiguous cli)
+            rows += &row(50, cid(105), 2, None); // the decoy: same cliMsgId
+            rows += &row(6, "c6".into(), 2, None);
+            rows += &row(7, cid(107), 19, Some(9)); // G
+            rows += &row(8, "c8".into(), 19, Some(9)); // H
+            rows += &row(9, "c9".into(), 18, None); // I: video, no att row
+            rows += &row(10, "c10".into(), 18, None); // J: video, no files
+            rows += &row(11, "c11".into(), 2, None);
+            rows += &row(12, "c12".into(), 18, None); // L: video row
+            let (snap, key) = synthetic_snapshot(PASS, &rows);
+
+            let ids: Vec<String> = (1..=12).map(cid).collect();
+            let m: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            let store = synthetic_store_v2(
+                &m,
+                &[
+                    (0, &ids[0], "image", Some("https://fake.zdn.vn/a"), "ref-import"),
+                    (0, &ids[1], "image", Some("https://fake.zdn.vn/b"), "ref"),
+                    (0, &ids[2], "image", Some("https://fake.zdn.vn/c"), "downloaded"),
+                    (0, &ids[3], "image", Some("https://fake.zdn.vn/d"), "ref-encrypted"),
+                    (0, &ids[4], "image", Some("https://fake.zdn.vn/e"), "ref-import"),
+                    (0, &ids[5], "image", Some("https://fake.zdn.vn/f0"), "ref-import"),
+                    (1, &ids[5], "image", Some("https://fake.zdn.vn/f1"), "ref-import"),
+                    (0, &ids[6], "file", Some("https://fake.zdn.vn/g"), "ref-import"),
+                    (0, &ids[7], "file", Some("https://fake.zdn.vn/h"), "ref"),
+                    (0, &ids[10], "image", Some("https://fake.zdn.vn/k"), "failed"),
+                    (0, &ids[11], "video", Some("https://fake.zdn.vn/l"), "ref-import"),
+                ],
+            );
+            CopyFx {
+                snap,
+                key,
+                root,
+                store,
+                media: temp_dir("media27b"),
+            }
+        }
+
+        fn copy_args(fx: &CopyFx, apply: bool, video: bool, limit: Option<u64>) -> ImportArgs {
+            let uin = sha12(PASS.as_bytes());
+            let mut a = args_for(&fx.snap, &uin, &fx.key);
+            a.local_media_copy = true;
+            a.local_media_root = Some(fx.root.clone());
+            a.target = Some(fx.store.clone());
+            a.apply = apply;
+            a.i_have_a_backup_plan = apply;
+            a.include_video = video;
+            a.limit = limit;
+            a
+        }
+
+        /// Run the copy with injected probes: `free` bytes on the media
+        /// volume, `running` = the zalors.exe probe.
+        fn run_copy_with(
+            a: &ImportArgs,
+            fx: &CopyFx,
+            free: Option<u64>,
+            running: Option<bool>,
+        ) -> (Result<(), String>, Vec<String>) {
+            let mut lines: Vec<String> = Vec::new();
+            let free_fn = move |_: &Path| free;
+            let run_fn = move || running;
+            let env = copy::CopyEnv {
+                media_root: fx.media.clone(),
+                free_space: &free_fn,
+                zalors_running: &run_fn,
+            };
+            let r = copy::copy_run(a, &fx.root, &fx.store, &env, &mut |l: &str| {
+                lines.push(l.to_string())
+            });
+            (r, lines)
+        }
+
+        fn run_copy(a: &ImportArgs, fx: &CopyFx) -> (Result<(), String>, Vec<String>) {
+            run_copy_with(a, fx, Some(u64::MAX / 2), Some(false))
+        }
+
+        type AttRowT = (
+            String,
+            i64,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+
+        /// Every attachment row (msg_id, idx, kind, status, local_path,
+        /// sha256, size), read-only.
+        fn att_rows(store: &Path) -> Vec<AttRowT> {
+            let (conn, _k) = crate::shadow::passphrase::open_store(store, true).unwrap();
+            let mut st = conn
+                .prepare(
+                    "SELECT msg_id, idx, kind, status, local_path, sha256, size \
+                       FROM attachments ORDER BY msg_id, idx",
+                )
+                .unwrap();
+            let v = st
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            v
+        }
+
+        fn status_of(rows: &[AttRowT], n: i64, idx: i64) -> String {
+            let id = cid(n);
+            rows.iter()
+                .find(|r| r.0 == id && r.1 == idx)
+                .unwrap_or_else(|| panic!("no row {n}/{idx}"))
+                .3
+                .clone()
+        }
+
+        /// Regular files under the media store (not temp files, not
+        /// the JXL cache).
+        fn store_files(media: &Path) -> usize {
+            fn walk(d: &Path, n: &mut usize) {
+                let Ok(rd) = std::fs::read_dir(d) else { return };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, n);
+                    } else if !e.file_name().to_string_lossy().ends_with(".tmp") {
+                        *n += 1;
+                    }
+                }
+            }
+            let mut n = 0;
+            walk(media, &mut n);
+            n
+        }
+
+        fn backup_count(store: &Path) -> usize {
+            std::fs::read_dir(store.join("pre-localmedia-backups"))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+
+        fn cleanup(fx: &CopyFx) {
+            let _ = std::fs::remove_dir_all(&fx.snap);
+            let _ = std::fs::remove_dir_all(&fx.root);
+            let _ = std::fs::remove_dir_all(&fx.store);
+            let _ = std::fs::remove_dir_all(&fx.media);
+        }
+
+        #[test]
+        fn copy_dry_run_reports_every_outcome_and_writes_nothing() {
+            let fx = copy_fixture();
+            let before = att_rows(&fx.store);
+            let (r, lines) = run_copy(&copy_args(&fx, false, false, None), &fx);
+            r.unwrap();
+            let j = lines.join("\n");
+            let m = "local-media-copy dry run";
+            assert!(j.contains(&format!("{m}: store=given (read-only)")), "{j}");
+            assert!(
+                j.contains(&format!(
+                    "{m}: import-sourced attachments: rows=11 kinds=3"
+                )),
+                "{j}"
+            );
+            // The cliMsgId census: the decoy shares E's key.
+            assert!(j.contains("cliMsgId census:"), "{j}");
+            assert!(
+                j.contains(&format!(
+                    "{m}: kind=image rows=8 outcomes already_downloaded=1 not_eligible=1 \
+                     multi_attachment=2 ambiguous_key=1 no_candidate=0 magic_mismatch=0 \
+                     size_excluded=0 size_mismatch=0 would_copy_renderable=2(bytes=13) \
+                     would_copy_jxl_only=1(bytes=7)"
+                )),
+                "{j}"
+            );
+            assert!(
+                j.contains(&format!(
+                    "{m}: kind=file rows=2 outcomes already_downloaded=0 not_eligible=0 \
+                     multi_attachment=0 ambiguous_key=0 no_candidate=0 magic_mismatch=0 \
+                     size_excluded=0 size_mismatch=1 would_copy_renderable=1(bytes=9) \
+                     would_copy_jxl_only=0(bytes=0)"
+                )),
+                "{j}"
+            );
+            assert!(
+                j.contains(&format!(
+                    "{m}: kind=video rows=1 outcomes already_downloaded=0 not_eligible=0 \
+                     multi_attachment=0 ambiguous_key=0 no_candidate=0 magic_mismatch=0 \
+                     size_excluded=0 size_mismatch=0 would_copy_renderable=1(bytes=12) \
+                     would_copy_jxl_only=0(bytes=0)"
+                )),
+                "{j}"
+            );
+            // Videos without an attachment row are only COUNTED.
+            assert!(
+                j.contains(&format!(
+                    "{m}: videos (msgType 18, no attachment row): messages=2 outcomes \
+                     already_downloaded=0 not_eligible=0 multi_attachment=0 ambiguous_key=0 \
+                     no_candidate=1 magic_mismatch=0 size_excluded=0 size_mismatch=0 \
+                     would_copy_renderable=1(bytes=10) would_copy_jxl_only=0(bytes=0) \
+                     rows_to_insert=1 (counted only; add --include-video"
+                )),
+                "{j}"
+            );
+            assert!(
+                j.contains(&format!(
+                    "{m}: planned: files=5 bytes=41 new_video_rows=0"
+                )),
+                "{j}"
+            );
+            assert!(j.contains(&format!("{m}: disk check: needed_bytes=")), "{j}");
+            assert!(j.contains("DRY RUN — nothing was written"), "{j}");
+            // No write of any kind.
+            assert_eq!(att_rows(&fx.store), before);
+            assert_eq!(store_files(&fx.media), 0);
+            assert_eq!(backup_count(&fx.store), 0);
+            assert!(!fx.store.join("pre-localmedia-backups").exists());
+            // H-rule: no id, name, path, URL in any line.
+            for n in (1..=12).chain([50, 105, 107]) {
+                assert!(!j.contains(&cid(n)), "an id leaked ({n})\n{j}");
+            }
+            for banned in [
+                "https://",
+                ".jpg",
+                ".jxl",
+                ".bin",
+                "zr-local-media",
+                &*fx.root.to_string_lossy(),
+                &*fx.store.to_string_lossy(),
+                &*fx.media.to_string_lossy(),
+                &*fx.snap.to_string_lossy(),
+            ] {
+                assert!(!j.contains(banned), "a value leaked: {banned}\n{j}");
+            }
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_apply_copies_updates_rows_and_is_idempotent() {
+            let fx = copy_fixture();
+            let before = att_rows(&fx.store);
+            let (r, lines) = run_copy(&copy_args(&fx, true, false, None), &fx);
+            r.unwrap_or_else(|e| panic!("{e}\n{}", lines.join("\n")));
+            let j = lines.join("\n");
+            let m = "local-media-copy apply";
+            assert!(j.contains(&format!("{m}: no other zalors.exe is running")), "{j}");
+            assert!(j.contains(&format!("{m}: store=given (read-write)")), "{j}");
+            assert!(j.contains(&format!("{m}: backup verified OK")), "{j}");
+            assert!(
+                j.contains(&format!(
+                    "{m}: copied=5 bytes_copied=41 errors open=0 io=0 magic=0 too_big=0 store=0"
+                )),
+                "{j}"
+            );
+            assert!(j.contains(&format!("{m}: video rows inserted=0")), "{j}");
+            assert!(j.contains(&format!("{m}: integrity_check=ok")), "{j}");
+            assert_eq!(backup_count(&fx.store), 1);
+
+            let after = att_rows(&fx.store);
+            assert_eq!(after.len(), before.len(), "no row added without --include-video");
+            // Copied rows: A(1) B(2) K(11) G(7) L(12).
+            for n in [1, 2, 11, 7, 12] {
+                assert_eq!(status_of(&after, n, 0), "downloaded", "{n}");
+                let r = after.iter().find(|r| r.0 == cid(n) && r.1 == 0).unwrap();
+                let rel = r.4.as_deref().expect("local_path set");
+                let sha = r.5.as_deref().expect("sha set");
+                assert_eq!(sha.len(), 64);
+                assert_eq!(rel, format!("{}/{}/{}", &sha[..2], &sha[2..4], sha));
+                let bytes = std::fs::read(fx.media.join(rel)).unwrap();
+                assert_eq!(format!("{:x}", Sha256::digest(&bytes)), sha);
+                assert_eq!(r.6, Some(bytes.len() as i64));
+            }
+            // Byte-exact content: A is the 6-byte jpg.
+            let a_rel = after
+                .iter()
+                .find(|r| r.0 == cid(1))
+                .unwrap()
+                .4
+                .clone()
+                .unwrap();
+            assert_eq!(std::fs::read(fx.media.join(a_rel)).unwrap(), JPG6);
+            // Untouched: downloaded (C) keeps its NULL path, ref-encrypted
+            // (D), ambiguous (E), multi-attachment (F x2), size
+            // mismatch (H) all keep status and columns.
+            for (n, idx, status) in [
+                (3, 0, "downloaded"),
+                (4, 0, "ref-encrypted"),
+                (5, 0, "ref-import"),
+                (6, 0, "ref-import"),
+                (6, 1, "ref-import"),
+                (8, 0, "ref"),
+            ] {
+                assert_eq!(status_of(&after, n, idx), status, "{n}/{idx}");
+                let b = before.iter().find(|r| r.0 == cid(n) && r.1 == idx).unwrap();
+                let a = after.iter().find(|r| r.0 == cid(n) && r.1 == idx).unwrap();
+                assert_eq!(a, b, "row {n}/{idx} must be byte-identical");
+            }
+            assert_eq!(store_files(&fx.media), 5);
+
+            // A second apply copies 0 and changes nothing (no extra backup).
+            let (r2, lines2) = run_copy(&copy_args(&fx, true, false, None), &fx);
+            r2.unwrap();
+            let j2 = lines2.join("\n");
+            assert!(j2.contains(&format!("{m}: nothing to copy")), "{j2}");
+            assert!(j2.contains(&format!("{m}: copied=0 bytes=0")), "{j2}");
+            assert_eq!(att_rows(&fx.store), after);
+            assert_eq!(store_files(&fx.media), 5);
+            assert_eq!(backup_count(&fx.store), 1);
+
+            // --include-video: one row INSERTED (idx 0, kind video) and
+            // copied; J (no candidate) gets none.
+            let (r3, lines3) = run_copy(&copy_args(&fx, true, true, None), &fx);
+            r3.unwrap();
+            let j3 = lines3.join("\n");
+            assert!(
+                j3.contains(&format!(
+                    "{m}: copied=1 bytes_copied=10 errors open=0 io=0 magic=0 too_big=0 store=0"
+                )),
+                "{j3}"
+            );
+            assert!(j3.contains(&format!("{m}: video rows inserted=1")), "{j3}");
+            let v = att_rows(&fx.store);
+            assert_eq!(v.len(), after.len() + 1);
+            let nr = v.iter().find(|r| r.0 == cid(9)).expect("the new video row");
+            assert_eq!((nr.1, nr.2.as_deref(), nr.3.as_str()), (0, Some("video"), "downloaded"));
+            assert!(nr.4.is_some() && nr.5.as_deref().map(str::len) == Some(64));
+            assert_eq!(nr.6, Some(10));
+            assert!(!v.iter().any(|r| r.0 == cid(10)), "J has no candidate: no row");
+            assert_eq!(store_files(&fx.media), 6);
+            assert_eq!(backup_count(&fx.store), 2);
+            // …and a rerun of it is idempotent too.
+            let (r4, lines4) = run_copy(&copy_args(&fx, true, true, None), &fx);
+            r4.unwrap();
+            assert!(lines4.join("\n").contains(&format!("{m}: copied=0 bytes=0")));
+            assert_eq!(att_rows(&fx.store), v);
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_dry_run_with_include_video_still_inserts_nothing() {
+            let fx = copy_fixture();
+            let before = att_rows(&fx.store);
+            let (r, lines) = run_copy(&copy_args(&fx, false, true, None), &fx);
+            r.unwrap();
+            let j = lines.join("\n");
+            assert!(
+                j.contains("planned: files=6 bytes=51 new_video_rows=1"),
+                "{j}"
+            );
+            assert!(j.contains("--include-video: they are inserted and copied"), "{j}");
+            assert_eq!(att_rows(&fx.store), before);
+            assert_eq!(store_files(&fx.media), 0);
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_limit_stops_after_n_copies() {
+            let fx = copy_fixture();
+            let (r, lines) = run_copy(&copy_args(&fx, true, false, Some(2)), &fx);
+            r.unwrap();
+            let j = lines.join("\n");
+            assert!(j.contains("planned: files=2 bytes="), "{j}");
+            assert!(j.contains("copied=2 "), "{j}");
+            let rows = att_rows(&fx.store);
+            // Processing order is msg_id, idx: A then B.
+            assert_eq!(status_of(&rows, 1, 0), "downloaded");
+            assert_eq!(status_of(&rows, 2, 0), "downloaded");
+            for n in [7, 11, 12] {
+                assert_ne!(status_of(&rows, n, 0), "downloaded", "{n} is past the limit");
+            }
+            assert_eq!(store_files(&fx.media), 2);
+            // The next run (no limit) continues with the rest: 3 more.
+            let (r2, lines2) = run_copy(&copy_args(&fx, true, false, None), &fx);
+            r2.unwrap();
+            assert!(lines2.join("\n").contains("copied=3 "));
+            assert_eq!(store_files(&fx.media), 5);
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_apply_refuses_when_the_disk_check_fails_and_writes_nothing() {
+            let fx = copy_fixture();
+            let before = att_rows(&fx.store);
+            // Planned 41 bytes: needs 41 x 1.05 + 1 GiB. Free = exactly
+            // 1 GiB is not enough.
+            let (r, _l) = run_copy_with(
+                &copy_args(&fx, true, false, None),
+                &fx,
+                Some(1 << 30),
+                Some(false),
+            );
+            let e = r.unwrap_err();
+            assert!(e.contains("disk check: not enough free space"), "{e}");
+            assert!(e.contains("no writes were performed"), "{e}");
+            // An unmeasurable volume fails closed too.
+            let (r, _l) = run_copy_with(
+                &copy_args(&fx, true, false, None),
+                &fx,
+                None,
+                Some(false),
+            );
+            let e = r.unwrap_err();
+            assert!(e.contains("cannot measure the free space"), "{e}");
+            // Just enough: needed (1 GiB + 44) < free passes.
+            let need = copy::needed_bytes(41) as u64;
+            let (r, _l) = run_copy_with(
+                &copy_args(&fx, false, false, None),
+                &fx,
+                Some(need + 1),
+                Some(false),
+            );
+            r.unwrap();
+            assert_eq!(att_rows(&fx.store), before);
+            assert_eq!(store_files(&fx.media), 0);
+            assert_eq!(backup_count(&fx.store), 0, "no backup before the disk check passes");
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_apply_guards_refuse_before_any_write() {
+            let fx = copy_fixture();
+            let before = att_rows(&fx.store);
+            // Guard 1: another zalors.exe, and a failed probe.
+            let (r, _l) = run_copy_with(&copy_args(&fx, true, false, None), &fx, Some(u64::MAX / 2), Some(true));
+            assert!(r.unwrap_err().contains("another zalors.exe process is running"));
+            let (r, _l) = run_copy_with(&copy_args(&fx, true, false, None), &fx, Some(u64::MAX / 2), None);
+            assert!(r.unwrap_err().contains("cannot verify that no other zalors.exe"));
+            // --apply without the confirmation flag.
+            let mut a = copy_args(&fx, true, false, None);
+            a.i_have_a_backup_plan = false;
+            let (r, _l) = run_copy(&a, &fx);
+            assert!(r.unwrap_err().contains("--i-have-a-backup-plan"));
+            assert_eq!(att_rows(&fx.store), before);
+            assert_eq!(store_files(&fx.media), 0);
+            assert_eq!(backup_count(&fx.store), 0);
+            // The dry run does not need the process probe at all (the
+            // app may keep running).
+            let (r, _l) = run_copy_with(&copy_args(&fx, false, false, None), &fx, Some(u64::MAX / 2), Some(true));
+            r.unwrap();
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_refuses_a_locked_passphrase_store() {
+            let fx = copy_fixture();
+            // Passphrase mode without a remember file: Locked.
+            crate::shadow::passphrase::write_marker(&fx.store, crate::shadow::schema::now_ms())
+                .unwrap();
+            for apply in [false, true] {
+                let (r, _l) = run_copy(&copy_args(&fx, apply, false, None), &fx);
+                let e = r.unwrap_err();
+                assert!(e.contains("password-protected (passphrase mode)"), "{e}");
+                assert!(e.contains("never accepts passwords"), "{e}");
+                assert!(e.contains("Nhớ trên máy này"), "{e}");
+            }
+            assert_eq!(store_files(&fx.media), 0);
+            assert_eq!(backup_count(&fx.store), 0);
+            cleanup(&fx);
+        }
+
+        #[test]
+        fn copy_refuses_a_store_without_the_db() {
+            let fx = copy_fixture();
+            let empty = temp_dir("nostore27b");
+            let mut a = copy_args(&fx, false, false, None);
+            a.target = Some(empty.clone());
+            let free_fn = |_: &Path| Some(u64::MAX / 2);
+            let run_fn = || Some(false);
+            let env = copy::CopyEnv {
+                media_root: fx.media.clone(),
+                free_space: &free_fn,
+                zalors_running: &run_fn,
+            };
+            let e = copy::copy_run(&a, &fx.root, &empty, &env, &mut |_l: &str| {}).unwrap_err();
+            assert!(e.contains("--target: no "), "{e}");
+            let _ = std::fs::remove_dir_all(&empty);
+            cleanup(&fx);
         }
     }
 }

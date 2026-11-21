@@ -1312,3 +1312,140 @@ tells whether `resource` is a thumbnail (`<0.25`) or the original.
 row, which batch 27b will have to create. Attachment-index to file
 ordering is unknown, so multi-image messages are only counted
 (`atts_vs_fitting_differ`), never matched one to one.
+
+### 10.7 Copy the local media into the store, and show JPEG XL (batch 27b)
+
+Batch 27b turns the §10.6 selection into real copies, and makes the
+archive viewer show JPEG XL. Decisions taken by the user: files are
+REAL copies (no hardlinks), and `jxl-oxide` (pure Rust) is the only new
+crate.
+
+#### M1 — `import --local-media-copy`
+
+```powershell
+# DRY RUN: the same selection, then what WOULD be copied. No writes; the
+# app may keep running.
+target\debug\zalors.exe import `
+  --from-snapshot "<cold snapshot dir>" --account default `
+  --uin-hash <sha256-12> --key-file "<D7 capture>" `
+  --local-media-copy --target "<shadow store dir>" `
+  --local-media-root "<Zalo PC media root>" [--include-video] [--limit N]
+
+# APPLY: quit the app first.
+target\debug\zalors.exe import `
+  --from-snapshot "<cold snapshot dir>" --account default `
+  --uin-hash <sha256-12> --key-file "<D7 capture>" `
+  --local-media-copy --apply --i-have-a-backup-plan `
+  --target "<shadow store dir>" --local-media-root "<Zalo PC media root>" `
+  [--include-video] [--limit N]
+```
+
+No `ZR_*` environment variable is read by this mode. The MEDIA root (where the
+files are copied) is resolved like the live media thread resolves it:
+`settings.shadow.media_store`, else `D:\ZaloRust Data` when it exists,
+else the app-data default. `--target` is the shadow STORE dir; it has
+no default. It is its own mode (one mode per run: it refuses
+`--inventory`, `--mapping`, `--shadow-copy`, `--delta`, `--distinct`,
+`--content-shape`, `--media-plan`, `--local-media-probe`,
+`--local-media-plan`, `--out`), and it does not take `--mapping`.
+
+**Guards of `--apply`**, in this order; each refuses with zero writes:
+
+1. no other `zalors.exe` runs (a probe that cannot run also refuses);
+2. the store opens read-write with the normal key resolution (a Locked
+   passphrase store gets the documented remember-file refusal; the CLI
+   never accepts a password);
+3. the stored schema version equals this binary's;
+4. the disk check: `planned bytes x 1.05 + 1 GiB` must be STRICTLY
+   below the free space of the volume holding the MEDIA root (the free
+   space probe is injectable in tests; an unmeasurable volume refuses);
+5. a verified store backup (the repair helper: sha + integrity + counts)
+   into `<target>\pre-localmedia-backups\`, BEFORE the first write.
+
+The selection runs read-only before guard 4 (it needs the planned bytes).
+When it plans nothing, `--apply` makes no backup and writes nothing.
+
+**Selection** (per import-sourced attachment, plan v2 plus these rules):
+
+- eligible statuses: `ref-import`, `ref`, `failed`, `expired`.
+  `downloaded` is `already_downloaded`; any other status (`ref-encrypted`)
+  is `not_eligible`. Neither is ever touched;
+- `multi_attachment`: the message has more than one attachment row of
+  that kind (the idx to file order is unknown). Skipped;
+- `ambiguous_key`: a candidate reached through the `resource` cliMsgId
+  key counts only when that cliMsgId sits on exactly ONE Desktop message
+  row across all message DBs (counted during the scan); otherwise it is
+  dropped, and when nothing is left the outcome is `ambiguous_key`;
+- `size_mismatch`: for kinds `file` and `video`, when the Desktop
+  `fileSize` is known (> 0) the chosen candidate's size must equal it
+  exactly; a mismatching candidate is dropped and the next best is
+  tried; none left is `size_mismatch`;
+- the rest are plan v2's outcomes: `no_candidate`, `magic_mismatch`,
+  `size_excluded`, `would_copy_renderable`, `would_copy_jxl_only`.
+
+**`--include-video`.** Considers import messages with Desktop msgType 18
+that have NO attachment row. Only when a video candidate is selected, one
+`attachments` row is inserted (`idx=0`, `kind='video'`, `status='ref-import'`;
+`msg_id`, `idx` and `status` are the table's only NOT NULL columns, so
+`url`, `local_path`, `size` and `sha256` start NULL and are set by the
+copy at once; a NULL `url` is never picked by the media thread) and then
+copied like any other row. The insert and the update run in one
+savepoint after the file was stored, so a failed copy leaves no row.
+Without the flag, such videos are only counted.
+
+**Copy.** The chosen file opens and streams through
+`media::store_stream` (content addressed, magic sniffed, 512 MB cap), and
+the row is updated through the SAME statement `Job::MediaDone` uses for a
+successful download (`writer::media_downloaded`: `status='downloaded'`,
+`local_path`, `sha256`, `size`). A per-file error is counted by kind
+(`open`, `io`, `magic`, `too_big`, `store`) and leaves the row unchanged;
+the run continues. A transaction commits every 200 copies, `--limit N`
+stops after N copies, and a counts-only progress line prints every 1000
+files. A second `--apply` copies 0 and changes nothing.
+
+**Report** (H-rule: counts, the fixed vocabulary and byte sums only; no
+path, file name, id, URL, sha or message text):
+
+```
+local-media-copy <mode>: kind=<k> rows=<n> outcomes already_downloaded=<n> not_eligible=<n> multi_attachment=<n> ambiguous_key=<n> no_candidate=<n> magic_mismatch=<n> size_excluded=<n> size_mismatch=<n> would_copy_renderable=<n>(bytes=<b>) would_copy_jxl_only=<n>(bytes=<b>)
+local-media-copy <mode>: videos (msgType 18, no attachment row): messages=<n> outcomes ... rows_to_insert=<n>
+local-media-copy <mode>: planned: files=<n> bytes=<b> new_video_rows=<n>
+local-media-copy <mode>: disk check: needed_bytes=<b> result=ok|NOT ENOUGH FREE SPACE|free space unmeasurable
+local-media-copy apply: backup verified OK in <target>\pre-localmedia-backups (sha+integrity+counts)
+local-media-copy apply: progress files=<n> copied=<n> errors=<n> bytes=<b>
+local-media-copy apply: copied=<n> bytes_copied=<b> errors open=<n> io=<n> magic=<n> too_big=<n> store=<n>
+local-media-copy apply: video rows inserted=<n>
+local-media-copy apply: integrity_check=ok
+```
+
+(`<mode>` is `dry run` or `apply`.)
+
+#### M2 — JPEG XL in the archive viewer
+
+WebView2 cannot decode JPEG XL, and most of the local picture cache is
+JXL. In the archive media protocol (`zrarchive`), when an `image` row's
+stored bytes are JXL (bare codestream or ISO-BMFF container):
+
+1. the first frame is decoded to 8-bit sRGB with `jxl-oxide` (RGB or
+   RGBA; a gray image stays gray);
+2. a PNG is encoded with the `png` crate;
+3. it is cached at `<media root>\cache\jxl-png\<sha>.png` (`<sha>` is
+   the store file's own name, else the sha256 of the bytes): a temp file
+   is written and renamed, and an existing cache file is reused;
+4. it is served as `image/png`.
+
+More than 50 megapixels refuses before any frame is rendered (the
+header is checked as soon as the image initialises; the decoder's
+allocations are also capped), and a decode failure behaves like a refused
+content type (404). Nothing logs a path. `archive::content_type_for`
+still reports `image/jxl` for the raw sniff; the serving path decides on
+the conversion.
+
+Dependencies: `jxl-oxide 0.12.6` with `default-features = false` (no
+rayon, no CMS: a single-threaded decode that handles well-known color
+encodings; an image that needs an external CMS is a decode failure),
+and `png` named directly, pinned to `=0.18.1`, the version already in
+`Cargo.lock` through tauri. The deployed app is a debug build, so
+`[profile.dev.package.*] opt-level = 3` is set for the `jxl-*` decoding
+crates, `png`, `miniz_oxide`, `fdeflate`, `crc32fast` and
+`simd-adler32`.

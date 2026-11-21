@@ -1909,6 +1909,47 @@ pub fn run_local_media_plan(a: &ImportArgs) -> Result<Vec<String>, String> {
     local_media::plan_report(a, root, target)
 }
 
+/// The `--local-media-copy` mode (batch 27b M1): a DRY RUN without
+/// `--apply`, the guarded copy with `--apply --i-have-a-backup-plan`.
+/// The media root is resolved exactly the way the live media thread
+/// resolves it (`settings.shadow.media_store`, else the documented
+/// default) through the settings loader; the free-space probe and the
+/// process probe are wired here (the real ones) and injected into
+/// [`local_media::copy::copy_run`], whose guards are unit-tested with
+/// fakes. Lines stream through `out` — counts, fixed vocabulary and
+/// byte sums only.
+pub fn run_local_media_copy(
+    a: &ImportArgs,
+    out: &mut dyn FnMut(&str),
+    zalors_running: impl Fn() -> Option<bool>,
+) -> Result<(), String> {
+    let root = a
+        .local_media_root
+        .as_deref()
+        .expect("cli::main routes --local-media-copy here; parse guarantees --local-media-root");
+    let target = a
+        .target
+        .as_deref()
+        .expect("cli::main routes --local-media-copy here; parse guarantees --target");
+    if !root.is_dir() {
+        return Err(format!(
+            "--local-media-root: {} is not a directory — pass the Zalo PC media root              (the dir whose `media` child holds the per-uid trees)",
+            root.display()
+        ));
+    }
+    let settings = crate::settings::path_without_app()
+        .map(|path| crate::settings::load_at(&path))
+        .unwrap_or_default();
+    let media_root = super::media::media_store_root(&settings.shadow);
+    let free = |p: &Path| super::disk_space::disk_free_space(p).map(|(free, _total)| free);
+    let env = local_media::copy::CopyEnv {
+        media_root,
+        free_space: &free,
+        zalors_running: &zalors_running,
+    };
+    local_media::copy::copy_run(a, root, target, &env, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,6 +2095,9 @@ mod tests {
             local_media_probe: false,
             local_media_plan: false,
             local_media_root: None,
+            local_media_copy: false,
+            include_video: false,
+            limit: None,
             content_shape: None,
             by: None,
             decrypt_basic: false,
