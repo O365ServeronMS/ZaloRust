@@ -35,6 +35,7 @@
 //!   - `import`  — Zalo Desktop DB import (P2)
 //!   - `repair`  — one-time v1 data repair (maintenance only, never
 //!     called from runtime)
+//!   - `repair_cli` — `zalors repair` entry (batch 20, audit T8)
 
 pub mod account;
 /// Read-only query layer for the "Lưu trữ" window (audit §4 Phase 3
@@ -84,6 +85,13 @@ pub mod rate_limit;
 /// One-time v1 data repair (audit T8). Maintenance/tests ONLY — never
 /// called from `runtime` or startup.
 pub mod repair;
+/// `zalors repair` CLI (batch 20, audit T8 / §1.2 migration): the
+/// guarded user entry for the one-time v1 data repair — a dry run on
+/// a verified temp COPY (the target opens read-only, its bytes never
+/// change) or a user-confirmed apply with a verified pre-repair
+/// backup, the whole repair in ONE transaction, and integrity +
+/// idempotence checks. Dispatched in `main.rs` before Tauri starts.
+pub mod repair_cli;
 /// REST capture stage counters (audit H2 / batch 3 C2).
 pub mod rest_stats;
 /// In-RAM hold for REST bodies that arrive BEFORE the REST key arms

@@ -5,7 +5,17 @@
 //! must only run from an explicit maintenance entry point or a test,
 //! after a backup (audit §1.2's "Migration 1 lần" note). Run the
 //! [`repair_v1_dry_run`] first and compare reports; the `maint_repair`
-//! ignored test runs both against a temp COPY of the live store.
+//! ignored test runs both against a temp COPY of the live store; the
+//! guarded `zalors repair` CLI (batch 20, `repair_cli.rs`) is the user
+//! entry point.
+//!
+//! Batch 20 (S1): every step now has ONE implementation
+//! (`repair_v1_impl`) behind two error policies. The old
+//! [`repair_v1`]/[`repair_v1_dry_run`] keep their swallow-and-count
+//! behaviour (a step's failure contributes today's zero/partial
+//! value); the new [`repair_v1_checked`]/[`repair_v1_dry_run_checked`]
+//! abort at the FIRST SQL failure and report a [`RepairError`] — a
+//! step NAME plus the sqlite error KIND, never row data.
 //!
 //! Scope (deliberately narrow):
 //! - create conversation stubs for orphan messages (H4-e);
@@ -28,6 +38,7 @@
 use rusqlite::Connection;
 use serde_json::Value;
 
+use super::pipeline::sqlite_kind;
 use super::{account, normalize, schema, writer};
 
 /// What `repair_v1` changed. All counters: no row data ever leaves this
@@ -49,15 +60,145 @@ pub struct RepairReport {
     pub revs_reset: usize,
 }
 
+/// Step names carried by [`RepairError::step`] — one per repair step
+/// (a)-(f), plus the dry run's BEGIN. Stable strings: the CLI prints
+/// them verbatim in its failure line.
+pub const STEP_CONV_STUBS: &str = "conv_stubs";
+pub const STEP_LAST_MSG: &str = "last_msg";
+pub const STEP_CONTENT_HASH: &str = "content_hash";
+pub const STEP_TYPE_REMAP: &str = "type_remap";
+pub const STEP_SENDER_BACKFILL: &str = "sender_backfill";
+pub const STEP_REV_PRUNE: &str = "rev_prune";
+/// The dry run's `BEGIN IMMEDIATE`.
+pub const STEP_BEGIN: &str = "begin";
+
+/// Why a repair step failed (batch 20 S1): the step NAME plus the
+/// sqlite error KIND (`pipeline::sqlite_kind`) — never row data, ids,
+/// paths or sqlite error text (H-rule).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairError {
+    /// Which step failed (a [`STEP_*`](self) constant).
+    pub step: &'static str,
+    /// The sqlite error kind, e.g. `sqlite_SQLError/1`.
+    pub kind: String,
+}
+
+fn rerr(step: &'static str, e: &rusqlite::Error) -> RepairError {
+    RepairError {
+        step,
+        kind: sqlite_kind(e),
+    }
+}
+
 /// Run the v1 repair. Idempotent: a second run over a repaired DB
 /// reports zero everywhere. `own_uid` gates step (e): `Some(valid uid)`
 /// backfills self-sent senders (KQ2), `None` (or a bad-shaped uid)
 /// skips it. Per-step failures are counted as "nothing done for that
 /// step" — this is a maintenance helper, not a pipeline path (the
 /// pipeline's no-swallowed-errors rule lives in
-/// `pipeline::process_batch`).
+/// `pipeline::process_batch`). Batch 20: the steps are ONE
+/// implementation shared with [`repair_v1_checked`]; this is the count
+/// policy, byte-for-byte the pre-batch-20 behaviour.
 pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
+    repair_v1_impl(conn, own_uid, false).0
+}
+
+/// (S1, batch 20) The error-propagating variant a LIVE apply drives:
+/// the first SQL failure of any step aborts the pass and comes back
+/// as a [`RepairError`] — the step NAME plus the sqlite error KIND,
+/// never row data. Every step runs exactly as [`repair_v1`]; the
+/// partial work before the failure is the caller's to undo (the CLI
+/// wraps this in one `BEGIN IMMEDIATE … COMMIT/ROLLBACK`).
+pub fn repair_v1_checked(
+    conn: &Connection,
+    own_uid: Option<&str>,
+) -> Result<RepairReport, RepairError> {
+    match repair_v1_impl(conn, own_uid, true) {
+        (r, None) => Ok(r),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// Collect `query_map` rows under the error policy: the count policy
+/// keeps the pre-batch-20 per-row skip (`filter_map(Result::ok)`); the
+/// checked policy turns the first row-read failure into the step's
+/// error.
+fn gather_rows<T>(
+    it: impl Iterator<Item = rusqlite::Result<T>>,
+    fail_fast: bool,
+    step: &'static str,
+) -> Result<Vec<T>, RepairError> {
+    let mut out = Vec::new();
+    for row in it {
+        match row {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                if fail_fast {
+                    return Err(RepairError {
+                        step,
+                        kind: sqlite_kind(&e),
+                    });
+                }
+                // Count policy: today's silent row skip.
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The ONE implementation of every repair step. `fail_fast` selects
+/// the error policy:
+///
+/// - `false` (the [`repair_v1`] policy): a step's own SQL failure
+///   contributes exactly the pre-batch-20 value (zero rows / empty
+///   vec / today's partial tuple), later steps still run, and the
+///   first failure is recorded in the second tuple slot (nothing
+///   consumed that slot before batch 20; the probe ignores it).
+/// - `true` (the [`repair_v1_checked`] policy): the FIRST SQL failure
+///   — statement or row read — aborts the pass and is returned; no
+///   later step runs. A live apply rolls its whole transaction back
+///   anyway, so stop-at-first-error is the safe shape.
+///
+/// Step (c) selects `payload_json` as `Option<String>` (NULL → skip):
+/// identical to the rows the pre-batch-20 `filter_map(Result::ok)`
+/// dropped, under BOTH policies.
+fn repair_v1_impl(
+    conn: &Connection,
+    own_uid: Option<&str>,
+    fail_fast: bool,
+) -> (RepairReport, Option<RepairError>) {
     let mut r = RepairReport::default();
+    let mut first_err: Option<RepairError> = None;
+
+    /// One fallible statement site: abort (checked policy) or record
+    /// the first error and yield the count policy's exact
+    /// pre-batch-20 default.
+    macro_rules! soft {
+        ($step:expr, $expr:expr, $default:expr) => {
+            match $expr {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = rerr($step, &e);
+                    if fail_fast {
+                        return (r, Some(err));
+                    }
+                    first_err.get_or_insert(err);
+                    $default
+                }
+            }
+        };
+    }
+    /// The same, for an error value already in hand.
+    macro_rules! soft_err {
+        ($step:expr, $e:expr, $default:expr) => {{
+            let err = rerr($step, &$e);
+            if fail_fast {
+                return (r, Some(err));
+            }
+            first_err.get_or_insert(err);
+            $default
+        }};
+    }
 
     // (a) H4-e: stub every conversation a message references but no
     // conversations row names. Same stub shape as the writer's Message
@@ -67,20 +208,26 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
          LEFT JOIN conversations c ON c.id = m.conv_id
          WHERE c.id IS NULL",
     ) {
-        Ok(mut st) => st
-            .query_map([], |row| row.get::<_, String>(0))
-            .map(|it| it.filter_map(Result::ok).collect())
-            .unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(mut st) => match st.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(it) => match gather_rows(it, fail_fast, STEP_CONV_STUBS) {
+                Ok(v) => v,
+                // gather_rows only errs under the checked policy.
+                Err(e) => return (r, Some(e)),
+            },
+            Err(e) => soft_err!(STEP_CONV_STUBS, e, Vec::new()),
+        },
+        Err(e) => soft_err!(STEP_CONV_STUBS, e, Vec::new()),
     };
     for id in &orphans {
-        let n = conn
-            .execute(
+        let n = soft!(
+            STEP_CONV_STUBS,
+            conn.execute(
                 "INSERT OR IGNORE INTO conversations (id, type, unread, updated_at)
                  VALUES (?1, 0, 0, ?2)",
                 rusqlite::params![id, schema::now_ms()],
-            )
-            .unwrap_or(0);
+            ),
+            0
+        );
         r.conv_stubs_created += n;
     }
 
@@ -88,8 +235,9 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
     // (ties broken by msg_id, so the result is insertion-order
     // independent). Only rows whose pointers actually change are
     // counted, hence a second run reports 0.
-    r.last_msg_fixed = conn
-        .execute(
+    r.last_msg_fixed = soft!(
+        STEP_LAST_MSG,
+        conn.execute(
             "UPDATE conversations
                 SET last_msg_id = (SELECT m.msg_id FROM messages m
                                     WHERE m.conv_id = conversations.id
@@ -107,36 +255,44 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
                         (SELECT MAX(m.ts) FROM messages m
                           WHERE m.conv_id = conversations.id))",
             [],
-        )
-        .unwrap_or(0);
+        ),
+        0
+    );
 
     // (c) H4-f: fill content_hash for legacy rows (same digest the
-    // writer now stores on insert).
+    // writer now stores on insert). `payload_json` reads as
+    // Option<String>: a NULL payload is skipped — exactly the rows the
+    // pre-batch-20 row-level drop removed.
     {
-        let rows: Vec<(i64, String)> = match conn
+        let rows: Vec<(i64, Option<String>)> = match conn
             .prepare("SELECT rowid, payload_json FROM messages WHERE content_hash IS NULL")
         {
-            Ok(mut st) => st
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .map(|it| it.filter_map(Result::ok).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(mut st) => match st.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            }) {
+                Ok(it) => match gather_rows(it, fail_fast, STEP_CONTENT_HASH) {
+                    Ok(v) => v,
+                    Err(e) => return (r, Some(e)),
+                },
+                Err(e) => soft_err!(STEP_CONTENT_HASH, e, Vec::new()),
+            },
+            Err(e) => soft_err!(STEP_CONTENT_HASH, e, Vec::new()),
         };
         for (rowid, payload) in rows {
-            // Invalid JSON keeps a NULL hash (the writer's first-fill
-            // rule then treats the row as legacy, never an edit).
-            let Some(h) = writer::content_hash(&payload) else {
-                continue;
-            };
-            let n = conn
-                .execute(
+            // Invalid/absent JSON keeps a NULL hash (the writer's
+            // first-fill rule then treats the row as legacy, never an
+            // edit).
+            let Some(p) = payload else { continue };
+            let Some(h) = writer::content_hash(&p) else { continue };
+            let n = soft!(
+                STEP_CONTENT_HASH,
+                conn.execute(
                     "UPDATE messages SET content_hash = ?2
                       WHERE rowid = ?1 AND content_hash IS NULL",
                     rusqlite::params![rowid, h],
-                )
-                .unwrap_or(0);
+                ),
+                0
+            );
             r.content_hash_filled += n;
         }
     }
@@ -151,17 +307,20 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
         let rows: Vec<(i64, Option<String>, i64)> = match conn
             .prepare("SELECT rowid, payload_json, type FROM messages")
         {
-            Ok(mut st) => st
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .map(|it| it.filter_map(Result::ok).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(mut st) => match st.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) {
+                Ok(it) => match gather_rows(it, fail_fast, STEP_TYPE_REMAP) {
+                    Ok(v) => v,
+                    Err(e) => return (r, Some(e)),
+                },
+                Err(e) => soft_err!(STEP_TYPE_REMAP, e, Vec::new()),
+            },
+            Err(e) => soft_err!(STEP_TYPE_REMAP, e, Vec::new()),
         };
         for (rowid, payload, cur_type) in rows {
             let Some(payload) = payload else { continue };
@@ -173,12 +332,14 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
             let msg_type = v.get("msgType").and_then(Value::as_str).unwrap_or("");
             let want = normalize::msg_type_code(msg_type);
             if want != cur_type {
-                let n = conn
-                    .execute(
+                let n = soft!(
+                    STEP_TYPE_REMAP,
+                    conn.execute(
                         "UPDATE messages SET type = ?2 WHERE rowid = ?1",
                         rusqlite::params![rowid, want],
-                    )
-                    .unwrap_or(0);
+                    ),
+                    0
+                );
                 r.types_remapped += n;
             }
         }
@@ -189,29 +350,42 @@ pub fn repair_v1(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
     // CONFLICT never filled it). One statement; None (or a bad-shaped
     // uid, the same rule `account::resolve_own_uid` applies) skips the
     // step.
-    r.senders_backfilled = backfill_senders(conn, own_uid);
+    r.senders_backfilled = soft!(
+        STEP_SENDER_BACKFILL,
+        backfill_senders(conn, own_uid),
+        0
+    );
 
     // (f) H4 ping-pong revisions (see `prune_ping_pong_revisions`).
-    let (pruned, reset) = prune_ping_pong_revisions(conn);
+    let (pruned, reset) = match prune_ping_pong_revisions(conn, fail_fast) {
+        Ok(v) => v,
+        // The checked policy only: the count policy folds today's
+        // partials into its Ok values.
+        Err(e) => return (r, Some(e)),
+    };
     r.revisions_pruned = pruned;
     r.revs_reset = reset;
 
-    r
+    (r, first_err)
 }
 
 /// (e) KQ2: fill `sender_id` for every self-sent row still at NULL.
 /// A row is self-sent when its payload says `uidFrom='0'` (the exact
-/// audit §3-KQ2 statement).
-fn backfill_senders(conn: &Connection, own_uid: Option<&str>) -> usize {
+/// audit §3-KQ2 statement). `Ok(0)` without touching SQL when the uid
+/// is absent/bad-shaped (the same rule `account::resolve_own_uid`
+/// applies to a configured uid).
+fn backfill_senders(
+    conn: &Connection,
+    own_uid: Option<&str>,
+) -> rusqlite::Result<usize> {
     let Some(uid) = own_uid.filter(|u| account::valid_uid(u)) else {
-        return 0;
+        return Ok(0);
     };
     conn.execute(
         "UPDATE messages SET sender_id = ?1
           WHERE sender_id IS NULL AND json_extract(payload_json, '$.uidFrom') = '0'",
         rusqlite::params![uid],
     )
-    .unwrap_or(0) as usize
 }
 
 /// (f) H4 ping-pong: the pre-fix writer bumped `rev` on every
@@ -226,7 +400,14 @@ fn backfill_senders(conn: &Connection, own_uid: Option<&str>) -> usize {
 /// semantic). Recall/delete rows are never candidates; a revision whose
 /// payload does not hash (invalid JSON) or whose message is gone stays
 /// (conservative). Returns `(revisions_pruned, revs_reset)`.
-fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
+///
+/// Under the count policy every failure keeps today's partial tuple
+/// (the step stops where it stopped); under the checked policy the
+/// first failure is `Err(STEP_REV_PRUNE)`.
+fn prune_ping_pong_revisions(
+    conn: &Connection,
+    fail_fast: bool,
+) -> Result<(usize, usize), RepairError> {
     // (msg_id, rev) of every representation-only edit revision.
     let mut prune: Vec<(String, i64)> = Vec::new();
     {
@@ -237,7 +418,12 @@ fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
               WHERE r.kind = 'edit'",
         ) {
             Ok(st) => st,
-            Err(_) => return (0, 0),
+            Err(e) => {
+                if fail_fast {
+                    return Err(rerr(STEP_REV_PRUNE, &e));
+                }
+                return Ok((0, 0));
+            }
         };
         let rows = match st.query_map([], |row| {
             Ok((
@@ -247,26 +433,36 @@ fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
                 row.get::<_, Option<String>>(3)?,
             ))
         }) {
-            Ok(it) => it.filter_map(Result::ok).collect::<Vec<_>>(),
-            Err(_) => return (0, 0),
-        };
-        for (msg_id, rev, rev_payload, msg_payload) in rows {
-            let (Some(rp), Some(mp)) = (rev_payload, msg_payload) else {
-                continue;
-            };
-            // Canonical hashing: key order cannot hide a real change,
-            // and an unhashable payload is never "representation-only".
-            let same = match (writer::content_hash(&rp), writer::content_hash(&mp)) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
-            if same {
-                prune.push((msg_id, rev));
+            Ok(it) => it,
+            Err(e) => {
+                if fail_fast {
+                    return Err(rerr(STEP_REV_PRUNE, &e));
+                }
+                return Ok((0, 0));
             }
+        };
+        match gather_rows(rows, fail_fast, STEP_REV_PRUNE) {
+            Ok(rows) => {
+                for (msg_id, rev, rev_payload, msg_payload) in rows {
+                    let (Some(rp), Some(mp)) = (rev_payload, msg_payload) else {
+                        continue;
+                    };
+                    // Canonical hashing: key order cannot hide a real change,
+                    // and an unhashable payload is never "representation-only".
+                    let same = match (writer::content_hash(&rp), writer::content_hash(&mp)) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    };
+                    if same {
+                        prune.push((msg_id, rev));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
     if prune.is_empty() {
-        return (0, 0);
+        return Ok((0, 0));
     }
     let mut pruned = 0usize;
     {
@@ -274,10 +470,24 @@ fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
             .prepare("DELETE FROM message_revisions WHERE msg_id = ?1 AND rev = ?2")
         {
             Ok(st) => st,
-            Err(_) => return (0, 0),
+            Err(e) => {
+                if fail_fast {
+                    return Err(rerr(STEP_REV_PRUNE, &e));
+                }
+                return Ok((0, 0));
+            }
         };
         for (msg_id, rev) in &prune {
-            pruned += del.execute(rusqlite::params![msg_id, rev]).unwrap_or(0);
+            let n = match del.execute(rusqlite::params![msg_id, rev]) {
+                Ok(n) => n,
+                Err(e) => {
+                    if fail_fast {
+                        return Err(rerr(STEP_REV_PRUNE, &e));
+                    }
+                    0
+                }
+            };
+            pruned += n;
         }
     }
     // Each touched message: rev = the number of REMAINING revision rows
@@ -294,14 +504,28 @@ fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
                              WHERE r.msg_id = messages.msg_id)",
         ) {
             Ok(st) => st,
-            Err(_) => return (pruned, 0),
+            Err(e) => {
+                if fail_fast {
+                    return Err(rerr(STEP_REV_PRUNE, &e));
+                }
+                return Ok((pruned, 0));
+            }
         };
         let touched: std::collections::BTreeSet<&String> = prune.iter().map(|(m, _)| m).collect();
         for msg_id in touched {
-            reset += st.execute(rusqlite::params![msg_id]).unwrap_or(0);
+            let n = match st.execute(rusqlite::params![msg_id]) {
+                Ok(n) => n,
+                Err(e) => {
+                    if fail_fast {
+                        return Err(rerr(STEP_REV_PRUNE, &e));
+                    }
+                    0
+                }
+            };
+            reset += n;
         }
     }
-    (pruned, reset)
+    Ok((pruned, reset))
 }
 
 /// The same work as [`repair_v1`], run inside `BEGIN IMMEDIATE …
@@ -309,18 +533,99 @@ fn prune_ping_pong_revisions(conn: &Connection) -> (usize, usize) {
 /// is provably untouched (audit §1.2 risk note: run the migration on a
 /// copy first and compare). The caller supplies a COPY of the live DB
 /// (`maint_repair` does); a failed BEGIN reports zero everywhere.
+/// Batch 20: implemented on the shared core (count policy).
 pub fn repair_v1_dry_run(conn: &Connection, own_uid: Option<&str>) -> RepairReport {
-    if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
-        return RepairReport::default();
+    dry_run_impl(conn, own_uid, false).0
+}
+
+/// (S1, batch 20) The checked variant the CLI's idempotence probe
+/// drives: `BEGIN IMMEDIATE`, the checked core, then `ROLLBACK`
+/// ALWAYS — on success and on error alike; a COMMIT never runs. The
+/// report shows what a second pass WOULD still change (all zeros on a
+/// repaired DB).
+pub fn repair_v1_dry_run_checked(
+    conn: &Connection,
+    own_uid: Option<&str>,
+) -> Result<RepairReport, RepairError> {
+    let (r, err) = dry_run_impl(conn, own_uid, true);
+    match err {
+        None => Ok(r),
+        Some(e) => Err(e),
     }
-    let r = repair_v1(conn, own_uid);
+}
+
+/// One `BEGIN IMMEDIATE … (core) … ROLLBACK` pass over the error
+/// policies (the shared core's dry-run twin: `false` is the
+/// pre-batch-20 behaviour, `true` aborts at the first SQL failure).
+fn dry_run_impl(
+    conn: &Connection,
+    own_uid: Option<&str>,
+    fail_fast: bool,
+) -> (RepairReport, Option<RepairError>) {
+    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+        // A failed BEGIN reports zero everywhere (the pre-batch-20
+        // behaviour); the checked variant surfaces the kind.
+        return (
+            RepairReport::default(),
+            Some(RepairError {
+                step: STEP_BEGIN,
+                kind: sqlite_kind(&e),
+            }),
+        );
+    }
+    let (r, err) = repair_v1_impl(conn, own_uid, fail_fast);
+    // ROLLBACK always — even on error, and never COMMIT. One
+    // best-effort retry for an odd savepoint state, then whatever
+    // happens, no COMMIT ever runs.
     if conn.execute_batch("ROLLBACK").is_err() {
-        // The transaction died mid-run: nothing was committed (every
-        // step ran inside it). One best-effort retry for an odd
-        // savepoint state, then whatever happens, no COMMIT ever runs.
         let _ = conn.execute_batch("ROLLBACK");
     }
-    r
+    (r, err)
+}
+
+/// The two counts lines the maintenance probe (`maint_repair`) and the
+/// repair CLI print — moved from the probe (batch 20) so both print
+/// IDENTICAL shapes. Counts only (H-rule: no row data, ids or
+/// content); a query that fails reads -1.
+pub fn counts_lines(conn: &Connection) -> Vec<String> {
+    let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    vec![
+        format!(
+            "messages={} conversations={} revisions={} attachments={} raw_events={} contacts={} groups={}",
+            q("SELECT COUNT(*) FROM messages"),
+            q("SELECT COUNT(*) FROM conversations"),
+            q("SELECT COUNT(*) FROM message_revisions"),
+            q("SELECT COUNT(*) FROM attachments"),
+            q("SELECT COUNT(*) FROM raw_events"),
+            q("SELECT COUNT(*) FROM contacts"),
+            q("SELECT COUNT(*) FROM groups"),
+        ),
+        format!(
+            "sender_null={} self_sent_sender_null={} msgs_without_conv_row={} convs_lastmsg_not_newest={} rev_gt0={}",
+            q("SELECT COUNT(*) FROM messages WHERE sender_id IS NULL"),
+            q("SELECT COUNT(*) FROM messages WHERE json_extract(payload_json,'$.uidFrom')='0' AND sender_id IS NULL"),
+            q("SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id=m.conv_id)"),
+            q("SELECT COUNT(*) FROM conversations c JOIN messages m ON m.msg_id=c.last_msg_id
+                 WHERE m.ts < (SELECT MAX(ts) FROM messages x WHERE x.conv_id=c.id)"),
+            q("SELECT COUNT(*) FROM messages WHERE rev>0"),
+        ),
+    ]
+}
+
+/// The report as ONE line, one counter per field — the CLI's printable
+/// shape (counts only; the caller adds its own `report: ` prefix).
+pub fn report_fields(r: &RepairReport) -> String {
+    format!(
+        "conv_stubs_created={} last_msg_fixed={} content_hash_filled={} \
+         types_remapped={} senders_backfilled={} revisions_pruned={} revs_reset={}",
+        r.conv_stubs_created,
+        r.last_msg_fixed,
+        r.content_hash_filled,
+        r.types_remapped,
+        r.senders_backfilled,
+        r.revisions_pruned,
+        r.revs_reset,
+    )
 }
 
 #[cfg(test)]
@@ -752,5 +1057,88 @@ mod tests {
         let after = checksum(&conn);
         let _ = repair_v1(&conn, Some(UID));
         assert_eq!(checksum(&conn), after, "third run changes nothing");
+    }
+
+    // --- batch 20 S1: the checked core --------------------------------------
+
+    /// Lighter than `checksum`: it must also work on a DB whose
+    /// `message_revisions` table is gone (the checked-core fixture).
+    fn light_state(conn: &Connection) -> (i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM conversations),
+                    (SELECT COUNT(*) FROM messages WHERE content_hash IS NULL),
+                    (SELECT COUNT(*) FROM messages WHERE sender_id IS NULL),
+                    (SELECT COALESCE(SUM(type),0) FROM messages)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repair_v1_checked_names_the_step_and_the_count_policy_keeps_counting() {
+        // Drop a table step (f) needs. The count policy runs FIRST (a
+        // bare connection autocommits, so the checked run's partial
+        // work would otherwise land before the count run's asserts):
+        // the good steps still report (cA stub + hash fill), (f)
+        // contributes its zero — the pre-batch-20 behaviour.
+        let conn = db();
+        legacy_msg(&conn, "a1", "cA", 300);
+        conn.execute("DROP TABLE message_revisions", []).unwrap();
+        let r = repair_v1(&conn, None);
+        assert_eq!(r.conv_stubs_created, 1);
+        assert_eq!(r.content_hash_filled, 1);
+        assert_eq!(r.revisions_pruned, 0);
+        assert_eq!(r.revs_reset, 0);
+
+        // The checked core over the same DB: nothing is left to do in
+        // steps (a)-(e), so the FIRST SQL failure is step (f)'s
+        // prepare — named, with a kind, never the error text.
+        let e = repair_v1_checked(&conn, None).unwrap_err();
+        assert_eq!(e.step, STEP_REV_PRUNE);
+        assert!(!e.kind.is_empty(), "a sqlite kind, never the error text");
+    }
+
+    #[test]
+    fn repair_v1_dry_run_checked_reports_the_same_and_never_commits() {
+        // The happy path: the checked dry run reports EXACTLY what the
+        // plain dry run reports, and persists nothing either.
+        const UID: &str = "1234567890123456789"; // fake, valid shape
+        let conn = db();
+        legacy_msg(&conn, "a1", "cA", 300);
+        revision(&conn, "a1", 1, "edit", &legacy_payload("a1"));
+        let before = checksum(&conn);
+        let plain = repair_v1_dry_run(&conn, Some(UID));
+        let checked = repair_v1_dry_run_checked(&conn, Some(UID)).unwrap();
+        assert_eq!(plain, checked);
+        assert_eq!(checked.revisions_pruned, 1, "the ping-pong edit");
+        assert_eq!(checksum(&conn), before, "no COMMIT ever ran");
+    }
+
+    #[test]
+    fn repair_v1_dry_run_checked_rolls_back_even_on_error() {
+        // The failure arm: a step error inside the BEGIN must still
+        // end ROLLBACK-ed (never COMMIT) — the DB equals its pre-run
+        // state even though steps (a)-(e) had already done work inside
+        // the transaction.
+        let conn = db();
+        legacy_msg(&conn, "a1", "cA", 300);
+        conn.execute("DROP TABLE message_revisions", []).unwrap();
+        let before = light_state(&conn);
+        let e = repair_v1_dry_run_checked(&conn, None).unwrap_err();
+        assert_eq!(e.step, STEP_REV_PRUNE);
+        assert_eq!(light_state(&conn), before, "the failed pass rolled back");
+        // The plain dry run over the same DB keeps its swallow-and-count
+        // behaviour (zeros for (f), work reported for the rest).
+        let r = repair_v1_dry_run(&conn, None);
+        assert_eq!(r.conv_stubs_created, 1);
+        assert_eq!(r.revisions_pruned, 0);
+        assert_eq!(light_state(&conn), before, "still untouched");
+    }
+
+    /// The payload `legacy_msg` stores for `msg_id` (the revision
+    /// fixture hashes equal to it — the representation-only case).
+    fn legacy_payload(msg_id: &str) -> String {
+        format!(r#"{{"msgId":"{msg_id}","msgType":"text","content":"c"}}"#)
     }
 }

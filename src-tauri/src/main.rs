@@ -20,6 +20,19 @@ fn main() {
         let code = zalors_lib::shadow::cli::main(&args[2..]);
         std::process::exit(code);
     }
+
+    // Batch 20 (audit T8): `zalors repair …` dispatches the same way —
+    // the guarded repair CLI runs before Tauri starts, attaches the
+    // parent console like the import branch, and exits with the CLI's
+    // code (0 ok/help · 1 runtime refusal/failure · 2 parse error).
+    if std::env::args().nth(1).as_deref() == Some("repair") {
+        #[cfg(windows)]
+        attach_parent_console();
+        let args: Vec<String> = std::env::args().collect();
+        let code = zalors_lib::shadow::repair_cli::main(&args[2..]);
+        std::process::exit(code);
+    }
+
     zalors_lib::run();
 }
 

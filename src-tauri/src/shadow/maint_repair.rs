@@ -20,27 +20,12 @@
 use rusqlite::Connection;
 
 /// Counts only (H-rule): no row data, ids or content ever printed.
+/// (Batch 20: the queries moved into `repair::counts_lines` so the
+/// probe and the repair CLI print identical shapes.)
 fn print_counts(conn: &Connection) {
-    let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
-    println!(
-        "messages={} conversations={} revisions={} attachments={} raw_events={} contacts={} groups={}",
-        q("SELECT COUNT(*) FROM messages"),
-        q("SELECT COUNT(*) FROM conversations"),
-        q("SELECT COUNT(*) FROM message_revisions"),
-        q("SELECT COUNT(*) FROM attachments"),
-        q("SELECT COUNT(*) FROM raw_events"),
-        q("SELECT COUNT(*) FROM contacts"),
-        q("SELECT COUNT(*) FROM groups"),
-    );
-    println!(
-        "sender_null={} self_sent_sender_null={} msgs_without_conv_row={} convs_lastmsg_not_newest={} rev_gt0={}",
-        q("SELECT COUNT(*) FROM messages WHERE sender_id IS NULL"),
-        q("SELECT COUNT(*) FROM messages WHERE json_extract(payload_json,'$.uidFrom')='0' AND sender_id IS NULL"),
-        q("SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id=m.conv_id)"),
-        q("SELECT COUNT(*) FROM conversations c JOIN messages m ON m.msg_id=c.last_msg_id
-             WHERE m.ts < (SELECT MAX(ts) FROM messages x WHERE x.conv_id=c.id)"),
-        q("SELECT COUNT(*) FROM messages WHERE rev>0"),
-    );
+    for l in super::repair::counts_lines(conn) {
+        println!("{l}");
+    }
 }
 
 #[test]
