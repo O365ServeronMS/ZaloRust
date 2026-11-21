@@ -457,6 +457,15 @@ fn flusher(
                                 drained.failed
                             ));
                         }
+                        // R1 (batch 21): a drain that had failures emits
+                        // ONE more line — the per-(safe_endpoint, kind)
+                        // tally, counts and safe endpoint paths only.
+                        if drained.failed > 0 {
+                            crate::dlog::log(&format!(
+                                "shadow rest pending drain fail: {}",
+                                drained.fail_tally.render()
+                            ));
+                        }
                         for _ in 0..drained.decoded() {
                             rest_stats::bump(RestStage::PendingDecoded);
                         }
@@ -547,10 +556,12 @@ fn flusher(
                             continue;
                         }
                     };
-                    let env = wire::rest_envelope(&endpoint, &outer, rest_key.as_ref());
-                    // C2: decoded / undecoded / no-key buckets from the
-                    // envelope's `undecoded` flag (counts only).
-                    rest_stats::bump_rest_decode(&outer, &env);
+                    let (env, outcome) =
+                        wire::rest_envelope_outcome(&endpoint, &outer, rest_key.as_ref());
+                    // C2 + batch 21 R1: decoded / undecoded / no-key
+                    // buckets from the envelope's `undecoded` flag,
+                    // plus the undecoded kind breakdown (counts only).
+                    rest_stats::bump_rest_decode(&outer, &env, outcome);
                     items.push(pipeline::Incoming {
                         kind: "rest",
                         direction,
@@ -1013,6 +1024,27 @@ mod tests {
         sqlcipher::open_with_key(path, key).unwrap()
     }
 
+    /// R3 (batch 21): best-effort removal of one run's temp store (db
+    /// + `-wal`/`-shm`) when the guard drops — even on a failed
+    /// assert. The flusher tests used to leave every
+    /// `zr-flusher-test-*` file behind in `%TEMP%`.
+    struct StoreFilesGuard(std::path::PathBuf);
+
+    impl Drop for StoreFilesGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let (name, parent) = (
+                self.0.file_name().map(|n| n.to_string_lossy().into_owned()),
+                self.0.parent().map(std::path::Path::to_path_buf),
+            );
+            if let (Some(name), Some(parent)) = (name, parent) {
+                for suffix in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(parent.join(format!("{name}{suffix}")));
+                }
+            }
+        }
+    }
+
     #[test]
     fn flusher_holds_no_key_rest_bodies_until_the_handshake() {
         let _guard = REST_FLUSH_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1028,6 +1060,7 @@ mod tests {
             },
             Job::Handshake { key_b64: b64_key(key), uid: None },
         ]);
+        let _store = StoreFilesGuard(path.clone());
         let conn = open_store(&path, &file_key);
         // Exactly one no-key row (truncated audit trail) and one
         // DECODED row, in that order — the decoded row is a NEW row,
@@ -1104,6 +1137,7 @@ mod tests {
             },
             Job::Handshake { key_b64: b64_key(armed), uid: None },
         ]);
+        let _store = StoreFilesGuard(path.clone());
         let conn = open_store(&path, &file_key);
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM raw_events WHERE kind = 'rest'", [], |r| r.get(0))
@@ -1149,6 +1183,7 @@ mod tests {
                 direction: "in",
             },
         ]);
+        let _store = StoreFilesGuard(path.clone());
         let conn = open_store(&path, &file_key);
         // One DECODED row only — no no-key row ever existed.
         let (total, decoded): (i64, i64) = conn
@@ -1188,6 +1223,7 @@ mod tests {
             body: serde_json::to_vec(&outer).unwrap(),
             direction: "in",
         }]);
+        let _store = StoreFilesGuard(path.clone());
         let conn = open_store(&path, &file_key);
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM raw_events WHERE kind = 'rest'", [], |r| r.get(0))

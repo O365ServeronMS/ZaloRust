@@ -833,5 +833,15 @@ mod probe_fts_bench {
                 "the helper must survive the TEXT/cipher_page_size answer the naive read fails on"
             ),
         }
+        // R4 (batch 21): the probe's two remaining integer-typed pragma
+        // reads (`pages_before`/`pages_after`) are `PRAGMA page_count`
+        // — pin that THIS build still answers INTEGER there, so a codec
+        // update that starts answering TEXT (as page_size/cipher_page_size
+        // does) fails THIS test first instead of aborting the probe.
+        let naive_count: Result<i64, _> = conn.query_row("PRAGMA page_count", [], |r| r.get(0));
+        assert!(
+            naive_count.is_ok(),
+            "PRAGMA page_count must stay integer-readable (the probe reads it as i64)"
+        );
     }
 }

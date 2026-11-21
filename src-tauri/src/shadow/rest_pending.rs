@@ -34,13 +34,13 @@
 //! derive `Debug` — a `{:?}` of a held body would dump the user's
 //! ciphertext and the raw endpoint (URLs can carry query-string ids).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::Value;
 use zeroize::Zeroize;
 
 use super::pipeline;
-use super::rest_stats::{self, RestDecode};
+use super::wire::RestOutcome;
 use super::{capture, wire};
 
 /// At most this many bodies ride the queue (R1).
@@ -84,12 +84,72 @@ pub struct DrainOutcome {
     /// Bodies that still failed to decode with the new key (the
     /// caller counts them `rest_stats::PendingFailed`; already wiped).
     pub failed: usize,
+    /// R1 (batch 21): WHY each failed body failed, per
+    /// `(safe_endpoint, kind)` — the caller logs ONE line from
+    /// [`FailTally::render`] after a drain that had failures.
+    pub fail_tally: FailTally,
 }
 
 impl DrainOutcome {
     /// How many bodies decoded (== `items.len()`).
     pub fn decoded(&self) -> usize {
         self.items.len()
+    }
+}
+
+/// R1 (batch 21): per-`(safe_endpoint, kind)` failure counts for one
+/// drain, bounded to [`FailTally::MAX_ENDPOINTS`] DISTINCT endpoint
+/// keys; failures past that bound land in the `other` endpoint bucket
+/// (the kind is kept). Counts only — safe endpoint paths and kind tags,
+/// never ciphertext, keys, ids or raw urls.
+#[derive(Debug, Default)]
+pub struct FailTally {
+    /// safe endpoint -> kind -> count (sorted: deterministic render).
+    rows: BTreeMap<String, BTreeMap<&'static str, u64>>,
+    /// the overflow endpoint bucket's kinds.
+    other: BTreeMap<&'static str, u64>,
+}
+
+impl FailTally {
+    /// At most this many DISTINCT endpoint keys (R1, batch 21);
+    /// further endpoints collapse into `other`.
+    pub const MAX_ENDPOINTS: usize = 16;
+
+    /// Count one failure. `safe_ep` must already be a
+    /// `capture::safe_endpoint` rendering.
+    pub fn record(&mut self, safe_ep: &str, kind: &'static str) {
+        if self.rows.contains_key(safe_ep) || self.rows.len() < Self::MAX_ENDPOINTS {
+            *self.rows.entry(safe_ep.to_string()).or_default().entry(kind).or_insert(0) += 1;
+        } else {
+            *self.other.entry(kind).or_insert(0) += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.other.is_empty()
+    }
+
+    /// Total failures tallied (== the drain's `failed` count).
+    pub fn total(&self) -> u64 {
+        self.rows.values().flat_map(|m| m.values()).sum::<u64>()
+            + self.other.values().sum::<u64>()
+    }
+
+    /// The one log line's payload (H-rule: safe endpoints + kind tags
+    /// + counts only): `<safe_ep> <kind>=<n> …; <safe_ep2> …; other …`.
+    pub fn render(&self) -> String {
+        let mut groups: Vec<String> = Vec::new();
+        for (ep, kinds) in &self.rows {
+            let parts: Vec<String> =
+                kinds.iter().map(|(k, n)| format!("{k}={n}")).collect();
+            groups.push(format!("{ep} {}", parts.join(" ")));
+        }
+        if !self.other.is_empty() {
+            let parts: Vec<String> =
+                self.other.iter().map(|(k, n)| format!("{k}={n}")).collect();
+            groups.push(format!("other {}", parts.join(" ")));
+        }
+        groups.join("; ")
     }
 }
 
@@ -188,29 +248,44 @@ impl PendingRest {
 
     /// Drain the whole queue with a freshly armed key (R1), in
     /// arrival order. Each held body is decoded with
-    /// `wire::rest_envelope`; a decoded body becomes a normal
+    /// `wire::rest_envelope_outcome`; a decoded body becomes a normal
     /// `pipeline::Incoming` (kind "rest", safe endpoint) — the
     /// caller's `process_batch` writes the NEW decoded raw row plus
-    /// the normalized writes. A body that still fails (or the
-    /// flagged string-`data` shape, R1) counts `failed`. Every entry
-    /// is wiped either way.
+    /// the normalized writes. A body that still fails counts
+    /// `failed` AND lands in the `(safe_endpoint, kind)` tally
+    /// (batch 21: `NoCipher`/`NoKey` are unreachable here — only
+    /// string-`data` bodies queue and the key is armed — but the
+    /// arms stay, so a future path change degrades honestly). Every
+    /// entry is wiped either way.
     pub fn drain_with_key(&mut self, key: &[u8; 16]) -> DrainOutcome {
         let mut out = DrainOutcome::default();
         while let Some(mut b) = self.queue.pop_front() {
             self.cipher_bytes -= Self::cipher_len(&b.outer);
-            let env = wire::rest_envelope(&b.endpoint, &b.outer, Some(key));
-            match rest_stats::classify_rest_envelope(&b.outer, &env) {
-                RestDecode::Decoded => out.items.push(pipeline::Incoming {
+            // R1 (batch 21): the outcome and the stored envelope come
+            // from the SAME decode call, so the outcome is the drain's
+            // single source of truth (the flag-based classify stays
+            // the arrival-path counters' source in `rest_stats`).
+            let (env, outcome) = wire::rest_envelope_outcome(&b.endpoint, &b.outer, Some(key));
+            match outcome {
+                RestOutcome::Decoded => out.items.push(pipeline::Incoming {
                     kind: "rest",
                     direction: b.direction,
                     endpoint: capture::safe_endpoint(&b.endpoint),
                     env,
                 }),
-                // `Undecoded` is the expected failure; `NoKey`/`NoCipher`
-                // are unreachable through the flusher (the key is armed
-                // and only string-`data` bodies queue) — counted, never
-                // asserted, so a future path change degrades honestly.
-                _ => out.failed += 1,
+                RestOutcome::NoCipher => {
+                    // Unreachable through the flusher (only
+                    // string-`data` bodies queue) — counted and
+                    // tallied, never asserted.
+                    out.failed += 1;
+                    out.fail_tally.record(&capture::safe_endpoint(&b.endpoint), "no_cipher");
+                }
+                RestOutcome::Failed(kind) => {
+                    // `Failed(NoKey)` is likewise unreachable (the
+                    // key is armed here) — the arm keeps it honest.
+                    out.failed += 1;
+                    out.fail_tally.record(&capture::safe_endpoint(&b.endpoint), kind.tag());
+                }
             }
             wipe_body(&mut b);
         }
@@ -413,5 +488,64 @@ mod tests {
         assert_eq!(out.failed, 1);
         assert_eq!(out.decoded(), 0);
         assert!(q.is_empty());
+    }
+
+    // --- R1 (batch 21): the drain failure tally --------------------------
+
+    #[test]
+    fn fail_tally_bounds_endpoints_and_keeps_the_kind() {
+        let mut t = FailTally::default();
+        assert!(t.is_empty());
+        // Fill the bound with DISTINCT endpoints, each with a failure.
+        for i in 0..FailTally::MAX_ENDPOINTS {
+            t.record(&format!("/e{i}"), "bad_padding");
+        }
+        // The 17th DISTINCT endpoint overflows; the kind survives.
+        t.record("/e-overflow", "not_json");
+        t.record("/e-overflow", "not_json");
+        // An EXISTING endpoint still counts in place, never `other`.
+        t.record("/e0", "opaque_data");
+        assert_eq!(t.total(), FailTally::MAX_ENDPOINTS as u64 + 3);
+        let line = t.render();
+        assert!(line.contains("/e0 bad_padding=1 opaque_data=1"), "{line}");
+        assert!(line.contains("other not_json=2"), "{line}");
+        assert!(!line.contains("/e-overflow"), "{line}");
+        assert!(line.contains("; "), "groups are `;`-separated: {line}");
+        // Counts, kinds and safe paths only — nothing else can appear.
+        for forbidden in ["https", "?", "zcid"] {
+            assert!(!line.contains(forbidden), "{line}");
+        }
+    }
+
+    #[test]
+    fn drain_tallies_failures_per_safe_endpoint_and_kind() {
+        let sealed = [0x11u8; 16]; // the bodies were sealed with this
+        let armed = [0x22u8; 16]; // but the handshake armed this
+        let mut q = PendingRest::new();
+        // Two wrong-key bodies on ONE endpoint (raw urls with query
+        // strings — only the safe path may ever render), one on another.
+        for ep in ["/a/get-last-msgs?zcid=fake-1", "/a/get-last-msgs?zcid=fake-2"] {
+            assert_eq!(q.push(ep.into(), real_outer("never", &sealed), "in", 1).evicted, 0);
+        }
+        assert_eq!(
+            q.push("/a/getprofiles/v2?zcid=fake".into(), real_outer("never2", &sealed), "in", 2)
+                .evicted,
+            0
+        );
+        let out = q.drain_with_key(&armed);
+        assert_eq!(out.failed, 3);
+        assert_eq!(out.fail_tally.total(), 3, "every failure is tallied exactly once");
+        let line = out.fail_tally.render();
+        assert!(line.contains("/a/get-last-msgs bad_padding=2"), "{line}");
+        assert!(line.contains("/a/getprofiles/v2 bad_padding=1"), "{line}");
+        assert!(!line.contains("zcid"), "no query string survives: {line}");
+        // A fully successful drain tallies nothing.
+        let mut q2 = PendingRest::new();
+        assert_eq!(q2.push("e".into(), real_outer("ok", &armed), "in", 1).evicted, 0);
+        let out2 = q2.drain_with_key(&armed);
+        assert_eq!(out2.failed, 0);
+        assert_eq!(out2.fail_tally.total(), 0);
+        assert!(out2.fail_tally.is_empty());
+        assert_eq!(out2.fail_tally.render(), "");
     }
 }

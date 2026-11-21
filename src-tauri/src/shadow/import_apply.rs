@@ -70,14 +70,13 @@ use std::path::PathBuf;
 
 use rusqlite::types::Value as SV;
 use rusqlite::Connection;
-use zeroize::Zeroizing;
 
 use super::cli::ImportArgs;
 use super::import::{self, distinct};
 use super::import_map::{self, CodedWrite, ImportCursor, MapDb, Verdict};
 use super::pipeline::sqlite_kind;
 use super::schema;
-use super::{db_file, key_file, Write};
+use super::{db_file, Write};
 
 /// Rows per write transaction (the brief's batch size).
 pub const APPLY_BATCH_ROWS: usize = 500;
@@ -1066,9 +1065,11 @@ mod tests {
     //! ever consults the real process table either.
 
     use super::*;
+    use super::super::key_file;
     use crate::migrate::sqlcipher;
     use serde_json::json;
     use std::path::Path;
+    use zeroize::Zeroizing;
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1505,6 +1506,11 @@ mod tests {
         assert_eq!(unmapped3.len(), 1);
         assert_eq!(unmapped3[0].rendered, "NULL");
         assert_eq!(unmapped3[0].rows, 1);
+        // R3 (batch 21): the two fixture DB connections must close
+        // BEFORE the cleanup — an open SQLite handle keeps the file
+        // locked on Windows and the removal fails silently.
+        drop(msg);
+        drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2161,6 +2167,11 @@ mod tests {
                 Some(import_map::ImportCursor { max_ts: 1690000005, max_rowid: 106 })
             );
         }
+        // R3 (batch 21): close the fixture connections before the
+        // cleanup (open handles lock the files on Windows).
+        drop(src);
+        drop(idx);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2477,6 +2488,12 @@ mod tests {
             stats2.uid_from_null_substituted, 0,
             "no substitution without an own uid"
         );
+        // R3 (batch 21): close every fixture connection before the
+        // cleanup (open handles lock the files on Windows).
+        drop(src);
+        drop(idx);
+        drop(conn);
+        drop(conn2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

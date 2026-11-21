@@ -28,16 +28,9 @@ use super::probe_util::h12;
 use super::schema;
 use crate::migrate::sqlcipher;
 
-fn live_dir() -> PathBuf {
-    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap())
-        .join("com.o365serveronms.zalors/shadow")
-}
-
-pub(crate) fn open_live() -> Connection {
-    let dir = live_dir();
-    let key = sqlcipher::load_key(&dir.join("default.key")).unwrap();
-    sqlcipher::open_with_key_readonly(&dir.join("default.db"), &key).unwrap()
-}
+// Batch 21 (R4, test-build warnings): the pre-1.0-c helpers that open
+// the LIVE store are gone — `open_oracle` (the frozen copy) replaced
+// them, and dead code in a cfg(test) module only ever warned.
 
 /// Frozen oracle (audit step 1.0-c, 2026-11-19): the live DB's
 /// `raw_events` is a 7-day ring, so the 13–14 Nov V1 input that this test
@@ -258,8 +251,8 @@ fn golden_replay_messages_and_conversations() {
         }
     }
 
-    let mut missing: Vec<&String> = live_msgs.keys().filter(|k| !repl_msgs.contains_key(*k)).collect();
-    let mut extra: Vec<&String> = repl_msgs.keys().filter(|k| !live_msgs.contains_key(*k)).collect();
+    let missing: Vec<&String> = live_msgs.keys().filter(|k| !repl_msgs.contains_key(*k)).collect();
+    let extra: Vec<&String> = repl_msgs.keys().filter(|k| !live_msgs.contains_key(*k)).collect();
     let mut conv_mismatch = 0;
     let mut ts_mismatch = 0;
     let mut sender_mismatch = 0;

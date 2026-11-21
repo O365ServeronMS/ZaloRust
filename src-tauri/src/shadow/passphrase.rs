@@ -1216,6 +1216,8 @@ mod tests {
         remove_marker(&dir).unwrap();
         remove_marker(&dir).unwrap();
         assert_eq!(read_mode(&dir), StoreKeyMode::Raw);
+        // R3 (batch 21): the scratch dir is the test's to clean up.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- validation + throttle --------------------------------------------
@@ -1289,6 +1291,8 @@ mod tests {
         assert!(load_remembered(&dir).is_err());
         // Idempotent delete.
         forget_remembered(&dir).unwrap();
+        // R3 (batch 21): the scratch dir is the test's to clean up.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- the full R5 conversion lifecycle -----------------------------------
@@ -1985,6 +1989,8 @@ mod tests {
             open_store(&bare, true),
             Err(StoreOpenError::Other(_))
         ));
+        // R3 (batch 21): both scratch dirs are the test's to clean up.
+        let _ = std::fs::remove_dir_all(&bare);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

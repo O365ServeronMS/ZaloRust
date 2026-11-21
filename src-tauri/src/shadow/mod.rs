@@ -321,6 +321,13 @@ mod probe_audit;
 #[cfg(test)]
 mod probe_coverage;
 
+/// No-key REST census probe (batch 21 R2): per safe endpoint, how many
+/// `undecoded:"no-key"` rows have a decoded row within the 10-minute
+/// drain window — the visible drain-success rate. Ignored: reads a
+/// temp COPY of the live store.
+#[cfg(test)]
+mod probe_rest_nokey;
+
 /// E2EE coverage probe (audit §4 item 1.5 AC iv, batch 10 J3): every
 /// cmd-551 msgId is either plaintext `source='e2ee'` or listed. Pure
 /// census unit-tested; the ignored test reads a temp COPY.

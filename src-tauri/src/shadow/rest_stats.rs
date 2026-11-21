@@ -116,6 +116,15 @@ pub struct RestStageCounters {
     pub pending_failed: AtomicU64,
     pub pending_evicted: AtomicU64,
     pub api_host_unmatched: AtomicU64,
+    /// R1 (batch 21): the per-kind breakdown of the `undecoded` bucket
+    /// (arrival-time decodes with an armed key). Their sum always
+    /// equals `undecoded` through the live path.
+    pub undecoded_bad_b64: AtomicU64,
+    pub undecoded_bad_len: AtomicU64,
+    pub undecoded_bad_padding: AtomicU64,
+    pub undecoded_not_utf8: AtomicU64,
+    pub undecoded_not_json: AtomicU64,
+    pub undecoded_opaque_data: AtomicU64,
 }
 
 pub static REST_STAGES: RestStageCounters = RestStageCounters {
@@ -139,6 +148,12 @@ pub static REST_STAGES: RestStageCounters = RestStageCounters {
     pending_failed: AtomicU64::new(0),
     pending_evicted: AtomicU64::new(0),
     api_host_unmatched: AtomicU64::new(0),
+    undecoded_bad_b64: AtomicU64::new(0),
+    undecoded_bad_len: AtomicU64::new(0),
+    undecoded_bad_padding: AtomicU64::new(0),
+    undecoded_not_utf8: AtomicU64::new(0),
+    undecoded_not_json: AtomicU64::new(0),
+    undecoded_opaque_data: AtomicU64::new(0),
 };
 
 /// A point-in-time copy of all stage counters (for formatting and the
@@ -165,6 +180,13 @@ pub struct RestStageSnapshot {
     pub pending_failed: u64,
     pub pending_evicted: u64,
     pub api_host_unmatched: u64,
+    /// R1 (batch 21): per-kind breakdown of `undecoded`.
+    pub undecoded_bad_b64: u64,
+    pub undecoded_bad_len: u64,
+    pub undecoded_bad_padding: u64,
+    pub undecoded_not_utf8: u64,
+    pub undecoded_not_json: u64,
+    pub undecoded_opaque_data: u64,
 }
 
 impl RestStageSnapshot {
@@ -191,6 +213,12 @@ impl RestStageSnapshot {
             pending_failed: 0,
             pending_evicted: 0,
             api_host_unmatched: 0,
+            undecoded_bad_b64: 0,
+            undecoded_bad_len: 0,
+            undecoded_bad_padding: 0,
+            undecoded_not_utf8: 0,
+            undecoded_not_json: 0,
+            undecoded_opaque_data: 0,
         }
     }
 }
@@ -249,6 +277,57 @@ impl RestStageCounters {
             pending_failed: self.pending_failed.load(Relaxed),
             pending_evicted: self.pending_evicted.load(Relaxed),
             api_host_unmatched: self.api_host_unmatched.load(Relaxed),
+            undecoded_bad_b64: self.undecoded_bad_b64.load(Relaxed),
+            undecoded_bad_len: self.undecoded_bad_len.load(Relaxed),
+            undecoded_bad_padding: self.undecoded_bad_padding.load(Relaxed),
+            undecoded_not_utf8: self.undecoded_not_utf8.load(Relaxed),
+            undecoded_not_json: self.undecoded_not_json.load(Relaxed),
+            undecoded_opaque_data: self.undecoded_opaque_data.load(Relaxed),
+        }
+    }
+
+    /// The per-kind counter for one undecoded kind (R1, batch 21);
+    /// `None` for `NoKey` — that bucket has its own named counter.
+    fn fail_kind_field(&self, k: crate::shadow::wire::RestFail) -> Option<&AtomicU64> {
+        use crate::shadow::wire::RestFail as F;
+        Some(match k {
+            F::BadB64 => &self.undecoded_bad_b64,
+            F::BadLen => &self.undecoded_bad_len,
+            F::BadPadding => &self.undecoded_bad_padding,
+            F::NotUtf8 => &self.undecoded_not_utf8,
+            F::NotJson => &self.undecoded_not_json,
+            F::OpaqueData => &self.undecoded_opaque_data,
+            F::NoKey => return None,
+        })
+    }
+
+    /// C2 + R1 (batch 21): one REST envelope's full counter effect on
+    /// THIS instance (no logging) — the bucket still comes from the
+    /// stored envelope's flag (`classify_rest_envelope`, defense in
+    /// depth), and the kind breakdown rides the outcome from the same
+    /// decode call. Kindless outcomes (a hand-built legacy pair that
+    /// still classifies undecoded) degrade honestly to the bucket with
+    /// no kind — never asserted.
+    pub fn bump_rest_decode_on(
+        &self,
+        outer: &Value,
+        env: &Value,
+        outcome: crate::shadow::wire::RestOutcome,
+    ) {
+        match classify_rest_envelope(outer, env) {
+            RestDecode::Decoded => self.bump_on(RestStage::Decoded),
+            RestDecode::Undecoded => {
+                if let crate::shadow::wire::RestOutcome::Failed(k) = outcome {
+                    if let Some(c) = self.fail_kind_field(k) {
+                        // The kind bumps FIRST so a summary line emitted
+                        // by the bucket bump below already shows it.
+                        c.fetch_add(1, Relaxed);
+                    }
+                }
+                self.bump_on(RestStage::Undecoded);
+            }
+            RestDecode::NoKey => self.bump_on(RestStage::NoKey),
+            RestDecode::NoCipher => {}
         }
     }
 }
@@ -260,14 +339,19 @@ pub fn bump(s: RestStage) {
 }
 
 /// Pure: the one summary line (cumulative counts only). The pending
-/// group (R1, batch 19) carries the no-key hold queue's lifecycle.
+/// group (R1, batch 19) carries the no-key hold queue's lifecycle; the
+/// `undecoded_kinds` group (R1, batch 21) breaks the `undecoded` bucket
+/// down by decode stage. Every pre-existing field keeps its name and
+/// position.
 pub fn format_stage_line(s: &RestStageSnapshot) -> String {
     format!(
         "shadow rest stages: seen={} api={} finished={} failed={} \
          body_ok={} body_err=(notjson {} nobody {} badb64 {} empty {}) \
          call_err={} delivered={} outer_json_err={} decoded={} undecoded={} \
          no_key={} pending=(queued {} decoded {} failed {} evicted {}) \
-         host_unmatched={} (cumulative)",
+         host_unmatched={} \
+         undecoded_kinds=(bad_b64 {} bad_len {} bad_padding {} not_utf8 {} \
+         not_json {} opaque {}) (cumulative)",
         s.response_seen,
         s.api_matched,
         s.finished_seen,
@@ -287,7 +371,13 @@ pub fn format_stage_line(s: &RestStageSnapshot) -> String {
         s.pending_decoded,
         s.pending_failed,
         s.pending_evicted,
-        s.api_host_unmatched
+        s.api_host_unmatched,
+        s.undecoded_bad_b64,
+        s.undecoded_bad_len,
+        s.undecoded_bad_padding,
+        s.undecoded_not_utf8,
+        s.undecoded_not_json,
+        s.undecoded_opaque_data
     )
 }
 
@@ -343,14 +433,12 @@ pub fn classify_rest_envelope(outer: &Value, env: &Value) -> RestDecode {
 }
 
 /// Flusher-side bump for one `Job::RestBody` (C2). No-op for
-/// `NoCipher` bodies — the three named buckets stay honest.
-pub fn bump_rest_decode(outer: &Value, env: &Value) {
-    match classify_rest_envelope(outer, env) {
-        RestDecode::Decoded => bump(RestStage::Decoded),
-        RestDecode::Undecoded => bump(RestStage::Undecoded),
-        RestDecode::NoKey => bump(RestStage::NoKey),
-        RestDecode::NoCipher => {}
-    }
+/// `NoCipher` bodies — the three named buckets stay honest. R1
+/// (batch 21): the outcome from `wire::rest_envelope_outcome` adds
+/// the per-kind breakdown of the `undecoded` bucket.
+pub fn bump_rest_decode(outer: &Value, env: &Value, outcome: crate::shadow::wire::RestOutcome) {
+    REST_STAGES.bump_rest_decode_on(outer, env, outcome);
+    maybe_log();
 }
 
 /// Last logged line: when it was emitted and the counts it showed.
@@ -395,7 +483,9 @@ mod tests {
              body_err=(notjson 0 nobody 0 badb64 0 empty 0) call_err=0 \
              delivered=0 outer_json_err=0 decoded=0 undecoded=0 no_key=0 \
              pending=(queued 0 decoded 0 failed 0 evicted 0) \
-             host_unmatched=0 (cumulative)"
+             host_unmatched=0 \
+             undecoded_kinds=(bad_b64 0 bad_len 0 bad_padding 0 not_utf8 0 \
+             not_json 0 opaque 0) (cumulative)"
         );
         let mut s = zero;
         s.response_seen = 100;
@@ -411,6 +501,7 @@ mod tests {
         s.pending_decoded = 1;
         s.pending_failed = 2;
         s.pending_evicted = 3;
+        s.undecoded_bad_padding = 1;
         let line = format_stage_line(&s);
         assert!(line.contains("seen=100 api=7 finished=5 failed=1"), "{line}");
         assert!(line.contains("body_ok=4"), "{line}");
@@ -419,6 +510,13 @@ mod tests {
         assert!(line.contains("decoded=3 undecoded=1 no_key=0"), "{line}");
         assert!(line.contains("pending=(queued 1 decoded 1 failed 2 evicted 3)"), "{line}");
         assert!(line.contains("host_unmatched=0"), "{line}");
+        // R1 (batch 21): the kind group rides the SAME line, appended
+        // after every pre-existing field.
+        assert!(
+            line.contains("undecoded_kinds=(bad_b64 0 bad_len 0 bad_padding 1 \
+             not_utf8 0 not_json 0 opaque 0)"),
+            "{line}"
+        );
         assert!(line.ends_with("(cumulative)"), "{line}");
         // The line is built from a fixed template and integers only —
         // no url, host, requestId or body fragment can ever appear.
@@ -493,6 +591,59 @@ mod tests {
         // The pure helpers compose with a snapshot diff.
         let zero = RestStageSnapshot::zeroed();
         assert!(log_due(120_000, 0, &zero, &s));
+    }
+
+    #[test]
+    fn undecoded_kinds_break_down_the_undecoded_bucket_only() {
+        // R1 (batch 21): a LOCAL instance (no statics), driven through
+        // the real decode path — every undecoded body bumps exactly one
+        // kind, and no other bucket ever moves a kind counter.
+        use crate::shadow::wire::{self, RestFail, RestOutcome};
+        let c = RestStageCounters::default();
+        let key = [0x33u8; 16];
+        let ep = "https://wpa.chat.zalo.me/a/x";
+        // (a) A wrong-key decrypt -> undecoded + bad_padding.
+        let inner = json!({"error_code": 0, "data": {"convs": [1, 2, 3]}});
+        let outer = json!({"error_code": 0, "data": wire::test_encode_rest(&inner, &key)});
+        let (env, out) = wire::rest_envelope_outcome(ep, &outer, Some(&[9u8; 16]));
+        assert_eq!(out, RestOutcome::Failed(RestFail::BadPadding));
+        c.bump_rest_decode_on(&outer, &env, out);
+        // (b) The opaque-string decrypt -> undecoded + opaque_data.
+        let sinner = json!({"error_code": 0, "data": "still-a-string"});
+        let souter = json!({"error_code": 0, "data": wire::test_encode_rest(&sinner, &key)});
+        let (env, out) = wire::rest_envelope_outcome(ep, &souter, Some(&key));
+        assert_eq!(out, RestOutcome::Failed(RestFail::OpaqueData));
+        c.bump_rest_decode_on(&souter, &env, out);
+        // (c) Decoded, no-key and no-cipher bodies never touch the kinds.
+        let (env, out) = wire::rest_envelope_outcome(ep, &outer, Some(&key));
+        assert_eq!(out, RestOutcome::Decoded);
+        c.bump_rest_decode_on(&outer, &env, out);
+        let (env, out) = wire::rest_envelope_outcome(ep, &outer, None);
+        assert_eq!(out, RestOutcome::Failed(RestFail::NoKey));
+        c.bump_rest_decode_on(&outer, &env, out);
+        let plain = json!({"error_code": 0, "data": {"plain": true}});
+        let (env, out) = wire::rest_envelope_outcome(ep, &plain, Some(&key));
+        assert_eq!(out, RestOutcome::NoCipher);
+        c.bump_rest_decode_on(&plain, &env, out);
+        // The kinds sum to the undecoded bucket, and each body landed
+        // in its own kind.
+        let s = c.snapshot();
+        assert_eq!(s.undecoded, 2);
+        assert_eq!(
+            s.undecoded_bad_b64
+                + s.undecoded_bad_len
+                + s.undecoded_bad_padding
+                + s.undecoded_not_utf8
+                + s.undecoded_not_json
+                + s.undecoded_opaque_data,
+            s.undecoded,
+            "the kinds are exactly the undecoded bucket"
+        );
+        assert_eq!(s.undecoded_bad_padding, 1);
+        assert_eq!(s.undecoded_opaque_data, 1);
+        assert_eq!(s.undecoded_bad_b64, 0);
+        assert_eq!(s.decoded, 1);
+        assert_eq!(s.no_key, 1);
     }
 
     #[test]

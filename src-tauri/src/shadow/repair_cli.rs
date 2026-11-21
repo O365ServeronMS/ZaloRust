@@ -46,7 +46,7 @@ use super::passphrase::{self, StoreKey};
 use super::pipeline::sqlite_kind;
 use super::repair;
 use super::schema;
-use super::{db_file, key_file};
+use super::db_file;
 use crate::migrate::sqlcipher;
 
 /// The usage text (`--help`, and after any parse error).
@@ -752,12 +752,37 @@ mod tests {
     //! process env or the real settings file.
 
     use super::*;
+    use super::super::key_file;
     use crate::migrate::sqlcipher;
     use std::path::Path;
     use zeroize::Zeroizing;
 
     /// A fake own uid of the documented shape (never a real one).
     const FAKE_UID: &str = "1234567890123456789";
+
+    /// R3 (batch 21): remove a temp dir when the guard drops — even
+    /// when an assert fails mid-test. The PRODUCTION dry run still
+    /// leaves its `zr-repair-dry-*` dir on purpose (documented); the
+    /// TESTS clean up every dir they cause.
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The temp dir a dry run printed (its "left on disk for
+    /// inspection" line), as a guard — `None` when the run refused
+    /// before making one (nothing to clean).
+    fn dry_tmp_of(lines: &[String]) -> Option<TempDirGuard> {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix("repair dry run: temp dir (left on disk for inspection): ")
+            })
+            .map(|p| TempDirGuard(PathBuf::from(p)))
+    }
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1131,10 +1156,15 @@ content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 r
     #[test]
     fn dry_run_reports_the_defects_and_never_touches_the_target() {
         let store = fixture_store("dryrun");
+        let _store_guard = TempDirGuard(store.clone());
         let before = sha256_file(&db_file(&store));
 
         let a = dry_args(&store);
         let (r, lines) = run_collect(&a, Some(FAKE_UID), || Some(false));
+        // R3: guards bind BEFORE the asserts (a failed run still
+        // cleans up its `zr-repair-dry-*` dir), and the dry run's dir
+        // is the one dir the run leaves on purpose — the TEST removes it.
+        let _tmp_guard = dry_tmp_of(&lines);
         r.unwrap();
         let joined = lines.join("\n");
 
@@ -1220,15 +1250,15 @@ content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 r
             assert_eq!(stubs, 0, "the target was NOT repaired");
             assert_eq!(sender, None, "the target's rows are untouched");
         }
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[test]
     fn dry_run_without_own_uid_skips_step_e() {
         let store = fixture_store("nouid");
+        let _store_guard = TempDirGuard(store.clone());
         let a = dry_args(&store);
         let (r, lines) = run_collect(&a, None, || Some(false));
+        let _tmp_guard = dry_tmp_of(&lines);
         r.unwrap();
         let joined = lines.join("\n");
         assert!(joined.contains("own_uid set: false"), "{joined}");
@@ -1239,8 +1269,6 @@ content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 r
         assert!(joined.contains("conv_stubs_created=1"), "{joined}");
         assert!(joined.contains("revisions_pruned=1"), "{joined}");
         assert!(joined.contains("report: all zeros (idempotent)"), "{joined}");
-        let _ = std::fs::remove_dir_all(&store);
-        // (the temp copy is left on disk — cheap, like the probe copies)
     }
 
     // --- the apply ---------------------------------------------------------
@@ -1385,9 +1413,11 @@ content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 r
         // provides, the dry run completes with the invariant lines —
         // and the uid value itself is never in the output.
         let store = fixture_store("realrun");
+        let _store_guard = TempDirGuard(store.clone());
         let a = dry_args(&store);
         let mut lines: Vec<String> = Vec::new();
         let r = run(&a, &mut |l: &str| lines.push(l.to_string()), || Some(false));
+        let _tmp_guard = dry_tmp_of(&lines);
         r.unwrap();
         let joined = lines.join("\n");
         assert!(
@@ -1396,7 +1426,5 @@ content_hash_filled=4 types_remapped=1 senders_backfilled=1 revisions_pruned=1 r
         );
         assert!(joined.contains("repair dry run: verified backup OK: "), "{joined}");
         assert!(joined.contains("report: all zeros (idempotent)"), "{joined}");
-        let _ = std::fs::remove_dir_all(&store);
-        // (the temp copy is left on disk — cheap, like the probe copies)
     }
 }

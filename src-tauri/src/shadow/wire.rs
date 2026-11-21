@@ -241,19 +241,91 @@ fn decode_gcm_gzip(s: &str, key: &[u8; 16]) -> Option<Value> {
     serde_json::from_slice(&json).ok()
 }
 
+/// R1 (batch 21): WHY one REST body did not land a decoded envelope.
+/// A small, log-tag-shaped enum — counts only, never ciphertext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestFail {
+    /// `data` did not base64-decode (after percent-decoding).
+    BadB64,
+    /// The ciphertext is empty or not a multiple of the AES block size.
+    BadLen,
+    /// AES ran but PKCS7 unpadding failed — a wrong key is the likely
+    /// cause (login/bootstrap endpoints, cloudmedia, or a rotation).
+    BadPadding,
+    /// Decrypted bytes are not valid UTF-8.
+    NotUtf8,
+    /// Valid UTF-8 but not JSON.
+    NotJson,
+    /// Decrypted fine, but the inner `data` is an opaque string — the
+    /// batch-19 flag shape; the payload under it is unreachable.
+    OpaqueData,
+    /// No key armed at all (unreachable at a pending drain, which arms
+    /// one; kept honest for the arrival path and future callers).
+    NoKey,
+}
+
+impl RestFail {
+    /// The log/probe tag (H-rule: kind names only, never values).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            RestFail::BadB64 => "bad_b64",
+            RestFail::BadLen => "bad_len",
+            RestFail::BadPadding => "bad_padding",
+            RestFail::NotUtf8 => "not_utf8",
+            RestFail::NotJson => "not_json",
+            RestFail::OpaqueData => "opaque_data",
+            RestFail::NoKey => "no_key",
+        }
+    }
+}
+
+/// R1 (batch 21): the full outcome of building one REST envelope —
+/// the same three buckets `rest_stats` counts, plus the why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestOutcome {
+    /// The inner envelope decrypted; `data` carries a reachable payload.
+    Decoded,
+    /// No decoded envelope; see the kind. `OpaqueData` decrypts fine
+    /// but its payload is unreachable, so it is a failure like the rest.
+    Failed(RestFail),
+    /// No `data` cipher string on the outer: nothing to decode.
+    NoCipher,
+}
+
 /// REST: percent-decode -> base64 -> AES-128-CBC (zero IV) -> inner JSON.
 /// Returns `None` when the ciphertext cannot be decrypted (no key yet,
 /// rotation, or a non-zpw endpoint such as cloudmedia).
+///
+/// R1 (batch 21): thin wrapper over [`decode_rest_body_why`] — the
+/// Option API keeps its exact success set.
 pub fn decode_rest_body(data: &str, key: &[u8; 16]) -> Option<Value> {
+    decode_rest_body_why(data, key).ok()
+}
+
+/// [`decode_rest_body`] with the REASON (R1, batch 21): the same
+/// success set, stage by stage — `bad_b64`, `bad_len` (empty or not a
+/// multiple of the 16-byte block size), `bad_padding` (AES ok, PKCS7
+/// invalid — a wrong key is likely), `not_utf8`, then `not_json`.
+pub fn decode_rest_body_why(data: &str, key: &[u8; 16]) -> Result<Value, RestFail> {
     let pct = percent_decode(data);
-    let ct = B64.decode(pct.trim()).ok()?;
+    let ct = B64.decode(pct.trim()).map_err(|_| RestFail::BadB64)?;
     if ct.is_empty() || ct.len() % 16 != 0 {
-        return None;
+        return Err(RestFail::BadLen);
     }
+    // The key and IV are fixed 16-byte arrays, so this construction
+    // cannot fail (the old code had the same arm via `.ok()?`; there
+    // is no honest kind for it, so the infallible constructor removes
+    // the arm instead of inventing one).
     let iv = [0u8; 16];
-    let dec = Aes128CbcDec::new_from_slices(key, &iv).ok()?;
-    let plain = dec.decrypt_padded_vec_mut::<Pkcs7>(&ct).ok()?;
-    serde_json::from_slice(&plain).ok()
+    let dec = Aes128CbcDec::new(
+        aes::cipher::generic_array::GenericArray::from_slice(key),
+        aes::cipher::generic_array::GenericArray::from_slice(&iv),
+    );
+    let plain = dec
+        .decrypt_padded_vec_mut::<Pkcs7>(&ct)
+        .map_err(|_| RestFail::BadPadding)?;
+    let text = std::str::from_utf8(&plain).map_err(|_| RestFail::NotUtf8)?;
+    serde_json::from_str(text).map_err(|_| RestFail::NotJson)
 }
 
 /// Stored shape for a REST event: the decoded inner envelope
@@ -268,30 +340,58 @@ pub fn decode_rest_body(data: &str, key: &[u8; 16]) -> Option<Value> {
 /// is unreachable: `normalize::unwrap_payload` only descends strings
 /// that parse as JSON, and a cipher string never does).
 pub fn rest_envelope(endpoint: &str, outer: &Value, key: Option<&[u8; 16]>) -> Value {
+    rest_envelope_outcome(endpoint, outer, key).0
+}
+
+/// R1 (batch 21): the stored envelope [`rest_envelope`] builds — its
+/// shape is UNCHANGED — paired with the decode outcome (the why). The
+/// two always come from the same decode call, so the flag in the
+/// stored envelope and the outcome cannot disagree.
+pub fn rest_envelope_outcome(
+    endpoint: &str,
+    outer: &Value,
+    key: Option<&[u8; 16]>,
+) -> (Value, RestOutcome) {
     let ec = outer.get("error_code").cloned().unwrap_or(Value::Null);
     let data_s = outer.get("data").and_then(Value::as_str);
-    let mut env = match (data_s, key) {
-        (Some(s), Some(k)) => match decode_rest_body(s, k) {
-            Some(inner) => flag_string_data(inner),
-            None => json!({
+    let (mut env, outcome) = match (data_s, key) {
+        (Some(s), Some(k)) => match decode_rest_body_why(s, k) {
+            Ok(inner) => {
+                // R1 (batch 19/21): a decrypt whose inner `data` is
+                // STILL an opaque string is flagged `undecoded: true`
+                // AND reported as `RestFail::OpaqueData`.
+                let out = if data_is_opaque_string(&inner) {
+                    RestOutcome::Failed(RestFail::OpaqueData)
+                } else {
+                    RestOutcome::Decoded
+                };
+                (flag_string_data(inner), out)
+            }
+            Err(kind) => (
+                json!({
+                    "error_code": ec,
+                    "data": truncate_str(s),
+                    "undecoded": true,
+                }),
+                RestOutcome::Failed(kind),
+            ),
+        },
+        (Some(s), None) => (
+            json!({
                 "error_code": ec,
                 "data": truncate_str(s),
-                "undecoded": true,
+                "undecoded": "no-key",
             }),
-        },
-        (Some(s), None) => json!({
-            "error_code": ec,
-            "data": truncate_str(s),
-            "undecoded": "no-key",
-        }),
-        (None, _) => json!({ "error_code": ec }),
+            RestOutcome::Failed(RestFail::NoKey),
+        ),
+        (None, _) => (json!({ "error_code": ec }), RestOutcome::NoCipher),
     };
     if let Some(o) = env.as_object_mut() {
         o.entry("error_code")
             .or_insert_with(|| outer.get("error_code").cloned().unwrap_or(Value::Null));
     }
     let _ = endpoint;
-    env
+    (env, outcome)
 }
 
 fn truncate_str(s: &str) -> String {
@@ -398,11 +498,18 @@ pub fn test_encode_gcm_gzip(payload: &Value, key: &[u8; 16], iv: &[u8; 16], aad:
 
 #[cfg(test)]
 pub fn test_encode_rest(payload: &Value, key: &[u8; 16]) -> String {
-    use aes::cipher::BlockEncryptMut as _;
     let json = serde_json::to_vec(payload).unwrap();
+    test_encode_rest_bytes(&json, key)
+}
+
+/// R1 (batch 21): the CBC encode side over RAW bytes (not JSON) —
+/// builds the `not_utf8` and `not_json` decode-failure fixtures.
+#[cfg(test)]
+fn test_encode_rest_bytes(plain: &[u8], key: &[u8; 16]) -> String {
+    use aes::cipher::BlockEncryptMut as _;
     let iv = [0u8; 16];
     let enc = Aes128CbcEnc::new_from_slices(key, &iv).unwrap();
-    let ct = enc.encrypt_padded_vec_mut::<Pkcs7>(&json);
+    let ct = enc.encrypt_padded_vec_mut::<Pkcs7>(plain);
     percent_encode_b64(&B64.encode(&ct))
 }
 
@@ -555,6 +662,114 @@ mod tests {
         // only corrupt.
         assert_eq!(percent_decode("a+b/c=="), "a+b/c==");
         assert_eq!(percent_decode("+"), "+");
+    }
+
+    // --- R1 (batch 21): the decode-failure kinds ---------------------------
+
+    #[test]
+    fn decode_rest_body_why_names_every_failure_stage() {
+        let key = [0x55u8; 16];
+        let inner = json!({"error_code": 0, "data": {"ok": 1}});
+        // Decoded roundtrip.
+        assert_eq!(
+            decode_rest_body_why(&test_encode_rest(&inner, &key), &key),
+            Ok(inner.clone())
+        );
+        // bad_b64: not base64 at all (after percent-decoding).
+        assert_eq!(decode_rest_body_why("!!not-base64!!", &key), Err(RestFail::BadB64));
+        // bad_len: the empty string decodes to zero bytes; a 15-byte
+        // ciphertext is not a multiple of the block size.
+        assert_eq!(decode_rest_body_why("", &key), Err(RestFail::BadLen));
+        let short = B64.encode([0u8; 15]);
+        assert_eq!(decode_rest_body_why(&short, &key), Err(RestFail::BadLen));
+        // bad_padding: valid base64, block-aligned, sealed with ANOTHER
+        // key — the shape a wrong-key body (cloudmedia, login, rotation)
+        // produces through the drain.
+        let enc = test_encode_rest(&inner, &[0x77u8; 16]);
+        assert_eq!(decode_rest_body_why(&enc, &key), Err(RestFail::BadPadding));
+        // not_utf8: AES-decryptable and PKCS7-valid, but the plaintext
+        // is not UTF-8 (0xFF is never a valid first byte).
+        let raw = test_encode_rest_bytes(&[0xFF, 0xFE, 0x00, 0x11], &key);
+        assert_eq!(decode_rest_body_why(&raw, &key), Err(RestFail::NotUtf8));
+        // not_json: valid UTF-8, not JSON.
+        let raw = test_encode_rest_bytes(b"not json", &key);
+        assert_eq!(decode_rest_body_why(&raw, &key), Err(RestFail::NotJson));
+    }
+
+    #[test]
+    fn decode_rest_body_still_agrees_with_the_why_variant() {
+        // "Without changing which bodies succeed" (R1, batch 21): the
+        // Option API and the why-variant accept EXACTLY the same
+        // bodies, input by input — including the JSON-string payload
+        // (reachable, stays a success).
+        let key = [0x55u8; 16];
+        let inner = json!({"error_code": 0, "data": "{\"msgs\":[]}"});
+        let inputs = [
+            test_encode_rest(&inner, &key), // ok
+            test_encode_rest(&inner, &[0x77u8; 16]), // wrong key
+            test_encode_rest_bytes(b"not json", &key), // not json
+            test_encode_rest_bytes(&[0xff, 0xfe, 0x00, 0x11], &key), // not utf8
+            "!!not-base64!!".to_string(), // bad b64
+            String::new(), // empty
+            B64.encode([0u8; 15]), // bad len
+        ];
+        for s in &inputs {
+            assert_eq!(
+                decode_rest_body(s, &key).is_some(),
+                decode_rest_body_why(s, &key).is_ok(),
+                "the two APIs must agree on this input"
+            );
+        }
+        assert!(decode_rest_body_why(&inputs[0], &key).is_ok());
+    }
+
+    #[test]
+    fn rest_envelope_outcome_reports_the_kind_alongside_the_same_stored_shape() {
+        // R1 (batch 21): the outcome only ADDS the why — the stored
+        // envelope stays byte-identical to `rest_envelope`'s.
+        let key = [0x44u8; 16];
+        let inner = json!({"error_code": 0, "data": {"ok": 1}});
+        let outer = json!({"error_code": 0, "data": test_encode_rest(&inner, &key)});
+        let (env, out) = rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &outer, Some(&key));
+        assert_eq!(out, RestOutcome::Decoded);
+        assert_eq!(env, rest_envelope("https://wpa.chat.zalo.me/a/x", &outer, Some(&key)));
+        // No key -> NoKey kind, same "no-key" flag stored.
+        let (env2, out2) = rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &outer, None);
+        assert_eq!(out2, RestOutcome::Failed(RestFail::NoKey));
+        assert_eq!(env2["undecoded"], "no-key");
+        // Decode failure -> the kind, same `undecoded: true` stored.
+        let (env3, out3) =
+            rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &outer, Some(&[9u8; 16]));
+        assert_eq!(out3, RestOutcome::Failed(RestFail::BadPadding));
+        assert_eq!(env3["undecoded"], true);
+        // No data string on the outer -> NoCipher.
+        let plain = json!({"error_code": 0, "data": {"plain": true}});
+        let (env4, out4) = rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &plain, Some(&key));
+        assert_eq!(out4, RestOutcome::NoCipher);
+        assert_eq!(env4, rest_envelope("https://wpa.chat.zalo.me/a/x", &plain, Some(&key)));
+        // Opaque string data -> the OpaqueData kind + the batch-19 flag.
+        let sinner = json!({"error_code": 0, "data": "still-a-string"});
+        let souter = json!({"error_code": 0, "data": test_encode_rest(&sinner, &key)});
+        let (env5, out5) = rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &souter, Some(&key));
+        assert_eq!(out5, RestOutcome::Failed(RestFail::OpaqueData));
+        assert_eq!(env5["undecoded"], true);
+        // A JSON-encoded string payload stays REACHABLE: decoded.
+        let jinner = json!({"error_code": 0, "data": "{\"msgs\":[]}"});
+        let jouter = json!({"error_code": 0, "data": test_encode_rest(&jinner, &key)});
+        let (_, out6) = rest_envelope_outcome("https://wpa.chat.zalo.me/a/x", &jouter, Some(&key));
+        assert_eq!(out6, RestOutcome::Decoded);
+        // Every kind's tag is a stable, log-safe ASCII word.
+        for (k, tag) in [
+            (RestFail::BadB64, "bad_b64"),
+            (RestFail::BadLen, "bad_len"),
+            (RestFail::BadPadding, "bad_padding"),
+            (RestFail::NotUtf8, "not_utf8"),
+            (RestFail::NotJson, "not_json"),
+            (RestFail::OpaqueData, "opaque_data"),
+            (RestFail::NoKey, "no_key"),
+        ] {
+            assert_eq!(k.tag(), tag);
+        }
     }
 
     #[test]
