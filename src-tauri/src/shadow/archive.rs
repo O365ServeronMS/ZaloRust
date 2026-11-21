@@ -547,6 +547,9 @@ pub fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
 /// disagreement and is REFUSED — the store already refused such bytes
 /// at download time, so this is defence in depth). file/voice/unknown
 /// kinds serve whatever container the bytes form, else generic binary.
+/// Batch 27 M4: JPEG XL (bare codestream and container) serves as
+/// `image/jxl` — `magic_ok` accepts JXL for image rows now, so the
+/// viewer must serve it too, or every stored JXL would 404.
 pub fn content_type_for(kind: Option<&str>, head: &[u8]) -> Option<&'static str> {
     let sniffed = if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("image/jpeg")
@@ -556,6 +559,10 @@ pub fn content_type_for(kind: Option<&str>, head: &[u8]) -> Option<&'static str>
         Some("image/gif")
     } else if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if head.starts_with(&[0xFF, 0x0A])
+        || head.starts_with(&[0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A])
+    {
+        Some("image/jxl")
     } else if head.len() >= 8 && &head[4..8] == b"ftyp" {
         Some("video/mp4")
     } else if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
@@ -1019,6 +1026,17 @@ mod tests {
         assert_eq!(content_type_for(Some("image"), &webp), Some("image/webp"));
         assert_eq!(content_type_for(Some("video"), &mp4), Some("video/mp4"));
         assert_eq!(content_type_for(Some("video"), &webm), Some("video/webm"));
+        // Batch 27 M4: JXL serves as image/jxl in both forms — and a
+        // VIDEO row holding JXL bytes is still a disagreement (None).
+        let jxl_bare = [0xFF, 0x0A, 0xE0, 0x0D, 0x00, 0x00, 0x00, 0x00];
+        let jxl_box = [
+            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        assert_eq!(content_type_for(Some("image"), &jxl_bare), Some("image/jxl"));
+        assert_eq!(content_type_for(Some("image"), &jxl_box), Some("image/jxl"));
+        assert_eq!(content_type_for(Some("video"), &jxl_bare), None);
+        assert_eq!(content_type_for(Some("video"), &jxl_box), None);
         // An image/video row whose bytes fail the sniff is refused…
         assert_eq!(content_type_for(Some("image"), &cipher), None);
         assert_eq!(content_type_for(Some("video"), &cipher), None);

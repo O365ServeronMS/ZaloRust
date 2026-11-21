@@ -892,8 +892,12 @@ impl Drop for TempGuard {
 }
 
 /// B4/KQ1: magic bytes of the first bytes. `image` must be JPEG
-/// (`FF D8 FF`), PNG (`89 50 4E 47`), GIF (`47 49 46 38`) or WEBP
-/// (`RIFF`…`WEBP` at offset 8); `video` must be MP4/MOV (`ftyp` at
+/// (`FF D8 FF`), PNG (`89 50 4E 47`), GIF (`47 49 46 38`), WEBP
+/// (`RIFF`…`WEBP` at offset 8) or JPEG XL (batch 27 M4: the bare
+/// codestream `FF 0A` and the ISO-BMFF container
+/// `00 00 00 0C 4A 58 4C 20 0D 0A 87 0A` — the Desktop's local
+/// picture cache is mostly JXL, and a CDN serving JXL is serving a
+/// real image, not ciphertext); `video` must be MP4/MOV (`ftyp` at
 /// offset 4) or WEBM (`1A 45 DF A3`). Files/voice and unknown kinds
 /// are not sniffed (a mismatch there means nothing).
 ///
@@ -906,6 +910,9 @@ pub(crate) fn magic_ok(kind: Option<&str>, head: &[u8]) -> bool {
                 || head.starts_with(&[0x89, 0x50, 0x4E, 0x47])
                 || head.starts_with(b"GIF8")
                 || (head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WEBP")
+                // Batch 27 M4: JPEG XL, both on-disk forms.
+                || head.starts_with(&[0xFF, 0x0A])
+                || head.starts_with(&[0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A])
         }
         Some("video") => {
             (head.len() >= 8 && &head[4..8] == b"ftyp")
@@ -1262,6 +1269,19 @@ mod tests {
         assert!(magic_ok(Some("image"), &webp));
         assert!(magic_ok(Some("video"), &mp4));
         assert!(magic_ok(Some("video"), &webm));
+        // Batch 27 M4: JPEG XL is an image — the bare codestream and
+        // the container signature both pass the image sniff.
+        let jxl_bare = [0xFF, 0x0A, 0xE0, 0x0D, 0x00, 0x00, 0x00, 0x00];
+        let jxl_box = [
+            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A, 0, 0, 0, 0,
+        ];
+        assert!(magic_ok(Some("image"), &jxl_bare));
+        assert!(magic_ok(Some("image"), &jxl_box));
+        // Both forms are IMAGE-only: a video row carrying them still
+        // fails its own sniff, and an image row carrying video bytes
+        // still fails.
+        assert!(!magic_ok(Some("video"), &jxl_bare));
+        assert!(!magic_ok(Some("video"), &jxl_box));
         // Mismatches are refused…
         assert!(!magic_ok(Some("image"), &cipher));
         assert!(!magic_ok(Some("video"), &cipher));
@@ -1330,6 +1350,31 @@ mod tests {
         // file/voice are not sniffed — the same bytes store fine.
         let (rel, _sha, _size) = store_stream(std::io::Cursor::new(cipher), &root, Some("voice")).unwrap();
         assert!(root.join(&rel).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_stream_accepts_jpeg_xl_in_both_forms() {
+        // Batch 27 M4: the live download path stores JXL images —
+        // `store_stream` has no file-name/extension assumption (the
+        // store is content-addressed, the name IS the sha), so the
+        // only thing that could refuse JXL was the sniff. Both forms
+        // must land in the store, never `ref-encrypted`.
+        let root = scratch();
+        let jxl_bare = [0xFF, 0x0A, 0xE0, 0x0D, 0x00, 0x00, 0x14, 0x66, 0x24, 0x11, 0x0A, 0x4D];
+        let (rel, _sha, size) =
+            store_stream(std::io::Cursor::new(jxl_bare), &root, Some("image")).unwrap();
+        assert_eq!(size, jxl_bare.len() as u64);
+        assert!(root.join(&rel).is_file());
+        let jxl_box = [
+            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A, 0x00, 0x00,
+            0x00, 0x01,
+        ];
+        let (rel2, _sha2, size2) =
+            store_stream(std::io::Cursor::new(jxl_box), &root, Some("image")).unwrap();
+        assert_eq!(size2, jxl_box.len() as u64);
+        assert!(root.join(&rel2).is_file());
+        assert_eq!(tmp_count(&root), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

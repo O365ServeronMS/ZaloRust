@@ -1367,6 +1367,7 @@ mod tests {
             }),
             group: None,
             stranger_box: None,
+            top_level: Vec::new(),
         };
         import_map::plan(&mapping, &inv).unwrap()
     }
@@ -1460,6 +1461,9 @@ mod tests {
             target: Some(store.to_path_buf()),
             unmapped_as_raw: false,
             media_plan: false,
+            local_media_probe: false,
+            local_media_plan: false,
+            local_media_root: None,
             content_shape: None,
             by: None,
             decrypt_basic: false,

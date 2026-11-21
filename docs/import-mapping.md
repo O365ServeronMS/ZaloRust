@@ -3,8 +3,8 @@
 This is the how-to for the tools batch 12 added to `zalors import`,
 the batch-14 addition, the batch-15 additions, the batch-16
 additions, the batch-23a content-shape additions, the batch-24
-BasicEncryption decode additions, and the batch-25 completed msgType
-code table:
+BasicEncryption decode additions, the batch-25 completed msgType
+code table, and the batch-27 Zalo PC local-media tools:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
@@ -56,7 +56,11 @@ code table:
 - batch 26 (§9) — what happens to MEDIA refs from imported history:
   the `ref-import`/`expired` statuses, the `media_import_requeue`
   repair step, the opt-in `shadow.media_backfill_import` backfill,
-  and the read-only `zalors media --shape` census tool.
+  and the read-only `zalors media --shape` census tool;
+- batch 27 (§10) — the Zalo PC LOCAL media tools: the `--inventory`
+  coverage of the top-level snapshot DBs, the read-only
+  `--local-media-probe` census, the `--local-media-plan` DRY-RUN copy
+  planner, and JPEG XL joining the image magic family.
 
 Everything here is **dry-run only** up to and including §5: nothing in
 the pipeline writes to the snapshot, the shadow store, or the live
@@ -1018,3 +1022,155 @@ verdict, 3xx with an allowed or blocked Location, 403/404/410, other
 4xx, 5xx, timeout, tls/dns/io. Nothing is stored, no url is ever
 printed, and no test calls it. `--out <file>` also writes the report
 to a file and REFUSES if the file already exists.
+
+## 10. Zalo PC local media: probe + dry-run plan (batch 27)
+
+The CDN cannot serve this history (`--probe-http` measured 15/15 dead
+links), but Zalo PC keeps a local copy of much of it under
+`<root>\media\<uid>\ZaloDownloads\<sub>\…`, where `<sub>` is one of
+`picture, video, file, fileNoise, fileThumb, voice, richThumb,
+zinstant, resource, Cache` (plus `<root>\media\<uid>\sticker\…`).
+Batch 27 adds the READ-ONLY tools that measure how the Desktop's own
+rows point into that tree, plus a DRY-RUN planner for copying the
+files into the media store later. **Copying is NOT part of batch 27**
+— it is a later, user-approved batch (27b) that comes after the real
+numbers below are read.
+
+Hard rules for both tools (H-rule): never a path value, file name,
+directory name, uid, msgId or message text — only counts, the fixed
+`<sub>` vocabulary (anything else prints as `other`), path-shape,
+extension and magic classes, length/charset buckets and booleans. The
+only file facts ever gathered are the FIRST 16 BYTES (the magic) and
+`metadata().len()` (the size) — no whole file is ever read, hashed or
+copied, and `fileNoise` contents are never decoded. The snapshot opens
+through the usual guards (`mode=ro&immutable=1`); the store opens
+READ-ONLY with the normal key resolution (a Locked passphrase store
+refuses — the CLI never accepts a password). Nothing is written
+anywhere: no DB, no files, no temp copies, `--out` aside.
+
+### 10.1 The inventory covers the top-level snapshot DBs (M1)
+
+`--inventory` now ALSO tries every `*.db` directly under the
+snapshot's uid dir (`Media.db`, `MsgInfo.db`, `Res.db`, `Meta.db`,
+`Reaction.db`, `Sync.db`, `E2ee.db`, `Preferences.db`) with the SAME
+open path and key as `Core/*.db` — SQLCipher with the snapshot
+passphrase and the detected profile first, then a plain SQLite open —
+and reports:
+
+```
+inventory: top-level DBs: 8 (opened cipher=… plain=… no=…)
+inventory: top-level <name>.db opened=yes (cipher|plain) (N table(s))
+  <the same table/column/rowcount lines as Core/>
+inventory: top-level <name>.db opened=no (<log-safe kind>)
+```
+
+`sqlite_NotADatabase/26` means "wrong key or another format" for a
+file that is neither plain SQLite nor SQLCipher-with-this-key (the
+expected verdict for the real Media.db & co). The `--out` JSON gains
+the same section (`top_level`, `serde(default)` — old files still
+load). Everything the mode printed for `Core/` above the new section
+is unchanged.
+
+### 10.2 The probe (M2)
+
+```powershell
+target\debug\zalors.exe import `
+  --from-snapshot "<cold snapshot dir>" --account default `
+  --uin-hash dca62c394a68 --key-file "<D7 capture>" `
+  --local-media-probe --local-media-root "D:\Zalo Data" [--out <file>]
+```
+
+`--local-media-root` is REQUIRED and is a USER SETTING passed
+explicitly (the Zalo PC media root — the dir whose `media` child holds
+the per-uid trees). Its own mode: mutually exclusive with
+`--apply`/`--inventory`/`--mapping`/`--shadow-copy`/`--delta`/
+`--distinct`/`--content-shape`/`--media-plan`. `--out <file>` writes
+the same report to a NEW file. It reports:
+
+- **the census** — for every message row in every snapshot message DB,
+  per Desktop msgType code (the fixed SELECT reads only the
+  bookkeeping columns `msgId, msgType, localPath, folderPath,
+  previewThumb, fileSize, cliMsgId, sendDttm` — never the `message`
+  text): rows, localPath/folderPath/previewThumb presence, the path
+  shape class (`abs_drive`/`abs_unc`/`relative`/`file_url`/`other`),
+  under-root yes/no (case-insensitive prefix after normalising
+  slashes, on the path RESOLVED via folderPath when relative), the
+  `<sub>` it falls in, file exists, `size == fileSize` match/differ,
+  the magic class of the first 16 bytes (`jpg, png, gif, webp, jxl,
+  jxl_container, mp4, webm_mkv, pdf, zip, html, other`), and the
+  name-contains-msgId/-cliMsgId/-sendDttm(13-digit) booleans;
+- **the zcloud census** — `Core/Index.db`'s `zcloud` by `zType`, the
+  same localPath census with `zSize` as the size column (skipped with
+  a line if the table/columns are absent);
+- **the reverse coverage** — a walk of
+  `<root>\media\*\ZaloDownloads\*` that counts, per `<sub>` with a
+  magic histogram, the files NO message row's `localPath` points at
+  (`*.rescache` index files skipped, hard 200 000-file cap).
+
+Batch 27c (reviewer findings on the real data): every column of every
+scan is read as a SQLite Value and coerced — the real Desktop
+`message` table declares `sendDttm:TEXT` (digits stay TEXT) and
+`fileSize:INTEGER` (non-numeric text stays text), so the old
+fixed-type read of `sendDttm` dropped EVERY row on the real snapshot
+(`query_failed=467616`, `rows=0`). A type surprise is counted and
+NEVER drops the row: the `message DBs:` line gains
+`row_failed=` (a row whose `rows.next()` errored) and
+`coerce_none=<col>:N,…` (the un-coercible values by column name,
+`none` when everything coerced); `query_failed` is now strictly the
+per-DB prepare/query failures; the zcloud line carries the same two
+counters. The header also no longer echoes path values (H-rule):
+`root=given (exists)` instead of the root, and `report written
+(--out)` instead of the file name (the `--out` refusal keeps its
+wording, without the path).
+
+### 10.3 The plan (M3, DRY RUN ONLY)
+
+```powershell
+target\debug\zalors.exe import `
+  --from-snapshot "<cold snapshot dir>" --account default `
+  --uin-hash dca62c394a68 --key-file "<D7 capture>" `
+  --local-media-plan --target "<shadow store dir>" `
+  --local-media-root "D:\Zalo Data"
+```
+
+The store opens READ-ONLY with the `repair_cli` key resolution (the
+app may keep running; a Locked passphrase store refuses). For each
+attachment whose message has `source='import'` (ANY status), the plan
+finds the Desktop row with the same message id (the import's own
+`msgId` → `msg_id` mapping), resolves its `localPath` (joining
+`folderPath` when the cell is relative) and classifies ONE outcome per
+shadow kind, in this priority:
+
+`already_downloaded` (the row already has the file) ·
+`no_desktop_row` · `no_local_path` · `outside_root` (the resolved
+path is not under `--local-media-root`) · `noise_obfuscated` (the path
+is under `fileNoise` — counted, never decoded) · `missing_file` ·
+`size_excluded` (exists but 0 bytes or over the 512 MB cap — the
+would_copy definition's own size clause) · `magic_mismatch` (fails
+`media::magic_ok` for the row's kind; batch 27 M4 makes JPEG XL an
+image, so `.jxl` copies are fine) · `would_copy` (exists, size in
+range, magic fits).
+
+It also prints the TOTAL BYTES `would_copy` would add (the sum of
+`metadata().len()`), and the `no_attachment_row` census: per Desktop
+msgType, the rows whose local file exists while the shadow knows the
+message but has no attachment row for it (`not_in_shadow` counts the
+rows whose message was never imported at all — the imported video gap
+the batch-26 census found, msgType 18, is `no_attachment_row`). NO
+writes of any kind: no DB, no files, no temp copies.
+
+Batch 27c: the plan's own snapshot scan uses the same tolerant
+reads — its header line is `message DBs dbs=… opened=…
+open_failed=… query_failed=… no_table=… rows=… row_failed=…
+coerce_none=…`, counting what the old code silently skipped, and it
+states `store=given` / `root=given (exists)` instead of echoing the
+`--target` / `--local-media-root` path values.
+
+### 10.4 JPEG XL is an image (M4)
+
+`media::magic_ok(Some("image"), …)` now also accepts the JXL bare
+codestream (`FF 0A`) and the container signature
+(`00 00 00 0C 4A 58 4C 20 0D 0A 87 0A`). This also affects live
+downloads — a CDN serving JXL is no longer flagged `ref-encrypted`
+(intended), and the archive window serves JXL as `image/jxl` (the
+viewer would otherwise 404 every stored JXL the store now accepts).

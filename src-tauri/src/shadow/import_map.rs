@@ -2169,6 +2169,7 @@ mod tests {
                 source_rel: "Core/Message/stranger_box.db".into(),
                 inventory: super::super::import::inventory::inventory_db(msg_conn).unwrap(),
             }),
+            top_level: Vec::new(),
         }
     }
 

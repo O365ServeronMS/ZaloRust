@@ -66,6 +66,34 @@ pub struct SnapshotInventories {
     pub one_to_one: Option<KindInventory>,
     pub group: Option<KindInventory>,
     pub stranger_box: Option<KindInventory>,
+    /// Batch 27 M1: every `*.db` directly under the snapshot's uid dir
+    /// (Media.db, MsgInfo.db, …) with HOW it opened — the same
+    /// inventory lines as Core/ when it opens at all. `serde(default)`
+    /// keeps pre-batch-27 JSON files loadable; the Vec is empty for
+    /// snapshots without top-level DBs (their output is unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_level: Vec<TopLevelInventory>,
+}
+
+/// One TOP-LEVEL snapshot DB (batch 27 M1): a `*.db` file directly
+/// under the snapshot's uid dir. The same open path and key as
+/// `Core/*.db` is tried first (SQLCipher with the snapshot passphrase
+/// + the detected profile), then a plain SQLite open. `open` names the
+/// path that worked (`cipher` | `plain`); `failed` carries the
+/// log-safe failure kind when neither did. `inventory` is `Some` only
+/// for a DB that opened — shape-only, like every line this module
+/// produces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TopLevelInventory {
+    /// The FILE name as listed (a Desktop schema name — the same class
+    /// of shape `Core/Message/<name>.db` already reports; never a row
+    /// value).
+    pub name: String,
+    /// `cipher` | `plain` when the DB opened.
+    pub opened: Option<String>,
+    /// The log-safe open-failure kind when it did not.
+    pub failed: Option<String>,
+    pub inventory: Option<DbInventory>,
 }
 
 /// Quote a SQLite identifier for interpolation into a statement
@@ -306,11 +334,36 @@ mod tests {
             one_to_one: None,
             group: None,
             stranger_box: None,
+            top_level: Vec::new(),
         };
         let j = serde_json::to_string(&set).unwrap();
         assert!(j.contains("\"source_rel\":\"Core/Index.db\""), "{j}");
         assert!(j.contains("\"one_to_one\":null"), "{j}");
         let back: SnapshotInventories = serde_json::from_str(&j).unwrap();
         assert_eq!(back, set);
+        // Batch 27 M1: a top-level DB section round-trips, and a JSON
+        // file WITHOUT the field (pre-batch-27) still loads — serde
+        // default keeps the old files readable.
+        let inv2 = back.index.as_ref().unwrap().inventory.clone();
+        let mut with_top = set.clone();
+        with_top.top_level.push(TopLevelInventory {
+            name: "Media.db".into(),
+            opened: Some("cipher".into()),
+            failed: None,
+            inventory: Some(inv2),
+        });
+        with_top.top_level.push(TopLevelInventory {
+            name: "Other.db".into(),
+            opened: None,
+            failed: Some("sqlite_NotADatabase/26".into()),
+            inventory: None,
+        });
+        let j2 = serde_json::to_string(&with_top).unwrap();
+        assert!(j2.contains("\"top_level\""), "{j2}");
+        assert!(j2.contains("\"opened\":\"cipher\""), "{j2}");
+        let back2: SnapshotInventories = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2, with_top);
+        let old: SnapshotInventories = serde_json::from_str(&j).unwrap();
+        assert!(old.top_level.is_empty(), "no field -> default");
     }
 }

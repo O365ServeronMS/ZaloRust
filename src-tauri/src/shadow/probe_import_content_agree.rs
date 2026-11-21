@@ -969,6 +969,9 @@ fn probe_import_content_agree() {
         i_have_a_backup_plan: false,
         unmapped_as_raw: false,
         media_plan: false,
+        local_media_probe: false,
+        local_media_plan: false,
+        local_media_root: None,
         content_shape: None,
         by: None,
         decrypt_basic: false,
@@ -1708,6 +1711,7 @@ mod tests {
             }),
             group: None,
             stranger_box: None,
+            top_level: Vec::new(),
         };
         let plan = import_map::plan(&mapping, &kinds).unwrap();
         let ep = plan.message.as_ref().unwrap();
@@ -1950,6 +1954,7 @@ mod tests {
             }),
             group: None,
             stranger_box: None,
+            top_level: Vec::new(),
         };
         let plan = import_map::plan(&mapping, &kinds).unwrap();
         let ep = plan.message.as_ref().unwrap();

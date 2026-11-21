@@ -73,6 +73,16 @@ pub mod desktop_cipher;
 /// independent arbiter for the unmapped Desktop msgType codes.
 pub mod content_shape;
 
+/// Batch 27 M2/M3: the Zalo PC LOCAL MEDIA tools — the read-only
+/// `--local-media-probe` census (message rows' `localPath` by Desktop
+/// msgType, the Index.db `zcloud` census, and the reverse-coverage
+/// walk) and the `--local-media-plan` DRY-RUN planner (outcome counts
+/// per shadow kind for copying local files into the media store).
+/// Read-only everywhere; the first 16 bytes and `metadata().len()` are
+/// the only file facts ever gathered. No file is ever copied in this
+/// batch.
+pub mod local_media;
+
 /// The snapshot manifest file (F5 writes it, `run` requires it):
 /// proof that `--from-snapshot` is a cold, byte-verified copy.
 pub const SNAPSHOT_MANIFEST: &str = "snapshot-manifest.json";
@@ -661,6 +671,7 @@ pub fn gather_inventories(p: &Prepared) -> Result<GatheredInventories, String> {
             one_to_one: None,
             group: None,
             stranger_box: None,
+            top_level: Vec::new(),
         },
         failed_samples: Vec::new(),
         one_to_one: 0,
@@ -708,7 +719,107 @@ pub fn gather_inventories(p: &Prepared) -> Result<GatheredInventories, String> {
             Err((n, e)) => g.failed_samples.push((n, e)),
         }
     }
+    // Batch 27 M1: the top-level DBs beside `Core/` (read-only; never
+    // fatal — the inventory is a report).
+    g.inv.top_level = top_level_inventories(p);
     Ok(g)
+}
+
+// --- batch 27 M1: the top-level snapshot DBs -----------------------------
+
+/// Every `*.db` FILE directly under the snapshot's uid dir — the
+/// top-level DBs `Core\` sits beside (`Media.db`, `MsgInfo.db`, `Res.db`,
+/// `Meta.db`, `Reaction.db`, `Sync.db`, `E2ee.db`, `Preferences.db`),
+/// sorted by file name. Sidecars never match (`-wal`/`-shm` do not
+/// end in `.db`); `Core\` itself is a directory, not a file.
+fn top_level_db_names(uid_dir: &Path) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = std::fs::read_dir(uid_dir)
+        .map_err(|e| format!("{}: {e}", uid_dir.display()))?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".db"))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// How one top-level DB answered the two open attempts (M1).
+#[derive(Debug)]
+enum TopOpen {
+    /// The snapshot passphrase + detected profile opened it — the same
+    /// open path and key as `Core/*.db`.
+    Cipher(Connection),
+    /// A plain SQLite open verified.
+    Plain(Connection),
+    /// Neither attempt worked; the log-safe kind of the LAST (plain)
+    /// failure — `sqlite_NotADatabase/26` means "wrong key or another
+    /// format" for a file that is neither plain SQLite nor
+    /// SQLCipher-with-this-key.
+    Failed(String),
+}
+
+/// Try the same open path and key as `Core/*.db` (M1): first SQLCipher
+/// with the snapshot passphrase and the detected profile, then a plain
+/// SQLite open on the same immutable read-only URI. A connection whose
+/// `sqlite_master` verify passes is returned live (the caller
+/// inventories through it); otherwise the log-safe error KIND (never
+/// sqlite's message text — it can quote the file path).
+fn open_top_level(path: &Path, passphrase: &str, profile: CipherProfile) -> TopOpen {
+    if let Ok(conn) = open_desktop_db(path, passphrase, profile) {
+        return TopOpen::Cipher(conn);
+    }
+    let plain: Result<Connection, String> = (|| {
+        let uri = immutable_ro_uri(path)?;
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| super::pipeline::sqlite_kind(&e))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|e| super::pipeline::sqlite_kind(&e))?;
+        Ok(conn)
+    })();
+    match plain {
+        Ok(conn) => TopOpen::Plain(conn),
+        Err(kind) => TopOpen::Failed(kind),
+    }
+}
+
+/// Inventory the top-level DBs (M1, read-only — every open is the same
+/// `mode=ro&immutable=1` URI the Core DBs use, so nothing creates or
+/// touches sidecar files). A DB that opens is inventoried with the
+/// SAME shape lines as `Core/`; one that does not is reported with its
+/// failure kind, never fatal. The file NAMES are Desktop schema names
+/// (the same class of shape `Core/Message/<name>.db` already reports);
+/// no row value ever crosses this function.
+fn top_level_inventories(p: &Prepared) -> Vec<inventory::TopLevelInventory> {
+    let Ok(names) = top_level_db_names(&p.uid_dir) else {
+        return Vec::new(); // unlistable dir: reported as an empty set
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let path = p.uid_dir.join(&name);
+        let (opened, failed, inv) =
+            match open_top_level(&path, p.passphrase.as_str(), p.profile) {
+                TopOpen::Cipher(conn) => {
+                    let inv = inventory::inventory_db(&conn).ok();
+                    (Some("cipher".to_string()), None, inv)
+                }
+                TopOpen::Plain(conn) => {
+                    let inv = inventory::inventory_db(&conn).ok();
+                    (Some("plain".to_string()), None, inv)
+                }
+                TopOpen::Failed(kind) => (None, Some(kind), None),
+            };
+        out.push(inventory::TopLevelInventory {
+            name,
+            opened,
+            failed,
+            inventory: inv,
+        });
+    }
+    out
 }
 
 /// The `--inventory` mode (L1, dry-run only — parse refuses `--apply`
@@ -759,6 +870,50 @@ pub fn run_inventory(a: &ImportArgs) -> Result<Vec<String>, String> {
         "inventory: message DBs: one_to_one={} group={} stranger_box={} undefined={} other={}",
         g.one_to_one, g.group, g.stranger_box, g.undefined, g.other
     ));
+    // Batch 27 M1: the top-level DBs beside `Core\` — the same shape
+    // lines as Core/ for one that opens, the open failure KIND for one
+    // that does not. Nothing above this line changed.
+    let (mut n_cipher, mut n_plain, mut n_failed) = (0usize, 0usize, 0usize);
+    for t in &g.inv.top_level {
+        match t.opened.as_deref() {
+            Some("cipher") => n_cipher += 1,
+            Some("plain") => n_plain += 1,
+            Some(_) => {}
+            None => n_failed += 1,
+        }
+    }
+    lines.push(format!(
+        "inventory: top-level DBs: {} (opened cipher={} plain={} no={})",
+        g.inv.top_level.len(),
+        n_cipher,
+        n_plain,
+        n_failed
+    ));
+    for t in &g.inv.top_level {
+        match (t.opened.as_deref(), &t.inventory) {
+            (Some(how), Some(inv)) => {
+                lines.push(format!(
+                    "inventory: top-level {} opened=yes ({how}) ({} table(s))",
+                    t.name,
+                    inv.tables.len()
+                ));
+                for tb in &inv.tables {
+                    lines.push(tb.line());
+                }
+            }
+            // Opened but the table inventory itself failed: counted,
+            // never fatal (the report is an aggregate).
+            (Some(how), None) => lines.push(format!(
+                "inventory: top-level {} opened=yes ({how}) (table inventory failed — counted)",
+                t.name
+            )),
+            (None, _) => lines.push(format!(
+                "inventory: top-level {} opened=no ({})",
+                t.name,
+                t.failed.as_deref().unwrap_or("unknown")
+            )),
+        }
+    }
     if let Some(out) = &a.out {
         let json = serde_json::to_string_pretty(&g.inv)
             .map_err(|e| format!("--out {}: serializing the inventory failed: {e}", out.display()))?;
@@ -1697,6 +1852,60 @@ pub fn run_media_plan(a: &ImportArgs) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+// --- batch 27 M2/M3: the local-media probe + the dry-run plan --------------
+
+/// The `--local-media-probe` mode (batch 27 M2, dry-run only — parse
+/// refuses `--apply` and every other mode): the read-only census of
+/// the Zalo PC local media tree as the Desktop's own rows describe it.
+/// `--local-media-root` is REQUIRED (parse enforces); the report never
+/// prints a path value, file name, uid, msgId or message text — only
+/// counts, the fixed `<sub>` vocabulary, path-shape classes, extension
+/// and magic classes, length/charset buckets and booleans. Every
+/// snapshot DB opens `mode=ro&immutable=1`; the only file facts ever
+/// gathered are the first 16 bytes and `metadata().len()`.
+pub fn run_local_media_probe(a: &ImportArgs) -> Result<Vec<String>, String> {
+    let root = a
+        .local_media_root
+        .as_deref()
+        .expect("cli::main routes --local-media-probe here; parse guarantees --local-media-root");
+    if !root.is_dir() {
+        return Err(format!(
+            "--local-media-root: {} is not a directory — pass the Zalo PC media root \
+             (the dir whose `media` child holds the per-uid trees)",
+            root.display()
+        ));
+    }
+    let p = prepare(a)?;
+    local_media::probe_report(&p, root, a.out.as_deref())
+}
+
+/// The `--local-media-plan` mode (batch 27 M3, DRY RUN ONLY — parse
+/// refuses `--apply` and every other mode): open the shadow store
+/// READ-ONLY with the normal key resolution (the `repair_cli` pattern;
+/// a Locked passphrase store refuses), mirror how the import mapped
+/// Desktop `msgId` → shadow `msg_id`, and classify every import-sourced
+/// attachment into exactly one outcome per shadow kind. NO writes of
+/// any kind: no DB, no files, no temp copies — the bytes `would_copy`
+/// names are counted, never moved.
+pub fn run_local_media_plan(a: &ImportArgs) -> Result<Vec<String>, String> {
+    let root = a
+        .local_media_root
+        .as_deref()
+        .expect("cli::main routes --local-media-plan here; parse guarantees --local-media-root");
+    let target = a
+        .target
+        .as_deref()
+        .expect("cli::main routes --local-media-plan here; parse guarantees --target");
+    if !root.is_dir() {
+        return Err(format!(
+            "--local-media-root: {} is not a directory — pass the Zalo PC media root \
+             (the dir whose `media` child holds the per-uid trees)",
+            root.display()
+        ));
+    }
+    local_media::plan_report(a, root, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1839,6 +2048,9 @@ mod tests {
             target: None,
             unmapped_as_raw: false,
             media_plan: false,
+            local_media_probe: false,
+            local_media_plan: false,
+            local_media_root: None,
             content_shape: None,
             by: None,
             decrypt_basic: false,
@@ -2527,6 +2739,90 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("inventory: sample group: none found in the snapshot"), "{joined}");
         assert!(joined.contains("message DBs: one_to_one=1 group=0"), "{joined}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch 27 M1: `--inventory` covers the TOP-LEVEL snapshot DBs —
+    /// the `*.db` files beside `Core\` — with the same open path and
+    /// key as `Core/*.db` (cipher), then plain, and reports the
+    /// failure KIND for one that opens neither way. The Core/ output
+    /// above the new section is unchanged.
+    #[test]
+    #[cfg(windows)]
+    fn run_inventory_covers_the_top_level_snapshot_dbs() {
+        let dir = temp_dir("invtop");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_rich(&dir, pass);
+        // Three top-level DBs: one the snapshot key opens (cipher),
+        // one plain SQLite, one garbage (neither path opens it).
+        make_cipher_db_sql(
+            &dir.join("TopCipher.db"),
+            pass,
+            "CREATE TABLE tc (x INTEGER); INSERT INTO tc VALUES (1);",
+        );
+        {
+            let conn = Connection::open_with_flags(
+                &dir.join("TopPlain.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE tp (y INTEGER); INSERT INTO tp VALUES (2);")
+                .unwrap();
+            conn.close().map_err(|(_, e)| e).unwrap();
+        }
+        std::fs::write(dir.join("TopGarbage.db"), b"not a sqlite database at all").unwrap();
+        let out = dir.join("inv-top.json");
+        let mut a = args_for(&dir, &sha12(pass.as_bytes()), Some(&key));
+        a.inventory = true;
+        a.out = Some(out.clone());
+        let lines = run_inventory(&a).unwrap();
+        let joined = lines.join("\n");
+        // The Core/ lines are unchanged (M1: nothing above the new
+        // section moves).
+        assert!(joined.contains("inventory: Core/Index.db (1 table(s))"), "{joined}");
+        assert!(
+            joined.contains("message DBs: one_to_one=1 group=1 stranger_box=1 undefined=1 other=1"),
+            "{joined}"
+        );
+        // The new section: counts per open verdict + the SAME shape
+        // lines as Core/ for the ones that open.
+        assert!(
+            joined.contains("inventory: top-level DBs: 3 (opened cipher=1 plain=1 no=1)"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("inventory: top-level TopCipher.db opened=yes (cipher) (1 table(s))"),
+            "{joined}"
+        );
+        assert!(joined.contains("  tc: rows=1 cols=(x:INTEGER) idx=(-)"), "{joined}");
+        assert!(
+            joined.contains("inventory: top-level TopPlain.db opened=yes (plain) (1 table(s))"),
+            "{joined}"
+        );
+        assert!(joined.contains("  tp: rows=1 cols=(y:INTEGER) idx=(-)"), "{joined}");
+        assert!(
+            joined.contains("inventory: top-level TopGarbage.db opened=no (sqlite_NotADatabase/26)"),
+            "{joined}"
+        );
+        // The --out JSON carries the same section (sorted by name:
+        // Cipher < Garbage < Plain).
+        let back: inventory::SnapshotInventories =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(back.top_level.len(), 3);
+        assert_eq!(back.top_level[0].name, "TopCipher.db");
+        assert_eq!(back.top_level[0].opened.as_deref(), Some("cipher"));
+        assert_eq!(back.top_level[0].inventory.as_ref().unwrap().tables.len(), 1);
+        assert_eq!(back.top_level[1].name, "TopGarbage.db");
+        assert_eq!(back.top_level[1].opened, None);
+        assert_eq!(
+            back.top_level[1].failed.as_deref(),
+            Some("sqlite_NotADatabase/26")
+        );
+        assert_eq!(back.top_level[2].name, "TopPlain.db");
+        assert_eq!(back.top_level[2].opened.as_deref(), Some("plain"));
+        // The snapshot was never written to (immutable proof: no new
+        // files appeared beside the fixture set).
         let _ = std::fs::remove_dir_all(&dir);
     }
 

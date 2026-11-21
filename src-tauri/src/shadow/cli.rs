@@ -2,7 +2,9 @@
 //! batch 12 adds `--inventory`/`--out` and the
 //! `--mapping`/`--shadow-copy`/`--delta` dry-run mode; batch 14
 //! adds the whitelisted `--distinct` code-column probe; batch 23a
-//! adds the `--content-shape … --by` content-shape probe).
+//! adds the `--content-shape … --by` content-shape probe; batch 27
+//! adds the `--local-media-probe` census and the `--local-media-plan`
+//! dry-run planner over the Zalo PC local media tree).
 //!
 //! Spec (KQ4: the import only ever reads a COLD SNAPSHOT):
 //! ```text
@@ -94,6 +96,42 @@ modes (one per run; everything except --apply is dry-run only):
                              same-volume yes/no, and the bytes hardlinking
                              would save vs copying. Counts only — no hashing,
                              no hardlinks, nothing written.
+  --local-media-probe       batch 27 M2, read-only census of the Zalo PC
+                             local media tree as the Desktop's own rows see
+                             it, per Desktop msgType code: localPath/
+                             folderPath/previewThumb presence, path shape
+                             class (abs_drive/abs_unc/relative/file_url/
+                             other), under-root yes/no, the <sub> it falls
+                             in (picture/video/file/fileNoise/fileThumb/
+                             voice/richThumb/zinstant/resource/Cache/sticker,
+                             else other), file exists, size==fileSize, magic
+                             class of the first 16 bytes, and the
+                             name-contains-msgId/-cliMsgId/-sendDttm
+                             booleans; PLUS the Index.db zcloud localPath
+                             census by zType and the reverse-coverage walk
+                             (files under <root>\\media\\*\\ZaloDownloads\\*
+                             that no message row points at, per <sub> +
+                             magic histogram, *.rescache skipped, hard cap
+                             200k files). --out <file> writes the same
+                             report and refuses if the file exists. Never
+                             prints a path value, file name, uid, msgId or
+                             message text. Needs --local-media-root.
+  --local-media-plan        batch 27 M3, DRY RUN ONLY: for each attachment
+                             whose message has source='import' (any status),
+                             find the Desktop row with the same message id
+                             (msgId -> msg_id, the import's own mapping),
+                             resolve its localPath (folderPath when
+                             relative) and classify ONE outcome per shadow
+                             kind: already_downloaded / would_copy /
+                             magic_mismatch / missing_file / no_local_path /
+                             noise_obfuscated / no_desktop_row /
+                             outside_root / size_excluded, plus the total
+                             bytes would_copy would add. The store opens
+                             READ-ONLY with the repair_cli key resolution
+                             (a Locked passphrase store refuses — the CLI
+                             never accepts a password). NO writes of any
+                             kind: no DB, no files, no temp copies. Needs
+                             --local-media-root and --target.
   --apply                    2.5, the guarded write step (see the
                              preconditions at the bottom) — needs
                              --mapping, --target and --i-have-a-backup-plan
@@ -105,7 +143,12 @@ flags:
 --uin-hash       expected sha256-12 of the Desktop key (12 lowercase hex)
 --key-file       DPAPI-wrapped D7 key capture (the key is never on argv)
 --cipher-compat  force cipher profile 3 or 4 instead of auto-detecting
---out <file>     JSON report (with --inventory or --content-shape)
+--out <file>     JSON report (with --inventory or --content-shape); the same
+                  report as text (with --local-media-probe)
+--local-media-root <dir>  the Zalo PC LOCAL media root — a USER SETTING
+                  passed explicitly (the dir whose `media` child holds the
+                  per-uid ZaloDownloads trees), never read from the
+                  snapshot; required by both local-media modes
 --shadow-copy    shadow STORE dir whose temp COPY is classified against
                   (its files are read; the store itself is never opened)
 --delta          skip rows at/before the per-DB import cursor (dry-run only)
@@ -130,8 +173,10 @@ flags:
                   (never printed; env ZR_OWN_UID, shape-validated, wins as
                   the override)
 --dry-run        inventory only, zero writes (the default)
---target <dir>   with --apply: the shadow STORE dir to write into. No
-                  default — the live store is never silently chosen
+--target <dir>   with --apply: the shadow STORE dir to write into (no
+                  default — the live store is never silently chosen).
+                  With --local-media-plan: the shadow STORE dir to
+                  classify READ-ONLY (the app may keep running)
 --i-have-a-backup-plan   with --apply: the explicit confirmation flag. The
                   run still makes its own verified backup first
                   (<target>\\pre-import-backups\\) before the first write;
@@ -226,6 +271,23 @@ pub struct ImportArgs {
     /// `--media-plan` (batch 16 P2, 2.6): the media hardlink PREP dry
     /// run — counts only, no hashing, no hardlinks. Its own mode.
     pub media_plan: bool,
+    /// `--local-media-probe` (batch 27 M2): the read-only census of
+    /// the Zalo PC local media tree — every snapshot message row's
+    /// `localPath` by Desktop msgType code, the Index.db `zcloud`
+    /// census by `zType`, and the reverse-coverage walk. Its own
+    /// dry-run mode; requires `--local-media-root`.
+    pub local_media_probe: bool,
+    /// `--local-media-plan` (batch 27 M3): the DRY-RUN copy planner —
+    /// for each import-sourced attachment, resolve the Desktop row's
+    /// `localPath` and classify the outcome per shadow kind. NO
+    /// writes of any kind. Its own dry-run mode; requires
+    /// `--local-media-root` and `--target`.
+    pub local_media_plan: bool,
+    /// `--local-media-root <dir>` (batch 27): the Zalo PC local media
+    /// root — a USER SETTING passed explicitly (the dir whose
+    /// `media` child holds the per-uid `ZaloDownloads` trees). Never
+    /// read from the snapshot. Required by both local-media modes.
+    pub local_media_root: Option<PathBuf>,
     /// `--content-shape <kind>:<table>.<content_col>` (batch 23a C1):
     /// the content-SHAPE probe mode — per distinct value of the
     /// whitelisted `--by` code column, the row count, the JSON-shape
@@ -324,6 +386,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         (false, false, false, false, false);
     let (mut all_dbs, mut own_uid_from_settings, mut decrypt_basic) = (false, false, false);
     let (mut i_have_a_backup_plan, mut unmapped_as_raw, mut media_plan) = (false, false, false);
+    let (mut local_media_probe, mut local_media_plan) = (false, false);
+    let mut local_media_root: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -343,6 +407,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--target"
                 | "--content-shape"
                 | "--by"
+                | "--local-media-root"
         );
         if value_flag {
             let value =
@@ -364,6 +429,12 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 // Batch 16 P1 (2.5): the store the apply writes into —
                 // no default, the user passes it.
                 "--target" => set_once(&mut target, flag, PathBuf::from(value))?,
+                // Batch 27 M2/M3: the Zalo PC local media root — a
+                // user setting passed explicitly, never read from the
+                // snapshot.
+                "--local-media-root" => {
+                    set_once(&mut local_media_root, flag, PathBuf::from(value))?
+                }
                 // Batch 14 N1: repeatable, max 10 per run. The spec
                 // shape (kind, table, column) is validated HERE, pure;
                 // existence + the code-column whitelist run against
@@ -419,6 +490,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             "--media-plan" => set_bool_once(&mut media_plan, flag)?,
             // Batch 24 D3: the content-shape probe's decode rider.
             "--decrypt-basic" => set_bool_once(&mut decrypt_basic, flag)?,
+            // Batch 27 M2/M3: the two local-media modes.
+            "--local-media-probe" => set_bool_once(&mut local_media_probe, flag)?,
+            "--local-media-plan" => set_bool_once(&mut local_media_plan, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -459,6 +533,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             ("--distinct", !distinct.is_empty()),
             ("--media-plan", media_plan),
             ("--content-shape", content_shape.is_some()),
+            ("--local-media-probe", local_media_probe),
+            ("--local-media-plan", local_media_plan),
         ]
         .into_iter()
         .find(|(_, on)| *on);
@@ -492,20 +568,33 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         }
     }
     for (on, flag) in [
-        (target.is_some(), "--target"),
+        // Batch 27 M3: --target also rides --local-media-plan (a
+        // read-only mode), so the apply-mode refusal is conditional.
+        (
+            target.is_some() && !local_media_plan,
+            "--target",
+        ),
         (i_have_a_backup_plan, "--i-have-a-backup-plan"),
         (unmapped_as_raw, "--unmapped-as-raw"),
     ] {
         if on && !apply {
+            if flag == "--target" {
+                return Err(
+                    "--target is an --apply/--local-media-plan-mode flag: add --apply (and \
+                                         its other preconditions) or --local-media-plan, or drop it"
+                        .into(),
+                );
+            }
             return Err(format!(
                 "{flag} is an --apply-mode flag: add --apply (and its other \
                  preconditions) or drop it"
             ));
         }
     }
-    if out.is_some() && !inventory && content_shape.is_none() {
+    if out.is_some() && !inventory && content_shape.is_none() && !local_media_probe {
         return Err(
-            "--out needs --inventory or --content-shape (it is the JSON report of one of them)"
+            "--out needs --inventory, --content-shape or --local-media-probe (it is the report \
+             file of one of them)"
                 .into(),
         );
     }
@@ -548,6 +637,58 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         return Err(
             "--media-plan cannot be combined with --mapping/--shadow-copy/--delta \
              (it needs no mapping — it discovers the media tables itself)"
+                .into(),
+        );
+    }
+    // Batch 27 M2/M3: the two local-media modes are their own dry-run
+    // modes — mutually exclusive with every other mode and each other.
+    if (local_media_probe || local_media_plan)
+        && (inventory
+            || mapping.is_some()
+            || shadow_copy.is_some()
+            || delta
+            || media_plan
+            || !distinct.is_empty()
+            || content_shape.is_some())
+    {
+        return Err(
+            "--local-media-probe/--local-media-plan cannot be combined with \
+             --inventory/--mapping/--shadow-copy/--delta/--distinct/--content-shape/--media-plan \
+             (one mode per run)"
+                .into(),
+        );
+    }
+    if local_media_probe && local_media_plan {
+        return Err(
+            "--local-media-probe and --local-media-plan are mutually exclusive \
+             (one mode per run)"
+                .into(),
+        );
+    }
+    // Both modes need the root (a user setting, never a snapshot
+    // value); the root without either mode is an error too.
+    if (local_media_probe || local_media_plan) && local_media_root.is_none() {
+        return Err(
+            "--local-media-probe/--local-media-plan need --local-media-root <dir>: the Zalo PC \
+             local media root (a user setting — the dir whose `media` child holds the \
+             per-uid ZaloDownloads trees)"
+                .into(),
+        );
+    }
+    if local_media_root.is_some() && !local_media_probe && !local_media_plan {
+        return Err(
+            "--local-media-root needs --local-media-probe or --local-media-plan (it is the \
+             local-media modes' root argument)"
+                .into(),
+        );
+    }
+    // M3 needs the store. (A `--local-media-probe --target …` misuse
+    // is caught by the generic --target rule above, which names both
+    // modes that may carry the flag.)
+    if local_media_plan && target.is_none() {
+        return Err(
+            "--local-media-plan needs --target <shadow store dir>: the plan classifies the \
+             store's import-sourced attachments (read-only — the app may keep running)"
                 .into(),
         );
     }
@@ -637,6 +778,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             i_have_a_backup_plan,
             unmapped_as_raw,
             media_plan,
+            local_media_probe,
+            local_media_plan,
+            local_media_root,
             content_shape,
             by,
             decrypt_basic,
@@ -662,6 +806,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         i_have_a_backup_plan,
         unmapped_as_raw,
         media_plan,
+        local_media_probe,
+        local_media_plan,
+        local_media_root,
         content_shape,
         by,
         decrypt_basic,
@@ -758,6 +905,33 @@ pub fn main(args: &[String]) -> i32 {
         },
         // Batch 16 P2 (2.6): the media hardlink PREP dry run.
         Ok(a) if a.media_plan => match import::run_media_plan(&a) {
+            Ok(lines) => {
+                for line in &lines {
+                    println!("{line}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                1
+            }
+        },
+        // Batch 27 M2: the local-media read-only census.
+        Ok(a) if a.local_media_probe => match import::run_local_media_probe(&a) {
+            Ok(lines) => {
+                for line in &lines {
+                    println!("{line}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                1
+            }
+        },
+        // Batch 27 M3: the local-media DRY-RUN copy planner (no
+        // writes of any kind).
+        Ok(a) if a.local_media_plan => match import::run_local_media_plan(&a) {
             Ok(lines) => {
                 for line in &lines {
                     println!("{line}");
@@ -909,13 +1083,16 @@ mod tests {
 
     #[test]
     fn parse_apply_mode_flags_require_apply() {
-        // Each apply-mode flag outside --apply names itself.
-        for (flags, flag) in [
-            (vec!["--target", r"D:\shadow"], "--target"),
-            (vec!["--i-have-a-backup-plan"], "--i-have-a-backup-plan"),
-            (vec!["--unmapped-as-raw"], "--unmapped-as-raw"),
-        ] {
-            let e = parse(&with_base(&flags)).unwrap_err();
+        // Each apply-mode flag outside --apply names itself. Batch 27
+        // M3: --target also rides --local-media-plan, so its refusal
+        // names BOTH modes; the two pure apply flags keep theirs.
+        let e = parse(&with_base(&["--target", r"D:\shadow"])).unwrap_err();
+        assert!(
+            e.contains("--target is an --apply/--local-media-plan-mode flag"),
+            "{e}"
+        );
+        for flag in ["--i-have-a-backup-plan", "--unmapped-as-raw"] {
+            let e = parse(&with_base(&[flag])).unwrap_err();
             assert!(
                 e.contains(&format!("{flag} is an --apply-mode flag")),
                 "{flag} -> {e}"
@@ -945,6 +1122,131 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(e.contains("--i-have-a-backup-plan given twice"), "{e}");
+    }
+
+    // --- batch 27 M2/M3: --local-media-probe / --local-media-plan (parse) ---
+
+    #[test]
+    fn parse_local_media_modes_rules() {
+        // The probe needs only the root; the plan needs the root AND
+        // the store.
+        let a = parse(&with_base(&[
+            "--local-media-probe",
+            "--local-media-root",
+            r"D:\Zalo Data",
+        ]))
+        .unwrap();
+        assert!(a.local_media_probe && !a.local_media_plan);
+        assert_eq!(a.local_media_root, Some(PathBuf::from(r"D:\Zalo Data")));
+        assert!(!a.apply);
+        let a = parse(&with_base(&[
+            "--local-media-plan",
+            "--local-media-root",
+            r"D:\Zalo Data",
+            "--target",
+            r"D:\shadow",
+        ]))
+        .unwrap();
+        assert!(a.local_media_plan && !a.local_media_probe);
+        assert_eq!(a.target, Some(PathBuf::from(r"D:\shadow")));
+        // --out rides the probe (the report file) and refuses to
+        // overwrite at run time.
+        let a = parse(&with_base(&[
+            "--local-media-probe",
+            "--local-media-root",
+            r"D:\Zalo Data",
+            "--out",
+            "report.txt",
+        ]))
+        .unwrap();
+        assert_eq!(a.out, Some(PathBuf::from("report.txt")));
+
+        // Every missing / misused flag names itself.
+        for (flags, needle) in [
+            (
+                vec!["--local-media-probe"],
+                "need --local-media-root",
+            ),
+            (
+                vec!["--local-media-plan", "--target", r"D:\s"],
+                "need --local-media-root",
+            ),
+            (
+                vec!["--local-media-plan", "--local-media-root", r"D:\Z"],
+                "--local-media-plan needs --target",
+            ),
+            (
+                vec!["--local-media-root", r"D:\Z"],
+                "--local-media-root needs --local-media-probe or --local-media-plan",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-plan"],
+                "mutually exclusive",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-root", r"D:\Z", "--target", r"D:\s"],
+                "--target is an --apply/--local-media-plan-mode flag",
+            ),
+            (
+                vec!["--local-media-plan", "--local-media-root", r"D:\Z", "--out", "x"],
+                "--out needs --inventory, --content-shape or --local-media-probe",
+            ),
+            // One mode per run: each existing mode conflicts.
+            (
+                vec!["--local-media-probe", "--local-media-root", r"D:\Z", "--inventory"],
+                "--local-media-probe/--local-media-plan cannot be combined",
+            ),
+            (
+                vec!["--local-media-plan", "--local-media-root", r"D:\Z", "--target", r"D:\s",
+                     "--mapping", "m.json"],
+                "--local-media-probe/--local-media-plan cannot be combined",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-root", r"D:\Z",
+                     "--distinct", "one2one:message.msgType"],
+                "--local-media-probe/--local-media-plan cannot be combined",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-root", r"D:\Z",
+                     "--content-shape", "one2one:message.message", "--by", "msgType"],
+                "--local-media-probe/--local-media-plan cannot be combined",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-root", r"D:\Z", "--media-plan"],
+                "--local-media-probe/--local-media-plan cannot be combined",
+            ),
+            // Dry-run only: --apply conflicts, naming the flag.
+            (
+                vec!["--apply", "--i-have-a-backup-plan", "--target", r"D:\s",
+                     "--mapping", "m.json", "--local-media-probe",
+                     "--local-media-root", r"D:\Z"],
+                "--local-media-probe is dry-run only and conflicts with --apply",
+            ),
+            (
+                vec!["--apply", "--i-have-a-backup-plan", "--target", r"D:\s",
+                     "--mapping", "m.json", "--local-media-plan",
+                     "--local-media-root", r"D:\Z"],
+                "--local-media-plan is dry-run only and conflicts with --apply",
+            ),
+            // Duplicates.
+            (
+                vec!["--local-media-probe", "--local-media-probe"],
+                "--local-media-probe given twice",
+            ),
+            (
+                vec!["--local-media-probe", "--local-media-root", "a",
+                     "--local-media-root", "b"],
+                "--local-media-root given twice",
+            ),
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(e.contains(needle), "{:?} -> {e}", flags);
+        }
+        // A CONSISTENT invocation yields to help; a conflicting pair
+        // beats it (the batch-6 convention).
+        let a = parse(&args(&["--help", "--local-media-probe", "--local-media-root", "r"]))
+            .unwrap();
+        assert!(a.help);
     }
 
     // --- batch 16 P2: --media-plan (parse level) ------------------------
