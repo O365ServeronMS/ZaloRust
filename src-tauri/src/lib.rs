@@ -97,19 +97,34 @@ pub fn run() {
                 // autostart relaunch carrying --minimized (stay hidden in the tray).
                 // Both toggle_active and show_main defer to the lock screen when locked,
                 // so neither can bypass the app lock.
-                if args.iter().any(|a| a == "--settings") {
-                    window::open_settings_window(app);
-                } else if args.iter().any(|a| a == "--toggle") {
-                    window::toggle_active(app);
-                } else if let Some(link) = links::link_from_args(&args) {
-                    // A zalors:// (or chat.zalo.me) link handed to a second launch by
-                    // the OS scheme handler (issue #23): open it in the running copy.
-                    links::open_from_outside(app, &link);
-                } else if !settings::start_hidden(
-                    cfg!(windows) && settings::load(app).start_minimized,
-                    &args,
-                ) {
-                    window::show_main(app);
+                //
+                // Batch 22 Q1: the branching is now [`second_launch_intent`]
+                // (pure, unit-tested), with `--quit` classified FIRST — a
+                // scripted quit (tools/deploy-local.ps1 -Stop) must never be
+                // masked by another flag in the same argv. The Quit arm only
+                // calls [`tray::quit`], the same exit path as the tray Quit
+                // item, and reveals nothing on the way: the locked-state
+                // paths below (settings / toggle / link / show_main) are
+                // simply not reached, matching the tray menu, where `quit`
+                // is the one item exempt from the locked-state redirect to
+                // the lock screen. So quitting while locked just exits.
+                match second_launch_intent(&args) {
+                    SecondLaunch::Quit => tray::quit(app),
+                    SecondLaunch::Settings => window::open_settings_window(app),
+                    SecondLaunch::Toggle => window::toggle_active(app),
+                    SecondLaunch::Link(link) => {
+                        // A zalors:// (or chat.zalo.me) link handed to a second launch by
+                        // the OS scheme handler (issue #23): open it in the running copy.
+                        links::open_from_outside(app, &link);
+                    }
+                    SecondLaunch::Show => {
+                        if !settings::start_hidden(
+                            cfg!(windows) && settings::load(app).start_minimized,
+                            &args,
+                        ) {
+                            window::show_main(app);
+                        }
+                    }
                 }
             },
         );
@@ -493,4 +508,131 @@ pub fn run() {
                 }
             }
         });
+}
+
+// --- batch 22 Q1: `zalors --quit` -------------------------------------------
+
+/// Does this argv ask the app to quit? (batch 22 Q1) Used by BOTH
+/// decisions the flag drives: `main.rs` (may it start Tauri at all?) and
+/// [`second_launch_intent`] (what a forwarded argv tells the running
+/// instance to do). argv[0] is the program path on every caller — our own
+/// `std::env::args()` as well as the argv the single-instance plugin hands
+/// over for a second launch — so it is skipped; `--quit` wins wherever it
+/// appears after it.
+pub fn wants_quit(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "--quit")
+}
+
+/// What a second instance's argv asks the RUNNING app to do. Pure — the
+/// single-instance callback only turns this into calls, and everything the
+/// `Show` arm needs beyond argv (the start-minimized preference, the
+/// platform) stays there: this fn classifies ARGS only.
+///
+/// Precedence: [`SecondLaunch::Quit`] first — a scripted quit
+/// (tools/deploy-local.ps1 -Stop) must never be masked by another flag in
+/// the same argv — then the pre-existing order: `--settings`, `--toggle`,
+/// the first Zalo link, and the plain raise-the-window fallback.
+#[cfg_attr(not(desktop), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum SecondLaunch {
+    Quit,
+    Settings,
+    Toggle,
+    Link(String),
+    Show,
+}
+
+#[cfg_attr(not(desktop), allow(dead_code))]
+fn second_launch_intent(args: &[String]) -> SecondLaunch {
+    if wants_quit(args) {
+        SecondLaunch::Quit
+    } else if args.iter().any(|a| a == "--settings") {
+        SecondLaunch::Settings
+    } else if args.iter().any(|a| a == "--toggle") {
+        SecondLaunch::Toggle
+    } else if let Some(link) = links::link_from_args(args) {
+        SecondLaunch::Link(link)
+    } else {
+        SecondLaunch::Show
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{second_launch_intent, wants_quit, SecondLaunch};
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn quit_flag_marks_the_whole_argv_but_never_argv0() {
+        assert!(wants_quit(&argv(&["zalors.exe", "--quit"])));
+        // Wherever it appears, and whatever else travels with it.
+        assert!(wants_quit(&argv(&[
+            r"D:\x\zalors.exe",
+            "--settings",
+            "--toggle",
+            "--quit",
+            "zalors://open"
+        ])));
+        // argv[0] is the program path, not a flag.
+        assert!(!wants_quit(&argv(&[r"D:\--quit\zalors.exe"])));
+        assert!(!wants_quit(&argv(&["zalors.exe", "--settings", "--toggle"])));
+    }
+
+    #[test]
+    fn quit_beats_every_other_intent() {
+        let a = argv(&[r"D:\x\zalors.exe", "--settings", "--toggle", "--quit"]);
+        assert_eq!(second_launch_intent(&a), SecondLaunch::Quit);
+        // Even when a link is present — quitting must not navigate first.
+        let b = argv(&[r"D:\x\zalors.exe", "https://chat.zalo.me/a", "--quit"]);
+        assert_eq!(second_launch_intent(&b), SecondLaunch::Quit);
+    }
+
+    #[test]
+    fn the_pre_existing_order_is_unchanged() {
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "--settings"])),
+            SecondLaunch::Settings
+        );
+        // --settings keeps winning over --toggle, as before.
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "--toggle", "--settings"])),
+            SecondLaunch::Settings
+        );
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "--toggle"])),
+            SecondLaunch::Toggle
+        );
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "zalors://home"])),
+            SecondLaunch::Link("zalors://home".to_string())
+        );
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "https://chat.zalo.me/a"])),
+            SecondLaunch::Link("https://chat.zalo.me/a".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_relaunch_and_start_hidden_flags_stay_show() {
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe"])),
+            SecondLaunch::Show
+        );
+        // --autostart/--minimized/--show classify as Show: whether the
+        // window may be raised is `settings::start_hidden`'s call
+        // (saved preference + platform), which is why it stays in the
+        // callback, not here.
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "--autostart", "--minimized"])),
+            SecondLaunch::Show
+        );
+        // A non-Zalo argument is not a link: the Show fallback.
+        assert_eq!(
+            second_launch_intent(&argv(&["zalors.exe", "--show", "https://example.com/x"])),
+            SecondLaunch::Show
+        );
+    }
 }

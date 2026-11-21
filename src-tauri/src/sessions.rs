@@ -305,7 +305,7 @@ fn install_menu(app: &AppHandle, w: &Window) -> tauri::Result<()> {
                 "app.back"=>close_panel(&a),
                 "app.reload"=> { if crate::lock::is_unlocked(&a) { if let Some(label)=selected(&a,&parent) { if let Some(v)=a.get_webview(&label) { let _=v.reload(); } } } },
                 "app.lock"=> { if crate::applock::load(&a).is_active() { crate::lock::lock_now(&a); } },
-                "app.quit"=>a.exit(0),
+                "app.quit"=>crate::tray::quit(&a),
                 _=>{}
             }
         });

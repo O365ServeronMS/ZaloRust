@@ -58,6 +58,22 @@ fn app_scale(app: &AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// The ONE app-quit path (batch 22 Q1): the tray menu's `Sair` item, the
+/// window menu's `Sair do Zalo` item, and a `--quit` argv forwarded to the
+/// running instance by the single-instance plugin all end HERE — the exact
+/// body the tray Quit item had before, nothing new. `app.exit(0)` fires
+/// `RunEvent::ExitRequested`, whose handler in `lib.rs` runs the exit hooks
+/// (macOS menubar restore, `shadow::backup::on_exit`) and then lets the
+/// process exit with code 0 — so a scripted `--quit` runs the backup-on-exit
+/// exactly like a tray quit does. No other code path may exit the app on
+/// user request.
+pub fn quit(app: &AppHandle) {
+    // Restore panel geometry before window state is saved.
+    #[cfg(target_os = "macos")]
+    crate::menubar::restore_all(app);
+    app.exit(0)
+}
+
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     // Placeholder menu; rebuild_menu fills in the per-account items at startup.
     let menu = MenuBuilder::new(app).build()?;
@@ -93,12 +109,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                     }
                 }
                 "lock" => crate::lock::lock_now(app),
-                "quit" => {
-                    // Restore panel geometry before window state is saved.
-                    #[cfg(target_os = "macos")]
-                    crate::menubar::restore_all(app);
-                    app.exit(0)
-                }
+                "quit" => quit(app),
                 _ => {}
             }
         })
