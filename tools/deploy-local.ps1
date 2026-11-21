@@ -261,10 +261,10 @@ try {
         Write-Host "  DRY-RUN: would ALWAYS remove it after the build -- git -C `"$Repo`" worktree remove `"$worktree`""
         Write-Host '  DRY-RUN: (--force as the fallback) -- after a successful OR failed build alike, before anything else runs.'
     } else {
+        $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
         if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
             Fail 'cargo not found (looked on PATH after prepending $env:USERPROFILE\.cargo\bin).'
         }
-        $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
         $env:CARGO_TARGET_DIR = $TargetDir
         New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
         $srcTauri = Join-Path $worktree 'src-tauri'
