@@ -203,6 +203,8 @@ fn probe_import_codes() {
         i_have_a_backup_plan: false,
         unmapped_as_raw: false,
         media_plan: false,
+        content_shape: None,
+        by: None,
         apply: false,
         help: false,
     };

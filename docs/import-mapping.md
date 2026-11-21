@@ -1,8 +1,8 @@
 # Desktop → shadow mapping (Phase 2.3/2.4 tooling)
 
 This is the how-to for the tools batch 12 added to `zalors import`,
-the batch-14 addition, the batch-15 additions, and the batch-16
-additions:
+the batch-14 addition, the batch-15 additions, the batch-16
+additions, and the batch-23a content-shape additions:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
@@ -22,6 +22,14 @@ additions:
   the Desktop NUMERIC msgType codes against the shadow payload's
   original wire `$.msgType` strings, matched by msgId — the type
   arbiter that needs no deploy;
+- `--content-shape <kind>:<table>.<col> --by <code_col>` (batch 23a)
+  — the content-SHAPE probe over a snapshot: per distinct code, the
+  JSON-shape census of one content column plus its top key
+  signatures, unable by construction to print a value;
+- `probe_shadow_content_shape` (batch 23a) — the shadow half of the
+  same shape census, grouped by the payload's wire `$.msgType` on a
+  temp COPY of the store; batch 23b combines the two halves with the
+  batch-15 cross-tab to fill the mapping's `msgType` table;
 - `--apply` (batch 16, §7) — the guarded write step (item 2.5): all
   preconditions enforced in code, a verified pre-import backup,
   batched savepoint writes with per-DB resume cursors, and a
@@ -182,6 +190,123 @@ rows, then per-code totals with the no-shadow-match counts, the
 dominant msgType and its purity. Fill the mapping's `msgType` table
 from the codes with **purity ≥ 90% and ≥ 5 matched rows**; leave the
 rest for a re-run after more soak coverage.
+
+## 1d. The content shapes (batch 23a)
+
+The cross-tab needs matched rows, and ~12.6k Desktop rows carry
+codes whose matches never reach that bar (19 ×8418, 20 ×2119,
+21 ×459, 52 ×343, 26 ×334, -4 ×278, -1909 ×128, 17 ×120, 7 ×79,
+25 ×65, -27 ×41, 3 ×30, 5 ×1). A second, INDEPENDENT arbiter is the
+SHAPE of the content: the top-level JSON key names and value types.
+A code whose content reads like `{href,params,title}` with `params`
+holding `fileSize/fileExt`, and whose few cross-tab hits say
+`share.file`, can be mapped with confidence.
+
+Two halves, one shared pure implementation
+(`shadow/import/content_shape.rs`):
+
+**The Desktop half — `--content-shape` (C1):**
+
+```powershell
+target\debug\zalors.exe import `
+  --from-snapshot "D:\ZaloRust Data\import-snapshot\2026-MM-DD" `
+  --account default --uin-hash dca62c394a68 `
+  --key-file "D:\.opencode\d7\zalo-desktop-uin-key-2026-11-19.bin" `
+  --content-shape one2one:message.message --by msgType `
+  [--all-dbs] [--out shapes.json]
+```
+
+- The spec is `<dbkind>:<table>.<content_col>` (the `--distinct`
+  spec shape); `--by <code_col>` is REQUIRED with it and must pass
+  the batch-14 code-column whitelist — the shapes are grouped by a
+  CODE column, and a content-bearing name is refused with the rule
+  quoted before any row is read. Dry-run only (`--apply` conflicts),
+  its own mode (cannot combine with `--inventory`/`--mapping`/
+  `--shadow-copy`/`--delta`/`--distinct`/`--media-plan`).
+- Without `--all-dbs` it reads the FIRST sample DB of the kind (the
+  very one `--inventory` reports); with `--all-dbs` (message kinds
+  only — an `index` spec is a parse error) it reads EVERY DB of the
+  kind and sums the groups, reporting `dbs=/opened=/failed=`.
+- Per distinct code (cap 64 codes, the rest merged into an `other`
+  group that always prints last — nothing is dropped), it prints:
+
+  ```
+  content-shape: code=19 rows=8418 json_object=8390 json_array=0 json_string_scalar=1 not_json=27 null=0
+  content-shape:  {action:s,childnumber:s,description:s,href:s,params:s{fileExt:s,fileSize:s},thumb:s,title:s,type:s} x 8000
+  ```
+
+  the per-code `rows` line is the check against the counts in the
+  mapping's `_notes` (the notes list them per code). `--out <file>`
+  writes the same data as JSON (BOM-less UTF-8).
+- The five buckets partition every row: `json_object` (the content
+  text parses as a JSON object), `json_array`, `json_string_scalar`
+  (the text parses as a JSON string), `not_json` (prose, blobs,
+  INTEGER/REAL cells, and number/bool/null JSON scalars), `null`.
+- A key signature is the sorted top-level keys with type letters
+  `s` string, `n` number, `b` bool, `o` object, `a` array, `z` null.
+  ONE level of nesting: a string value that itself parses as a JSON
+  object adds `key{inner}` (so `params:s` becomes
+  `params:s{fileExt:s,fileSize:s}` — the Desktop content column
+  stores `params` as JSON *text*); inner values are letters only, no
+  deeper nesting. Each signature caps at 24 keys with `…+N` appended
+  (the inner list gets the same cap inside the braces). The top 8
+  signatures print, most frequent first.
+- PRIVACY, by construction: a key name prints only when it matches
+  `^[A-Za-z_][A-Za-z0-9_]{0,31}$`, anything else prints
+  `k:<sha256-12>`; codes render through the `--distinct` renderer;
+  NO text, id, url, number or file name taken from the content can
+  appear — the unit tests feed sentinel-bearing contents and assert
+  every output line clean.
+
+**The shadow half — `probe_shadow_content_shape` (C2):**
+
+```powershell
+cargo test --lib probe_shadow_content_shape -- --ignored --nocapture
+```
+
+No required env: it copies the live store to a temp dir
+(`ZR_PROBE_DIR` overrides the source) and opens the COPY; the
+optional `ZR_PROBE_SINCE_MS` cuts the census to messages with
+`ts >= <epoch ms>`. It groups the messages by the payload's wire
+`$.msgType` (a code-like token `^[A-Za-z0-9._:-]{1,40}$` prints
+verbatim, anything else prints its h12; a missing msgType groups
+under `NULL`) and folds `$.content` through the SAME shared
+functions — the same buckets, signatures, nesting rule and caps
+(grouped as `msgType=` lines). The one representation difference to
+know when comparing: the wire payload's `params` is a real JSON
+object (letter `o`), while the Desktop column stores it as JSON text
+(`params:s{…}` with the inner keys expanded) — the key NAMES are the
+comparable part.
+
+## 1e. Batch 23b — mapping from the two shapes plus the cross-tab
+
+Batch 23b edits the mapping's `msgType` table from three pieces of
+evidence, in this order of trust:
+
+1. **The batch-15 cross-tab** (`probe_import_codes`): the direct
+   arbiter — a code whose matched rows reach purity ≥ 90% with ≥ 5
+   rows maps on that alone, as entries 1/2/4/6/18 already did.
+2. **The content shapes**: run C1 (`--content-shape … --by msgType
+   --all-dbs` over every message kind) and C2
+   (`probe_shadow_content_shape`) and compare each unmapped code's
+   signatures against every shadow msgType family's signatures.
+   **Promote a code only when its shape matches exactly ONE shadow
+   msgType family** (one family whose signatures share the code's
+   dominant key names — e.g. a code whose content is
+   `{href:s,params:s{fileExt:s,fileSize:s},title:s,type:s}` against
+   a family whose `$.content` shows `{href,params(o),title,type}`),
+   **AND any cross-tab hits it does have AGREE** (a code whose 1-2
+   matched rows point at a different msgType stays unmapped — the
+   shapes corroborate the cross-tab, they never outvote it).
+   Zero-match codes (7/17/26/3/25/5, -4/-27/-1909) may be promoted
+   on shape agreement alone, but only into the msgType the shadow
+   evidence pins uniquely; otherwise they stay unmapped for the
+   apply step's `--unmapped-as-raw` path.
+3. Record every promotion in the mapping's `_notes` with its
+   evidence (shape match + agreeing cross-tab hits), then re-run the
+   batch-15 cross-tab and the overlap probe before proposing an
+   apply; the apply preflight (§7 precondition 4) is the final gate
+   that lists anything still unmapped.
 
 ## 2. Write the mapping JSON
 

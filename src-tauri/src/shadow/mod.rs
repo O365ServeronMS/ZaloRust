@@ -366,3 +366,14 @@ mod probe_import_overlap;
 /// `ZR_MAPPING`.
 #[cfg(test)]
 mod probe_import_codes;
+
+/// Shadow-side content-shape probe (batch 23a C2): group the shadow
+/// copy's messages by the payload's wire `$.msgType` and print the
+/// SHAPE of `$.content` per group — the same counts, key signatures,
+/// nesting rule and caps as the C1 `--content-shape` mode (the
+/// shared `import::content_shape` functions), so batch 23b can map
+/// the unmapped Desktop msgType codes from both halves. Ignored: it
+/// reads a temp COPY of the live store (`ZR_PROBE_SINCE_MS`
+/// optional, no required env).
+#[cfg(test)]
+mod probe_shadow_content_shape;

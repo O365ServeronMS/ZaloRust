@@ -1315,6 +1315,8 @@ mod tests {
             target: Some(store.to_path_buf()),
             unmapped_as_raw: false,
             media_plan: false,
+            content_shape: None,
+            by: None,
             help: false,
         }
     }

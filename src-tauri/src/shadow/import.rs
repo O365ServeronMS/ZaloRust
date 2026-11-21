@@ -58,6 +58,12 @@ pub mod inventory;
 /// code-shape-only rendering), unit-tested against synthetic DBs.
 pub mod distinct;
 
+/// Batch 23a C1/C2: the content-SHAPE aggregation (key names + type
+/// letters only, never a value) shared by `--content-shape … --by`
+/// and the shadow-side `probe_shadow_content_shape` — the second,
+/// independent arbiter for the unmapped Desktop msgType codes.
+pub mod content_shape;
+
 /// The snapshot manifest file (F5 writes it, `run` requires it):
 /// proof that `--from-snapshot` is a cold, byte-verified copy.
 pub const SNAPSHOT_MANIFEST: &str = "snapshot-manifest.json";
@@ -876,9 +882,209 @@ pub fn run_distinct(a: &ImportArgs) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The `--content-shape <kind>:<table>.<content_col> --by <code_col>`
+/// mode (batch 23a C1, dry-run only — parse refuses `--apply` and the
+/// other modes): per distinct code of the whitelisted `--by` column,
+/// print the row count, the five-bucket JSON-shape census of the
+/// content column and the top 8 top-level key signatures — SHAPE
+/// ONLY, never a value (the shared `content_shape` module is unable
+/// to print one). Without `--all-dbs` the DB probed is the FIRST
+/// sample of the requested kind (the very one `--inventory`
+/// reports); with `--all-dbs` (message kinds only — parse refuses an
+/// `index` spec) every DB of the kind is read and the groups SUMMED.
+/// The spec's table + content column and the `--by` column are
+/// validated against the inventory BEFORE any row is read, and `--by`
+/// must pass the batch-14 code-column whitelist (all violations
+/// listed at once, the `plan` convention). `--out <file>` writes the
+/// same data as JSON (BOM-less UTF-8). Nothing writes to the
+/// snapshot; every DB opens `mode=ro&immutable=1`.
+pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
+    use import_map::MapDb;
+
+    let spec = a
+        .content_shape
+        .as_ref()
+        .expect("cli::main routes --content-shape here, parse guarantees --by");
+    let by = a
+        .by
+        .as_ref()
+        .expect("parse guarantees --by with --content-shape");
+    let p = prepare(a)?;
+    let g = gather_inventories(&p)?;
+
+    // Validate BEFORE any row is read: sample, table, the content
+    // column, the --by column, and the code-column whitelist on --by
+    // (the N1 hard rule — grouping by a content-bearing column would
+    // echo its values into the report).
+    let who = format!("--content-shape {}", distinct::spec_str(spec));
+    let mut errs = Vec::new();
+    if let Some(kinv) = sample_inventory(&g.inv, spec.kind) {
+        match kinv.inventory.table(&spec.table) {
+            None => errs.push(format!(
+                "{who}: table {:?} does not exist (inventory {})",
+                spec.table, kinv.source_rel
+            )),
+            Some(tinfo) => {
+                if !tinfo.columns.iter().any(|c| c.name == spec.column) {
+                    errs.push(format!(
+                        "{who}: content column {:?} does not exist in table {:?} (inventory {})",
+                        spec.column, spec.table, kinv.source_rel
+                    ));
+                }
+                if !tinfo.columns.iter().any(|c| c.name == *by) {
+                    errs.push(format!(
+                        "{who}: --by column {:?} does not exist in table {:?} (inventory {})",
+                        by, spec.table, kinv.source_rel
+                    ));
+                } else if !distinct::is_code_column(by) {
+                    errs.push(format!(
+                        "{who}: --by column {by:?} is not on the code-column whitelist — \
+                         refused (rule: {}, case-insensitive; the shapes are grouped by \
+                         a CODE column, and content-bearing columns can never be one)",
+                        distinct::CODE_COLUMN_RULE
+                    ));
+                }
+            }
+        }
+    } else {
+        errs.push(format!(
+            "{who}: the snapshot has no {} sample DB to read",
+            spec.kind.name()
+        ));
+    }
+    if !errs.is_empty() {
+        return Err(format!(
+            "--content-shape validation ({} error(s)):\n  - {}",
+            errs.len(),
+            errs.join("\n  - ")
+        ));
+    }
+
+    // Read: the first sample, or EVERY DB of the message kind summed
+    // (batch-15 O2 style — open/query failures counted, not logged
+    // one DB at a time).
+    let mut groups: std::collections::BTreeMap<String, content_shape::ShapeGroup> =
+        Default::default();
+    let mut dbs = 0usize;
+    let mut opened = 0usize;
+    let mut failed = 0usize;
+    let source;
+    if a.all_dbs {
+        let msg_dir = p.uid_dir.join("Core").join("Message");
+        for (name, k) in message_db_names(&p.uid_dir)? {
+            let map_kind = match k {
+                DbKind::OneToOne(_) => MapDb::OneToOne,
+                DbKind::Group(_) => MapDb::Group,
+                DbKind::StrangerBox => MapDb::Stranger,
+                // `undefined.db` and unknown names stay skipped.
+                DbKind::Undefined | DbKind::Other => continue,
+            };
+            if map_kind != spec.kind {
+                continue;
+            }
+            dbs += 1;
+            match open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile) {
+                Ok(conn) => match fold_content_shape_db(&conn, spec, by, &mut groups) {
+                    Ok(()) => opened += 1,
+                    // Read failures are COUNTED, not printed one DB at
+                    // a time (the batch-15 O2 convention; the error
+                    // would name table/column names only).
+                    Err(_) => failed += 1,
+                },
+                Err(_) => failed += 1,
+            }
+        }
+        source = "ALL".to_string();
+    } else {
+        let kinv = sample_inventory(&g.inv, spec.kind).expect("validated above");
+        let path = sample_db_path(&p, &kinv.source_rel);
+        let conn = open_desktop_db(&path, p.passphrase.as_str(), p.profile)
+            .map_err(|e| format!("{who}: {e}"))?;
+        fold_content_shape_db(&conn, spec, by, &mut groups)
+            .map_err(|e| format!("{who}: {e}"))?;
+        source = kinv.source_rel.clone();
+        dbs = 1;
+        opened = 1;
+    }
+
+    // Report: header, the capped group blocks (64 codes + `other`,
+    // ranked by rows), the grand total, and the optional JSON.
+    let capped = content_shape::cap_groups(groups);
+    let total_rows: usize = capped.iter().map(|r| &r.group.rows).sum();
+    let mut lines = Vec::new();
+    if a.all_dbs {
+        lines.push(format!(
+            "content-shape: {} by={} source=ALL dbs={dbs} opened={opened} failed={failed}",
+            distinct::spec_str(spec),
+            by
+        ));
+    } else {
+        lines.push(format!(
+            "content-shape: {} by={} source={}",
+            distinct::spec_str(spec),
+            by,
+            source
+        ));
+    }
+    for grp in &capped {
+        lines.extend(content_shape::group_block("content-shape:", "code", grp));
+    }
+    lines.push(format!(
+        "content-shape: grand rows={total_rows} groups={}",
+        capped.len()
+    ));
+    if let Some(out) = &a.out {
+        let json = content_shape::ContentShapeJson {
+            spec: distinct::spec_str(spec),
+            by: by.clone(),
+            source,
+            dbs: if a.all_dbs { Some(dbs) } else { None },
+            opened: if a.all_dbs { Some(opened) } else { None },
+            failed: if a.all_dbs { Some(failed) } else { None },
+            total_rows,
+            groups: capped.iter().map(Into::into).collect(),
+        };
+        let text = serde_json::to_string_pretty(&json).map_err(|e| {
+            format!("--out {}: serializing the content-shape report failed: {e}", out.display())
+        })?;
+        std::fs::write(out, text)
+            .map_err(|e| format!("--out {}: {e}", out.display()))?;
+        lines.push(format!("content-shape: wrote JSON to {}", out.display()));
+    }
+    Ok(lines)
+}
+
+/// Read one Desktop DB's (`--by` code, content) pairs into the group
+/// map — the ONE fixed read of the C1 mode (identifier-quoted names
+/// from the inventory; no other column is ever touched). Code values
+/// group by their RENDERED batch-14 token, so every group label in
+/// the report is unique and shape-safe by construction.
+fn fold_content_shape_db(
+    conn: &Connection,
+    spec: &distinct::DistinctSpec,
+    by: &str,
+    groups: &mut std::collections::BTreeMap<String, content_shape::ShapeGroup>,
+) -> Result<(), String> {
+    use rusqlite::types::Value as SV;
+    let qt = inventory::quote_ident(&spec.table)?;
+    let qcontent = inventory::quote_ident(&spec.column)?;
+    let qby = inventory::quote_ident(by)?;
+    let sql = format!("SELECT {qby}, {qcontent} FROM {qt}");
+    let mut st = conn.prepare(&sql).map_err(|e| format!("{}: {e}", spec.table))?;
+    let rows = st
+        .query_map([], |r| Ok((r.get::<_, SV>(0)?, r.get::<_, SV>(1)?)))
+        .map_err(|e| format!("{}: {e}", spec.table))?;
+    for (code, content) in rows.flatten() {
+        let token = distinct::render_value(&code);
+        groups.entry(token).or_default().fold_cell(&content);
+    }
+    Ok(())
+}
+
 /// The inventory sample of one DB kind (`run_distinct`'s lookup —
-/// the same samples `--inventory` reports).
-fn sample_inventory<'a>(
+/// the same samples `--inventory` reports; batch 23a's
+/// `run_content_shape` validates its spec against them too).
+pub(crate) fn sample_inventory<'a>(
     inv: &'a inventory::SnapshotInventories,
     kind: import_map::MapDb,
 ) -> Option<&'a inventory::KindInventory> {
@@ -893,7 +1099,7 @@ fn sample_inventory<'a>(
 /// The absolute path of a sample's `source_rel` (the forward-slash
 /// relative path inside the snapshot, e.g. `Core/Message/123.db` —
 /// built by `gather_inventories`, never raw user input).
-fn sample_db_path(p: &Prepared, source_rel: &str) -> PathBuf {
+pub(crate) fn sample_db_path(p: &Prepared, source_rel: &str) -> PathBuf {
     let mut path = p.uid_dir.clone();
     path.extend(source_rel.split('/'));
     path
@@ -1522,6 +1728,8 @@ mod tests {
             target: None,
             unmapped_as_raw: false,
             media_plan: false,
+            content_shape: None,
+            by: None,
             help: false,
         }
     }
@@ -2698,6 +2906,344 @@ mod tests {
                 "weird.db".to_string(),
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 23a C1: --content-shape --by (end to end) ------------------
+
+    /// The fake Desktop message schema for the content-shape fixture:
+    /// the content-bearing `message` column plus the whitelisted
+    /// `msgType` code column. Synthetic data only — every value
+    /// carries a SENTINEL so the tests prove no value ever prints.
+    #[cfg(windows)]
+    const SHAPE_DB_SQL: &str = r#"CREATE TABLE message (
+        msgId TEXT PRIMARY KEY, serverTime TEXT, msgType INTEGER, message TEXT
+      );
+      INSERT INTO message (msgId, serverTime, msgType, message) VALUES
+        ('m1', '1690000000000', 19,
+         '{"href":"https://sentinel-cdn.example/x","params":"{\"fileExt\":\"pdf\",\"fileSize\":\"987654321\"}","title":"SENTINEL-TITLE-1","type":"file"}'),
+        ('m2', '1690000000001', 19,
+         '{"href":"https://sentinel-cdn.example/x","params":"{\"fileExt\":\"doc\"}","title":"SENTINEL-TITLE-2","type":"file"}'),
+        ('m3', '1690000000002', 19, 'prose with SENTINEL-PROSE-1 words'),
+        ('m4', '1690000000003', 20, '{"title":"SENTINEL-TITLE-3"}'),
+        ('m5', '1690000000004', 20, NULL),
+        ('m6', '1690000000005', 20, '["a","b"]'),
+        ('m7', '1690000000006', 20, '"quoted SENTINEL-STRING-1"'),
+        ('m8', '1690000000007', NULL, '{"a":1,"b":"SENTINEL-STR"}');"#;
+
+    /// A second one2one DB with a different distribution, so both the
+    /// sample mode (first DB only) and the `--all-dbs` sum are
+    /// observable — the brief's "two tiny SQLCipher Desktop-shaped
+    /// DBs".
+    #[cfg(windows)]
+    const SHAPE_DB_SQL2: &str = r#"CREATE TABLE message (
+        msgId TEXT PRIMARY KEY, serverTime TEXT, msgType INTEGER, message TEXT
+      );
+      INSERT INTO message (msgId, serverTime, msgType, message) VALUES
+        ('n1', '1690000001000', 19, 'prose with SENTINEL-PROSE-2 words'),
+        ('n2', '1690000001001', 19, 'more SENTINEL-PROSE-3 prose'),
+        ('n3', '1690000001002', 21,
+         '{"href":"https://sentinel-cdn.example/y","params":"{\"fileSize\":\"42\"}","title":"SENTINEL-TITLE-4","type":"file"}'),
+        ('n4', '1690000001003', 19, '{"SENTINEL-KEY-1!":1}');"#;
+
+    /// A synthetic snapshot with TWO one2one DBs (the content-shape
+    /// fixture) plus the group/stranger samples. Returns the key path.
+    #[cfg(windows)]
+    fn synthetic_snapshot_shapes(dir: &Path, pass: &str) -> PathBuf {
+        write_manifest_json(dir, valid_manifest_json());
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        make_cipher_db_sql(&core.join("Index.db"), pass, INDEX_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("111.db"), pass, SHAPE_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("112.db"), pass, SHAPE_DB_SQL2);
+        make_cipher_db_sql(&core.join("Message").join("g222.db"), pass, SHAPE_DB_SQL);
+        make_cipher_db_sql(&core.join("Message").join("stranger_box.db"), pass, SHAPE_DB_SQL);
+        for name in ["undefined.db", "weird.db"] {
+            std::fs::write(core.join("Message").join(name), b"fake").unwrap();
+        }
+        let key = dir.join("d7.bin");
+        fake_d7_key_file(&key, pass);
+        key
+    }
+
+    /// ImportArgs for the content-shape mode against a synthetic snapshot.
+    #[cfg(windows)]
+    fn shape_args(from: &Path, uin: &str, key: &Path, by: &str, all_dbs: bool) -> ImportArgs {
+        let mut a = args_for(from, uin, Some(key));
+        a.content_shape = Some(super::distinct::parse_spec_for("--content-shape", "one2one:message.message").unwrap());
+        a.by = Some(by.to_string());
+        a.all_dbs = all_dbs;
+        a
+    }
+
+    /// Every sentinel the fixture plants inside CONTENT values (and one
+    /// inside a key name): none may ever appear in any output line.
+    #[cfg(windows)]
+    const SHAPE_SENTINELS: [&str; 8] = [
+        "SENTINEL-PROSE",
+        "SENTINEL-TITLE",
+        "sentinel-cdn.example",
+        "SENTINEL-STRING",
+        "SENTINEL-KEY-1",
+        "SENTINEL-STR",
+        "987654321",
+        "quoted",
+    ];
+
+    #[test]
+    #[cfg(windows)]
+    fn run_content_shape_prints_shapes_only_from_the_first_sample_db() {
+        let dir = temp_dir("shape1");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_shapes(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        let out = dir.parent().unwrap().join(format!(
+            "zr-shape-out-{}-{}.json",
+            std::process::id(),
+            super::super::schema::now_ms()
+        ));
+        let mut a = shape_args(&dir, &uin, &key, "msgType", false);
+        a.out = Some(out.clone());
+        let lines = run_content_shape(&a).unwrap();
+        let joined = lines.join("\n");
+        // The header names the spec, the --by column and the sample
+        // source (a relative path — not data).
+        assert!(
+            joined.contains("content-shape: one2one:message.message by=msgType source=Core/Message/111.db"),
+            "{joined}"
+        );
+        // Ranked by rows: code 20 (4 rows) before 19 (3) before the
+        // NULL group (1). The per-code rows line is the check against
+        // the notes' counts.
+        assert!(
+            joined.contains(
+                "content-shape: code=20 rows=4 json_object=1 json_array=1 \
+                 json_string_scalar=1 not_json=0 null=1"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=19 rows=3 json_object=2 json_array=0 \
+                 json_string_scalar=0 not_json=1 null=0"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=NULL rows=1 json_object=1 json_array=0 \
+                 json_string_scalar=0 not_json=0 null=0"
+            ),
+            "{joined}"
+        );
+        // The key signatures: sorted key names with type letters, the
+        // one-level nesting for `params` (a string parsing as a JSON
+        // object), counts.
+        assert!(
+            joined.contains(
+                "content-shape:  {href:s,params:s{fileExt:s,fileSize:s},title:s,type:s} x 1"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-shape:  {href:s,params:s{fileExt:s},title:s,type:s} x 1"),
+            "{joined}"
+        );
+        assert!(joined.contains("content-shape:  {title:s} x 1"), "{joined}");
+        assert!(joined.contains("content-shape:  {a:n,b:s} x 1"), "{joined}");
+        // The grand total closes the report; the JSON note names --out.
+        assert!(joined.contains("content-shape: grand rows=8 groups=3"), "{joined}");
+        assert!(joined.contains(&format!("wrote JSON to {}", out.display())), "{joined}");
+        // PRIVACY (the batch-23a hard rule): no sentinel value from
+        // any content ever appears in ANY line.
+        for s in SHAPE_SENTINELS {
+            assert!(!joined.contains(s), "{s} leaked:\n{joined}");
+        }
+        // The --out JSON carries the same data — and no value either.
+        let raw = std::fs::read_to_string(&out).unwrap();
+        assert!(!raw.starts_with('\u{feff}'), "the JSON file is BOM-less UTF-8");
+        for s in SHAPE_SENTINELS {
+            assert!(!raw.contains(s), "{s} leaked into the JSON:\n{raw}");
+        }
+        let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(j["spec"], "one2one:message.message");
+        assert_eq!(j["by"], "msgType");
+        assert_eq!(j["source"], "Core/Message/111.db");
+        assert_eq!(j["total_rows"], 8);
+        assert_eq!(j["groups"].as_array().unwrap().len(), 3);
+        assert_eq!(j["groups"][0]["code"], "20");
+        assert_eq!(j["groups"][0]["rows"], 4);
+        assert_eq!(j["groups"][1]["code"], "19");
+        assert_eq!(j["groups"][1]["signatures"].as_array().unwrap().len(), 2);
+        assert!(raw.contains("\"dbs\": null") || !raw.contains("\"dbs\""), "no all-dbs fields in sample mode");
+        // Immutable proof: nothing was created in the snapshot.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(
+            names,
+            vec![
+                "111.db".to_string(),
+                "112.db".to_string(),
+                "g222.db".to_string(),
+                "stranger_box.db".to_string(),
+                "undefined.db".to_string(),
+                "weird.db".to_string(),
+            ]
+        );
+        // The CLI exit-code path: success → 0.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            uin,
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--content-shape".to_string(),
+            "one2one:message.message".to_string(),
+            "--by".to_string(),
+            "msgType".to_string(),
+            "--out".to_string(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_content_shape_all_dbs_sums_both_one2one_dbs() {
+        let dir = temp_dir("shape2");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_shapes(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        let a = shape_args(&dir, &uin, &key, "msgType", true);
+        let lines = run_content_shape(&a).unwrap();
+        let joined = lines.join("\n");
+        // Both one2one DBs are read and the groups SUMMED
+        // (111.db: 19x3, 20x4, NULLx1; 112.db: 19x3, 21x1).
+        assert!(
+            joined.contains(
+                "content-shape: one2one:message.message by=msgType \
+                 source=ALL dbs=2 opened=2 failed=0"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=19 rows=6 json_object=3 json_array=0 \
+                 json_string_scalar=0 not_json=3 null=0"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=20 rows=4 json_object=1 json_array=1 \
+                 json_string_scalar=1 not_json=0 null=1"
+            ),
+            "{joined}"
+        );
+        // Code 21 exists only in 112.db; the tie with NULL breaks by
+        // the rendered token ("21" < "NULL").
+        assert!(
+            joined.contains(
+                "content-shape: code=21 rows=1 json_object=1 json_array=0 \
+                 json_string_scalar=0 not_json=0 null=0"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape:  {href:s,params:s{fileSize:s},title:s,type:s} x 1"
+            ),
+            "{joined}"
+        );
+        // The non-identifier key from 112.db prints its fingerprint
+        // (key hash + type letter).
+        assert!(
+            joined.contains(&format!(
+                "content-shape:  {{k:{}:n}} x 1",
+                sha12(b"SENTINEL-KEY-1!")
+            )),
+            "{joined}"
+        );
+        assert!(joined.contains("content-shape: grand rows=12 groups=4"), "{joined}");
+        // group/stranger DBs exist but are NOT of the one2one kind.
+        assert!(!joined.contains("dbs=4"), "{joined}");
+        for s in SHAPE_SENTINELS {
+            assert!(!joined.contains(s), "{s} leaked:\n{joined}");
+        }
+        // Immutable proof again.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(names.len(), 6, "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_content_shape_refuses_bad_by_and_missing_columns() {
+        let dir = temp_dir("shaperf");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_shapes(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+        // `--by message`: the content column itself — content-bearing,
+        // refused with the rule quoted before any row is read.
+        let a = shape_args(&dir, &uin, &key, "message", false);
+        let e = run_content_shape(&a).unwrap_err();
+        assert!(e.contains("--content-shape validation (1 error(s))"), "{e}");
+        assert!(
+            e.contains("--by column \"message\" is not on the code-column whitelist"),
+            "{e}"
+        );
+        assert!(e.contains(&format!("rule: {}", super::distinct::CODE_COLUMN_RULE)), "{e}");
+        // Every violation at once (the plan convention): a missing
+        // --by column over the real table, then a missing table spec.
+        let a = shape_args(&dir, &uin, &key, "noCol", false);
+        let e = run_content_shape(&a).unwrap_err();
+        assert!(e.contains("(1 error(s))"), "{e}");
+        assert!(e.contains("--by column \"noCol\" does not exist in table \"message\""), "{e}");
+        let mut a = shape_args(&dir, &uin, &key, "msgType", false);
+        a.content_shape = Some(
+            super::distinct::parse_spec_for("--content-shape", "one2one:zzz.msgType").unwrap(),
+        );
+        let e = run_content_shape(&a).unwrap_err();
+        assert!(e.contains("(1 error(s))"), "{e}");
+        assert!(e.contains("table \"zzz\" does not exist"), "{e}");
+        // A missing content column names itself.
+        let mut a = shape_args(&dir, &uin, &key, "msgType", false);
+        a.content_shape = Some(
+            super::distinct::parse_spec_for("--content-shape", "one2one:message.noCol").unwrap(),
+        );
+        let e = run_content_shape(&a).unwrap_err();
+        assert!(
+            e.contains("content column \"noCol\" does not exist in table \"message\""),
+            "{e}"
+        );
+        // A kind with no sample in the snapshot.
+        let mut a = shape_args(&dir, &uin, &key, "msgType", false);
+        a.content_shape = Some(
+            super::distinct::parse_spec_for("--content-shape", "group:message.message").unwrap(),
+        );
+        std::fs::remove_file(dir.join("Core").join("Message").join("g222.db")).unwrap();
+        let e = run_content_shape(&a).unwrap_err();
+        assert!(e.contains("the snapshot has no group sample DB to read"), "{e}");
+        // The CLI exit-code path: a refused --by exits 1.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            uin,
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--content-shape".to_string(),
+            "one2one:message.message".to_string(),
+            "--by".to_string(),
+            "message".to_string(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

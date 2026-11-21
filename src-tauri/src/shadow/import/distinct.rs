@@ -66,7 +66,14 @@ pub struct DistinctSpec {
 /// LAST '.' — a dotted table name still parses, a dotted column fails
 /// the inventory existence check fail-closed.
 pub fn parse_spec(s: &str) -> Result<DistinctSpec, String> {
-    let err = |why: String| format!("--distinct {s:?}: {why}");
+    parse_spec_for("--distinct", s)
+}
+
+/// [`parse_spec`] with the flag label the errors quote (batch 23a:
+/// `--content-shape <kind>:<table>.<column>` parses the SAME spec
+/// shape, so its errors must name their own flag, never `--distinct`).
+pub fn parse_spec_for(flag: &str, s: &str) -> Result<DistinctSpec, String> {
+    let err = |why: String| format!("{flag} {s:?}: {why}");
     let (kind_s, rest) = s.split_once(':').ok_or_else(|| {
         err(String::from(
             "must be <dbkind>:<table>.<column> (dbkind: index, one2one, group, stranger)",

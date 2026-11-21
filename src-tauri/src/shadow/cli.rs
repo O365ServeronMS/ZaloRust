@@ -1,7 +1,8 @@
 //! `zalors import` CLI (P2, audit §4 items 2.0–2.4; batch 6 F1;
 //! batch 12 adds `--inventory`/`--out` and the
 //! `--mapping`/`--shadow-copy`/`--delta` dry-run mode; batch 14
-//! adds the whitelisted `--distinct` code-column probe).
+//! adds the whitelisted `--distinct` code-column probe; batch 23a
+//! adds the `--content-shape … --by` content-shape probe).
 //!
 //! Spec (KQ4: the import only ever reads a COLD SNAPSHOT):
 //! ```text
@@ -10,6 +11,8 @@
 //!              [--dry-run | --apply]
 //!              [--inventory [--out <file>]
 //!               | [--distinct <dbkind>:<table>.<column>]… (max 10)
+//!               | [--content-shape <dbkind>:<table>.<col> --by <code_col>
+//!                  [--all-dbs] [--out <file>]]
 //!               | [--mapping <file>] [--shadow-copy <dir>] [--delta]]
 //!              [--help]
 //! ```
@@ -55,6 +58,21 @@ modes (one per run; everything except --apply is dry-run only):
                              repeatable, max 10 per run; from the FIRST
                              sample DB of that kind, or with --all-dbs (batch
                              15) summed across EVERY DB of a message kind
+  --content-shape <k>:<t>.<c> --by <code_col>
+                              content-shape probe (batch 23a): per distinct
+                              value of the whitelisted --by code column, the
+                              row count, the JSON-shape census of ONE content
+                              column (json_object / json_array /
+                              json_string_scalar / not_json / null) and the
+                              top 8 top-level key signatures — key NAMES only
+                              (any other key prints k:<sha256-12>), type
+                              letters s/n/b/o/a/z, one nesting level for
+                              string values that parse as JSON objects, a
+                              24-key cap per signature. NEVER a value: codes
+                              render through the --distinct code-shape
+                              renderer. The FIRST sample DB of the kind, or
+                              with --all-dbs every DB of the message kind
+                              summed; --out <file> writes the same as JSON
   --mapping <file>           mapping dry run (docs/import-mapping.md): extract
   [--shadow-copy <dir>]      per the mapping JSON and, with --shadow-copy,
   [--delta]                  classify each write READ-ONLY against a temp
@@ -78,16 +96,21 @@ flags:
 --uin-hash       expected sha256-12 of the Desktop key (12 lowercase hex)
 --key-file       DPAPI-wrapped D7 key capture (the key is never on argv)
 --cipher-compat  force cipher profile 3 or 4 instead of auto-detecting
---out <file>     JSON inventory report (only with --inventory)
+--out <file>     JSON report (with --inventory or --content-shape)
 --shadow-copy    shadow STORE dir whose temp COPY is classified against
                   (its files are read; the store itself is never opened)
 --delta          skip rows at/before the per-DB import cursor (dry-run only)
 --distinct       see the modes above: whitelisted code-column distinct
                   values, repeatable, max 10 per run, dry-run only
---all-dbs        with --distinct: aggregate the column across EVERY DB of
-                  the message kind (one2one/group/stranger), summing
-                  per-DB counts (batch 15); an index spec is refused —
-                  there is exactly one Core\\Index.db
+--content-shape  see the modes above: the content-shape probe over ONE
+                  content column, grouped by --by; its own mode, dry-run
+                  only, needs --by
+--by <code_col>  with --content-shape: the code column to group by — it
+                  must pass the --distinct code-column whitelist
+--all-dbs        with --distinct/--content-shape: aggregate across EVERY
+                  DB of the message kind (one2one/group/stranger),
+                  summing per-DB counts (batch 15); an index spec is
+                  refused — there is exactly one Core\\Index.db
 --own-uid-from-settings   with --mapping/--shadow-copy or --apply: seed the
                   import extraction's self-sent sender from
                   settings.shadow.own_uid read through the settings loader
@@ -187,6 +210,18 @@ pub struct ImportArgs {
     /// `--media-plan` (batch 16 P2, 2.6): the media hardlink PREP dry
     /// run — counts only, no hashing, no hardlinks. Its own mode.
     pub media_plan: bool,
+    /// `--content-shape <kind>:<table>.<content_col>` (batch 23a C1):
+    /// the content-SHAPE probe mode — per distinct value of the
+    /// whitelisted `--by` code column, the row count, the JSON-shape
+    /// census of ONE content column and its top key signatures,
+    /// everything shape-only by construction (key names + type
+    /// letters, never a value). Its own dry-run mode.
+    pub content_shape: Option<import::distinct::DistinctSpec>,
+    /// `--by <code_col>` (batch 23a C1): the code column the shapes
+    /// are grouped by. Required with `--content-shape`, refused
+    /// without it; must pass the batch-14 code-column whitelist
+    /// (validated against the inventory at run time).
+    pub by: Option<String>,
     /// `--apply`: write into the shadow DB (guarded by the
     /// preconditions in `import_apply`).
     pub apply: bool,
@@ -261,6 +296,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let mut mapping: Option<PathBuf> = None;
     let mut shadow_copy: Option<PathBuf> = None;
     let mut distinct: Vec<import::distinct::DistinctSpec> = Vec::new();
+    let mut content_shape: Option<import::distinct::DistinctSpec> = None;
+    let mut by: Option<String> = None;
     let (mut dry_run, mut apply, mut help, mut inventory, mut delta) =
         (false, false, false, false, false);
     let (mut all_dbs, mut own_uid_from_settings) = (false, false);
@@ -282,6 +319,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--shadow-copy"
                 | "--distinct"
                 | "--target"
+                | "--content-shape"
+                | "--by"
         );
         if value_flag {
             let value =
@@ -316,6 +355,27 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                             distinct.len()
                         ));
                     }
+                }
+                // Batch 23a C1: the content-shape probe's spec parses
+                // through the SAME shape rule (with this flag's name
+                // in the errors); existence + the --by whitelist run
+                // against the inventory in `run_content_shape`.
+                "--content-shape" => {
+                    set_once(
+                        &mut content_shape,
+                        flag,
+                        import::distinct::parse_spec_for(flag, value)?,
+                    )?;
+                }
+                // …and its required companion: the code column the
+                // shapes are grouped by (non-empty; a name that fails
+                // the batch-14 whitelist is refused at run time with
+                // the rule quoted).
+                "--by" => {
+                    if value.is_empty() {
+                        return Err(String::from("--by requires a non-empty column name"));
+                    }
+                    set_once(&mut by, flag, value.to_string())?;
                 }
                 _ => unreachable!("the value_flag match lists every value flag"),
             }
@@ -361,6 +421,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             ("--shadow-copy", shadow_copy.is_some()),
             ("--distinct", !distinct.is_empty()),
             ("--media-plan", media_plan),
+            ("--content-shape", content_shape.is_some()),
         ]
         .into_iter()
         .find(|(_, on)| *on);
@@ -405,8 +466,11 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             ));
         }
     }
-    if out.is_some() && !inventory {
-        return Err("--out needs --inventory (it is the JSON inventory report)".into());
+    if out.is_some() && !inventory && content_shape.is_none() {
+        return Err(
+            "--out needs --inventory or --content-shape (it is the JSON report of one of them)"
+                .into(),
+        );
     }
     if inventory && (mapping.is_some() || shadow_copy.is_some() || delta || media_plan) {
         return Err(
@@ -425,6 +489,23 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 .into(),
         );
     }
+    // Batch 23a C1: --content-shape is its own mode, and --by rides
+    // only with it.
+    if content_shape.is_some()
+        && (inventory
+            || mapping.is_some()
+            || shadow_copy.is_some()
+            || delta
+            || media_plan
+            || !distinct.is_empty())
+    {
+        return Err(
+            "--content-shape cannot be combined with \
+             --inventory/--mapping/--shadow-copy/--delta/--distinct/--media-plan \
+             (one mode per run)"
+                .into(),
+        );
+    }
     // Batch 16 P2: --media-plan is its own dry-run mode.
     if media_plan && (mapping.is_some() || shadow_copy.is_some() || delta) {
         return Err(
@@ -433,11 +514,13 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 .into(),
         );
     }
-    // Batch 15 O2: --all-dbs rides the --distinct mode, and only a
-    // message kind has more than one DB to aggregate.
-    if all_dbs && distinct.is_empty() {
+    // Batch 15 O2 / batch 23a C1: --all-dbs rides the --distinct mode
+    // and the --content-shape mode, and only a message kind has more
+    // than one DB to aggregate.
+    if all_dbs && distinct.is_empty() && content_shape.is_none() {
         return Err(
-            "--all-dbs needs --distinct (it aggregates every DB of the requested message kind)"
+            "--all-dbs needs --distinct or --content-shape \
+             (it aggregates every DB of the requested message kind)"
                 .into(),
         );
     }
@@ -451,6 +534,31 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 import::distinct::spec_str(bad)
             ));
         }
+        if let Some(bad) = content_shape
+            .iter()
+            .find(|s| s.kind == super::import_map::MapDb::Index)
+        {
+            return Err(format!(
+                "--all-dbs with {}: the snapshot has exactly ONE index DB — drop --all-dbs",
+                import::distinct::spec_str(bad)
+            ));
+        }
+    }
+    // Batch 23a C1: --content-shape and --by are a pair — one without
+    // the other is a parse error naming both.
+    if content_shape.is_some() && by.is_none() {
+        return Err(
+            "--content-shape needs --by <code column>: it names the whitelisted \
+             code column the content shapes are grouped by"
+                .into(),
+        );
+    }
+    if by.is_some() && content_shape.is_none() {
+        return Err(
+            "--by needs --content-shape: it is the grouping column of the \
+             content-shape probe"
+                .into(),
+        );
     }
     // Batch 15 O4 + batch 16: --own-uid-from-settings rides the
     // mapping mode AND the apply step (the batch-15 rule applies
@@ -492,6 +600,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             i_have_a_backup_plan,
             unmapped_as_raw,
             media_plan,
+            content_shape,
+            by,
             apply: false,
             help: true,
         });
@@ -514,6 +624,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         i_have_a_backup_plan,
         unmapped_as_raw,
         media_plan,
+        content_shape,
+        by,
         apply,
         help: false,
     })
@@ -580,6 +692,20 @@ pub fn main(args: &[String]) -> i32 {
         }
         // Batch 14 N1: the whitelisted distinct-values mode.
         Ok(a) if !a.distinct.is_empty() => match import::run_distinct(&a) {
+            Ok(lines) => {
+                for line in &lines {
+                    println!("{line}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                1
+            }
+        },
+        // Batch 23a C1: the content-shape probe mode (parse guarantees
+        // --by is present with it).
+        Ok(a) if a.content_shape.is_some() => match import::run_content_shape(&a) {
             Ok(lines) => {
                 for line in &lines {
                     println!("{line}");
@@ -1365,6 +1491,223 @@ mod tests {
         ]))
         .unwrap();
         assert!(a.help);
+    }
+
+    // --- batch 23a C1: --content-shape / --by ------------------------------
+
+    #[test]
+    fn parse_content_shape_needs_by_and_vice_versa() {
+        // A consistent invocation parses; each half alone names both.
+        let a = parse(&with_base(&[
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap();
+        assert_eq!(
+            a.content_shape,
+            Some(import::distinct::DistinctSpec {
+                kind: import_map::MapDb::OneToOne,
+                table: "message".into(),
+                column: "message".into(),
+            })
+        );
+        assert_eq!(a.by.as_deref(), Some("msgType"));
+        assert!(!a.apply);
+        let e = parse(&with_base(&["--content-shape", "one2one:message.message"]))
+            .unwrap_err();
+        assert!(e.contains("--content-shape needs --by <code column>"), "{e}");
+        let e = parse(&with_base(&["--by", "msgType"])).unwrap_err();
+        assert!(e.contains("--by needs --content-shape"), "{e}");
+        // --by never rides another mode (here: --distinct).
+        let e = parse(&with_base(&[
+            "--distinct",
+            "one2one:message.msgType",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--by needs --content-shape"), "{e}");
+        // An empty --by is refused; duplicates and missing/flag-like
+        // values are errors like every value flag.
+        let e = parse(&with_base(&[
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--by requires a non-empty column name"), "{e}");
+        for flags in [
+            vec![
+                "--content-shape",
+                "one2one:message.message",
+                "--content-shape",
+                "group:message.message",
+                "--by",
+                "msgType",
+            ],
+            vec![
+                "--content-shape",
+                "one2one:message.message",
+                "--by",
+                "msgType",
+                "--by",
+                "status",
+            ],
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(e.contains("given twice"), "{flags:?} -> {e}");
+        }
+        for flag in ["--content-shape", "--by"] {
+            let e = parse(&args(&[flag])).unwrap_err();
+            assert!(e.contains(&format!("{flag} requires a value")), "{e}");
+            let e = parse(&args(&[flag, "--apply"])).unwrap_err();
+            assert!(e.contains(&format!("{flag} requires a value")), "{e}");
+        }
+    }
+
+    #[test]
+    fn parse_content_shape_validates_the_spec_shape_under_its_own_name() {
+        // The spec parses through the same <kind>:<table>.<column>
+        // rule, but the errors name --content-shape, never --distinct.
+        let a = parse(&with_base(&[
+            "--content-shape",
+            "stranger:zz.table.col",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap();
+        assert_eq!(a.content_shape.as_ref().unwrap().kind, import_map::MapDb::Stranger);
+        for (bad, needle) in [
+            (
+                "bogus:message.message",
+                "unknown dbkind \"bogus\" (allowed: index, one2one, group, stranger)",
+            ),
+            ("one2one:message", "missing the .<column> part"),
+            ("one2one:.message", "empty <table> part"),
+            ("group:message.", "empty <column> part"),
+        ] {
+            let e = parse(&with_base(&["--content-shape", bad, "--by", "msgType"]))
+                .unwrap_err();
+            assert!(e.contains(&format!("--content-shape {bad:?}:")), "{bad} -> {e}");
+            assert!(e.contains(needle), "{bad} -> {e}");
+            assert!(!e.contains("--distinct"), "{bad} -> {e}");
+        }
+    }
+
+    #[test]
+    fn parse_content_shape_conflicts_with_apply_and_the_other_modes() {
+        // --apply names the flag (dry-run only).
+        let e = parse(&args(&[
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\s",
+            "--mapping",
+            "m.json",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains("--content-shape is dry-run only and conflicts with --apply"),
+            "{e}"
+        );
+        // One mode per run — each names --content-shape.
+        for flags in [
+            vec!["--inventory", "--content-shape", "one2one:message.message", "--by", "msgType"],
+            vec!["--mapping", "m.json", "--content-shape", "one2one:message.message", "--by", "msgType"],
+            vec!["--shadow-copy", r"D:\s", "--content-shape", "one2one:message.message", "--by", "msgType"],
+            vec!["--delta", "--mapping", "m.json", "--content-shape", "one2one:message.message", "--by", "msgType"],
+            vec!["--distinct", "one2one:message.msgType", "--content-shape", "one2one:message.message", "--by", "msgType"],
+            vec!["--media-plan", "--content-shape", "one2one:message.message", "--by", "msgType"],
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(e.contains("--content-shape cannot be combined"), "{flags:?} -> {e}");
+        }
+        // --out rides the content-shape mode (and still needs one of
+        // its two modes).
+        let a = parse(&with_base(&[
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--out",
+            "o.json",
+        ]))
+        .unwrap();
+        assert_eq!(a.out, Some(PathBuf::from("o.json")));
+        // A CONSISTENT invocation yields to help…
+        let a = parse(&args(&[
+            "--help",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap();
+        assert!(a.help);
+        // …but a conflicting pair (or a missing --by) beats help.
+        let e = parse(&args(&[
+            "--help",
+            "--inventory",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--content-shape cannot be combined"), "{e}");
+        let e = parse(&args(&["--help", "--content-shape", "one2one:message.message"]))
+            .unwrap_err();
+        assert!(e.contains("--content-shape needs --by"), "{e}");
+    }
+
+    #[test]
+    fn parse_content_shape_all_dbs_rides_and_refuses_index_specs() {
+        // --all-dbs rides the content-shape mode too.
+        let a = parse(&with_base(&[
+            "--all-dbs",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap();
+        assert!(a.all_dbs);
+        assert!(a.content_shape.is_some());
+        // An index spec is refused: exactly one Core\Index.db.
+        let e = parse(&with_base(&[
+            "--all-dbs",
+            "--content-shape",
+            "index:conversation.raw",
+            "--by",
+            "msgType",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains(
+                "--all-dbs with index:conversation.raw: the snapshot has exactly ONE index DB"
+            ),
+            "{e}"
+        );
+        // Without --all-dbs the index kind is a normal (sample) spec.
+        let a = parse(&with_base(&[
+            "--content-shape",
+            "index:conversation.raw",
+            "--by",
+            "localType",
+        ]))
+        .unwrap();
+        assert_eq!(a.content_shape.as_ref().unwrap().kind, import_map::MapDb::Index);
+        // The updated --all-dbs message still leads with the old text.
+        let e = parse(&with_base(&["--all-dbs"])).unwrap_err();
+        assert!(e.contains("--all-dbs needs --distinct"), "{e}");
+        assert!(e.contains("or --content-shape"), "{e}");
     }
 
     #[test]
