@@ -1174,3 +1174,85 @@ codestream (`FF 0A`) and the container signature
 downloads — a CDN serving JXL is no longer flagged `ref-encrypted`
 (intended), and the archive window serves JXL as `image/jxl` (the
 viewer would otherwise 404 every stored JXL the store now accepts).
+
+### 10.5 Media.db / Res.db — the import-attachment link (batch 27d)
+
+The real-data run killed `message.localPath` as the link: it is EMPTY
+for 57.6k of the 58.5k import attachments, 744 more rows point
+outside the media root (`--local-media-plan` measured
+`would_copy=0`), and `Index.db zcloud.localPath` is empty for all
+1,023 rows — while the reverse coverage counted ~80k files under
+`ZaloDownloads` that NO message row points at (`picture` 19.8k,
+`resource` 58.7k, `video` 897, …). The link therefore has to live in
+the TOP-LEVEL snapshot DBs, which all open with the snapshot cipher
+key (§10.1): `Media.db` (`image` 115k rows: `mediaId pk, convId,
+cliMsgId, …, content, type, sendDttm, localPath, previewThumb,
+metadata`; `file` 8.3k: the same plus `folderPath`/`thumbMetadata`)
+and `Res.db` (`res`: `uid pk, size, type, atime, params`; `ref`:
+`msgId pk, convId, uid`).
+
+`--local-media-probe` (same command as §10.2) gains three sections
+plus one skipped milestone, all with the §10.2 tolerant reads and the
+same H-rule (counts, fixed vocabularies, path-shape/magic classes,
+rendered code tokens, and JSON key NAMES — schema, printed under the
+`--content-shape` rule: identifier-shaped names as-is, anything else
+as `k:<sha256-12>`; never a value):
+
+- **Media.db, by `type` code** — per table (`image`, `file`):
+  rows; the non-empty counts of the table's path columns
+  (`localpath`/`previewthumb` or `localpath`/`folderpath`); the path
+  shape class, under-root and `<sub>` over the rows with a
+  `localPath` (relative cells resolve via `folderPath`, the file
+  table's own column); `exists`, `size_zero`, `total_bytes` and the
+  magic class of the resolved file (the first 16 bytes and
+  `metadata().len()` only, as everywhere in §10); the name relations
+  (`climsgid`/`mediaid`/`senddttm` contained in the cache file name,
+  plus the exactly-13-digit `dttm13` run); and the row relations as
+  booleans — `climsgid_in_message` (the row's `cliMsgId` equals some
+  Desktop `message.cliMsgId`), `mediaid_in_message` (`mediaId`
+  equals some `message.msgId`) and `pair_in_message` (the
+  `(convId, cliMsgId)` pair matches — the message row's convId is
+  its DB file-name digits, the mapping's own conversation-id
+  domain). For `content` and the metadata column: the five shape
+  classes (`json_object | json_array | text | empty | other`,
+  `text` = a JSON string scalar, the double-encoded Desktop shape),
+  the top-30 key names, and — for `content` only — the batch-24
+  `BasicEncryption` decode with the snapshot key
+  (`--content-shape --decrypt-basic`'s own helper), reported as
+  `decrypt=ok|fail|na` counts plus the decoded shape and key names
+  (`ok` = decoded, `na` = the cell was never encrypted, `fail` = a
+  blob or the wrong-key signature).
+- **Res.db** — `res` by `type`: the `params` shape and top-30 key
+  names, plus `uid_file_hits` — how many `uid` values equal a cache
+  file STEM, per `<sub>` (the stems come from the §10.2 reverse-
+  coverage walk, which now gathers them for every file). `ref`:
+  `msgid_in_message` (vs every `message.msgId`) and `uid_in_res`
+  (vs the `res` uids), yes/no/na.
+- **file-name keys** — for the cache's `picture`/`video`/`resource`
+  files, how many carry an exactly-13-digit name part equal to some
+  `message.sendDttm` / `message.cliMsgId` / `message.msgId`, or some
+  `Media.db image.sendDttm` / `image.cliMsgId` (HashSets over the
+  scans; counts only). The measured name shapes it targets: picture
+  `<letter><13 digits>_<32 alnum>.jxl|.jpg`, video 13 digits.
+
+Everything above a missing DB, table or column prints one skipped
+line (the zcloud convention — a report, never fatal). The walk's
+hard 200 000-file cap now also bounds these sets (`cap_hit=yes`
+means partial).
+
+**M2 is SKIPPED and reported as such.** The milestone asked whether
+the 32-char part of a picture file name is the MD5 of a content url
+(full and without query, per url field — `oriUrl`, `normalUrl`,
+`thumbUrl`, `hdUrl`, `href`, `params.hd`, … the key names
+`zalors media --shape` already reports). No MD5 implementation
+exists anywhere in the dependency tree (`sha2`/`blake2` only — a SHA
+hex is 64 chars and can never equal a 32-char part), and the brief
+forbids adding a crate, so the probe prints exactly:
+
+```
+local-media-probe: picture-name hash: md5=unavailable (no MD5 implementation exists in the dependency tree and the brief forbids adding a crate — milestone skipped)
+```
+
+A later batch may revisit it only with an approved dependency (or a
+reviewer-vetted hand-rolled MD5, which the current brief does not
+allow).

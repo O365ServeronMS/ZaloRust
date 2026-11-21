@@ -216,8 +216,11 @@ fn type_letter(v: &J) -> char {
 }
 
 /// A key's printed form: itself when identifier-shaped, else
-/// `k:<sha256-12>` — never the raw name.
-fn render_key(k: &str) -> String {
+/// `k:<sha256-12>` — never the raw name. `pub(crate)` so the batch-27d
+/// Media.db/Res.db sections render key names under the SAME privacy
+/// rule as `--content-shape` (schema-shaped names print, anything else
+/// fingerprints).
+pub(crate) fn render_key(k: &str) -> String {
     if is_identifier_key(k) {
         k.to_string()
     } else {

@@ -55,16 +55,41 @@
 //! The report headers also no longer echo the `--local-media-root` /
 //! `--target` path values (H-rule): `root=given (exists)`,
 //! `store=given`, `report written (--out)`.
+//!
+//! Batch 27d (the import-attachment link): the real-data measurements
+//! killed `message.localPath` as the link — it is EMPTY for 57.6k of
+//! the 58.5k import attachments and 744 more rows point outside the
+//! media root (`would_copy=0`), while the cache itself holds ~80k
+//! files NO message row points at. The probe therefore ALSO reads the
+//! two top-level snapshot DBs that actually track the cache, with the
+//! same tolerant reads: `Media.db` (`image`/`file`, by `type` — the
+//! path census plus the `content`/`metadata` shapes, their top-level
+//! JSON KEY names, and the batch-24 BasicEncryption decode of
+//! `content` with the snapshot key) and `Res.db` (`res` by `type` with
+//! the `params` shape and the `uid` ↔ cache-file-STEM hits, `ref`
+//! against the message ids and the `res` uids), plus the file-name
+//! keys section (the cache files' 13-digit name parts vs the
+//! `message`/`Media.db image` id sets). Everything stays shape-only:
+//! key NAMES are schema and print under the `--content-shape` rule
+//! (identifier-shaped as-is, anything else as `k:<sha256-12>`), no
+//! VALUE ever prints, and the only file facts remain the first 16
+//! bytes and `metadata().len()`. The M2 milestone (is the 32-char
+//! part of a picture name the MD5 of a content url?) is SKIPPED and
+//! reported `md5=unavailable`: no MD5 implementation exists anywhere
+//! in the dependency tree and the brief forbids adding a crate.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SV;
 use rusqlite::Connection;
+use serde_json::Value as J;
 
+use super::content_shape::render_key;
+use super::desktop_cipher::{decode_field, FieldDecode};
 use super::distinct::render_value;
 use super::inventory::quote_ident;
-use super::Prepared;
+use super::{open_top_level, Prepared, TopOpen};
 
 // --- the fixed shape vocabularies -----------------------------------------
 
@@ -484,6 +509,26 @@ fn coerce_none_field(cols: &[&'static str], coerce: &CoerceNone) -> String {
     }
 }
 
+// --- batch 27d: the message membership sets ----------------------------------
+
+/// The membership sets the batch-27d relation counters compare
+/// against — one HashSet pass over every Desktop `message` row (all
+/// in memory; nothing here ever prints): every `msgId`, every
+/// `cliMsgId`, every `(convId, cliMsgId)` pair and every `sendDttm`.
+///
+/// The `convId` of a message row is the DIGITS of its DB file name —
+/// the 1-1 DBs are named `<peer uid>.db` and the group DBs
+/// `g<group id>.db`, the mapping's own conversation-id domain (the
+/// real `message` table has no convId column). `stranger_box.db`
+/// carries no digits, so its rows add no pair.
+#[derive(Default)]
+pub struct MsgSets {
+    pub msg_ids: HashSet<String>,
+    pub cli_ids: HashSet<String>,
+    pub pairs: HashSet<(String, String)>,
+    pub send_dttms: HashSet<i64>,
+}
+
 // --- M2: the per-code census ------------------------------------------------
 
 /// The path-side stats of one code group, over the rows WITH a
@@ -565,6 +610,22 @@ fn has_message_table(conn: &Connection) -> bool {
 /// The `message` table's column set (for the preflight).
 fn message_columns(conn: &Connection) -> Vec<String> {
     let Ok(mut st) = conn.prepare("PRAGMA table_info(\"message\")") else {
+        return Vec::new();
+    };
+    let Ok(rows) = st.query_map([], |r| r.get::<_, String>(1)) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+/// One table's column names (batch 27d; `PRAGMA table_info`,
+/// identifier-quoted — schema names only, no data). Empty when the
+/// table does not exist (a missing table answers with no rows).
+fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+    let Ok(qt) = quote_ident(table) else {
+        return Vec::new();
+    };
+    let Ok(mut st) = conn.prepare(&format!("PRAGMA table_info({qt})")) else {
         return Vec::new();
     };
     let Ok(rows) = st.query_map([], |r| r.get::<_, String>(1)) else {
@@ -743,12 +804,15 @@ struct DbStats {
 
 /// Scan EVERY snapshot message DB once with the fixed SELECT and fold
 /// the rows — tolerant reads (batch 27c): open/query/row failures and
-/// un-coercible values are COUNTED, kinds only — H-rule.
+/// un-coercible values are COUNTED, kinds only — H-rule. Batch 27d:
+/// the same pass also builds the [`MsgSets`] membership sets (the
+/// ids stay in memory; the relation counters never print a value).
 fn scan_message_dbs(
     p: &Prepared,
     root_norm: &str,
     groups: &mut BTreeMap<String, CodeCensus>,
     refs: &mut HashSet<String>,
+    sets: &mut MsgSets,
 ) -> Result<DbStats, String> {
     let sql = msg_scan_sql(&MSG_COLS)?;
     let names = super::message_db_names(&p.uid_dir)?;
@@ -761,6 +825,11 @@ fn scan_message_dbs(
             | super::DbKind::StrangerBox => {}
             _ => continue, // `undefined.db` and unknown names are not scanned
         }
+        // The message row's convId domain: the DB file-name digits.
+        let conv_of_db: Option<String> = match kind {
+            super::DbKind::OneToOne(id) | super::DbKind::Group(id) => Some(id.to_string()),
+            _ => None,
+        };
         stats.dbs += 1;
         let Ok(conn) = super::open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile)
         else {
@@ -803,6 +872,23 @@ fn scan_message_dbs(
                 continue;
             };
             stats.rows += 1;
+            let msg_id = v_to_string(msg_id, "msgId", &mut stats.coerce_none);
+            let cli_msg = v_to_string(cli, "cliMsgId", &mut stats.coerce_none);
+            let send_dttm = v_to_i64(dttm, "sendDttm", &mut stats.coerce_none);
+            // Batch 27d: fold the membership sets BEFORE the values
+            // move into the census fold.
+            if let Some(id) = msg_id.as_ref() {
+                sets.msg_ids.insert(id.clone());
+            }
+            if let Some(c) = cli_msg.as_ref() {
+                sets.cli_ids.insert(c.clone());
+            }
+            if let Some(d) = send_dttm {
+                sets.send_dttms.insert(d);
+            }
+            if let (Some(cid), Some(c)) = (conv_of_db.as_ref(), cli_msg.as_ref()) {
+                sets.pairs.insert((cid.clone(), c.clone()));
+            }
             fold_msg_row(
                 groups,
                 refs,
@@ -812,9 +898,9 @@ fn scan_message_dbs(
                 v_to_string(folder, "folderPath", &mut stats.coerce_none),
                 v_to_string(preview, "previewThumb", &mut stats.coerce_none),
                 v_to_i64(size, "fileSize", &mut stats.coerce_none),
-                v_to_string(msg_id, "msgId", &mut stats.coerce_none),
-                v_to_string(cli, "cliMsgId", &mut stats.coerce_none),
-                v_to_i64(dttm, "sendDttm", &mut stats.coerce_none),
+                msg_id,
+                cli_msg,
+                send_dttm,
             );
         }
     }
@@ -1106,6 +1192,15 @@ struct RevCov {
     cap_hit: bool,
     unref: BTreeMap<MediaSub, u64>,
     magic: BTreeMap<(MediaSub, MagicClass), u64>,
+    /// Batch 27d: the STEM of every non-rescache file, per `<sub>` —
+    /// the Res.db `uid` ↔ cache-file-name check. Every file counts
+    /// (referenced or not): the question is "is this uid a file name
+    /// under this `<sub>`", not "is it unreferenced".
+    stems: BTreeMap<MediaSub, HashSet<String>>,
+    /// Batch 27d: each picture/video/resource file's exactly-13-digit
+    /// name runs (the file-name keys section). Only files WITH a run
+    /// are stored; `files_with_dttm13` is the stored length.
+    dttm13: BTreeMap<MediaSub, Vec<Vec<String>>>,
 }
 
 /// Walk `<root>\media\<uid>\ZaloDownloads\…` for EVERY uid and count
@@ -1113,6 +1208,9 @@ struct RevCov {
 /// with a magic histogram (first 16 bytes only). `*.rescache` index
 /// files are skipped; the walk stops hard at [`WALK_CAP`] files. No
 /// path is ever printed — uid counts, `<sub>` counts, magic classes.
+/// Batch 27d: the same pass gathers the file STEMS (the Res.db uid
+/// check) and the 13-digit name runs (the file-name keys section) —
+/// a `cap_hit` report therefore also means partial sets.
 fn walk_reverse_coverage(root: &Path, refs: &HashSet<String>) -> RevCov {
     let mut rc = RevCov::default();
     let Ok(uids) = std::fs::read_dir(root.join("media")) else {
@@ -1153,12 +1251,27 @@ fn walk_reverse_coverage(root: &Path, refs: &HashSet<String>) -> RevCov {
                     continue;
                 }
                 let path_s = e.path().to_string_lossy().into_owned();
+                let sub = classify_sub(&path_s);
+                // Batch 27d: stems for EVERY file, and the 13-digit
+                // runs for the picture/video/resource files. Values
+                // stay in memory; only the counts ever print.
+                if let Some(stem) = e.path().file_stem() {
+                    rc.stems
+                        .entry(sub)
+                        .or_default()
+                        .insert(stem.to_string_lossy().into_owned());
+                }
+                if matches!(sub, MediaSub::Picture | MediaSub::Video | MediaSub::Resource) {
+                    let runs = digit_runs_13(&name);
+                    if !runs.is_empty() {
+                        rc.dttm13.entry(sub).or_default().push(runs);
+                    }
+                }
                 let norm = norm_path(&path_s);
                 if refs.contains(&norm) {
                     rc.referenced += 1;
                     continue;
                 }
-                let sub = classify_sub(&path_s);
                 *rc.unref.entry(sub).or_insert(0) += 1;
                 *rc
                     .magic
@@ -1170,8 +1283,7 @@ fn walk_reverse_coverage(root: &Path, refs: &HashSet<String>) -> RevCov {
     rc
 }
 
-fn reverse_coverage_lines(root: &Path, refs: &HashSet<String>) -> Vec<String> {
-    let rc = walk_reverse_coverage(root, refs);
+fn reverse_coverage_lines(rc: &RevCov) -> Vec<String> {
     let mut lines = vec![format!(
         "local-media-probe: reverse coverage: uids={} uids_with_zalodownloads={} files_seen={} \
          rescache_skipped={} referenced={} cap={} cap_hit={}",
@@ -1210,6 +1322,964 @@ fn reverse_coverage_lines(root: &Path, refs: &HashSet<String>) -> Vec<String> {
     lines
 }
 
+// --- batch 27d: the JSON column shapes ----------------------------------------
+
+/// The five shape classes a JSON-ish column cell can take (the brief's
+/// M1 vocabulary): `json_object` — the cell's text parses as a JSON
+/// object; `json_array` — an array; `text` — a JSON STRING scalar
+/// (the Desktop double-encoded shape the batch-24 decode unwraps);
+/// `empty` — NULL or empty text; `other` — everything else (prose,
+/// INTEGER/REAL/BLOB cells, number/bool JSON scalars). Counts only.
+#[derive(Default)]
+struct JsonShape {
+    json_object: u64,
+    json_array: u64,
+    text: u64,
+    empty: u64,
+    other: u64,
+}
+
+impl JsonShape {
+    fn fields(&self) -> String {
+        format!(
+            "json_object:{} json_array:{} text:{} empty:{} other:{}",
+            self.json_object, self.json_array, self.text, self.empty, self.other
+        )
+    }
+
+    /// Fold one raw cell (a tolerant [`SV`] — every storage class has a
+    /// class). A JSON object's top-level key NAMES also count into
+    /// `keys`, rendered by the `--content-shape` rule (identifier-
+    /// shaped schema names as-is, anything else `k:<sha256-12>`).
+    fn fold_cell(&mut self, v: &SV, keys: &mut BTreeMap<String, u64>) {
+        match v {
+            SV::Null => self.empty += 1,
+            SV::Integer(_) | SV::Real(_) | SV::Blob(_) => self.other += 1,
+            SV::Text(s) => {
+                if s.is_empty() {
+                    self.empty += 1;
+                    return;
+                }
+                match serde_json::from_str::<J>(s) {
+                    Ok(J::Object(m)) => {
+                        self.json_object += 1;
+                        fold_key_names(&m, keys);
+                    }
+                    Ok(J::Array(_)) => self.json_array += 1,
+                    Ok(J::String(_)) => self.text += 1,
+                    Ok(_) => self.other += 1,
+                    Err(_) => self.other += 1,
+                }
+            }
+        }
+    }
+
+    /// Fold one decoded VALUE (the batch-24 decode's output for the
+    /// ok/na cells — a `fail` has no value at all). A string result
+    /// stays `text`: the decode already performed the standard
+    /// unwrap, so no second-level parse is attempted here.
+    fn fold_value(&mut self, v: &J, keys: &mut BTreeMap<String, u64>) {
+        match v {
+            J::Null => self.empty += 1,
+            J::Object(m) => {
+                self.json_object += 1;
+                fold_key_names(m, keys);
+            }
+            J::Array(_) => self.json_array += 1,
+            J::String(_) => self.text += 1,
+            J::Bool(_) | J::Number(_) => self.other += 1,
+        }
+    }
+}
+
+/// Count one JSON object's top-level key names into `keys` (the
+/// `--content-shape` rendering rule: identifier-shaped schema names
+/// print as-is, anything else prints its `k:<sha256-12>` fingerprint —
+/// a key NAME that would carry a value's shape never leaks it).
+fn fold_key_names(m: &serde_json::Map<String, J>, keys: &mut BTreeMap<String, u64>) {
+    for k in m.keys() {
+        *keys.entry(render_key(k)).or_insert(0) += 1;
+    }
+}
+
+/// The brief's top-30 cap for the key-name lists.
+const KEY_CAP: usize = 30;
+
+/// `a:2 b:1 …` — the top `cap` key names by count (ties by name,
+/// ascending — deterministic), `more=+N` when overflow, `none` when
+/// empty. Names only, counts only (H-rule).
+fn keys_fields(keys: &BTreeMap<String, u64>, cap: usize) -> String {
+    let mut v: Vec<(&String, &u64)> = keys.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let shown: Vec<String> = v
+        .iter()
+        .take(cap)
+        .map(|(k, n)| format!("{k}:{n}"))
+        .collect();
+    if shown.is_empty() {
+        return "none".into();
+    }
+    let mut s = shown.join(" ");
+    if v.len() > cap {
+        s.push_str(&format!(" more=+{}", v.len() - cap));
+    }
+    s
+}
+
+/// Every maximal ASCII digit run of EXACTLY 13 digits in `name` (the
+/// `sendDttm`-shaped part of the cache file names). Pure; values stay
+/// in memory — the sections that use it print counts only.
+pub fn digit_runs_13(name: &str) -> Vec<String> {
+    let b = name.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start == 13 {
+                out.push(name[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+// --- batch 27d: Media.db (the Desktop media tables) ----------------------------
+
+/// The top-level DB names (schema, printable exactly like the
+/// inventory's own top-level names).
+const MEDIA_DB: &str = "Media.db";
+const RES_DB: &str = "Res.db";
+
+/// One Media.db table the census reads (the reviewer's schema excerpt;
+/// the fixed column lists are validated against the table before any
+/// row is read, and a missing table/column is REPORTED as a skipped
+/// line, never fatal — the zcloud convention).
+struct MediaTableSpec {
+    table: &'static str,
+    /// The path-presence columns, in print order: `localPath` first,
+    /// then the table's other path column (image: `previewThumb`,
+    /// file: `folderPath`).
+    path_cols: &'static [&'static str],
+    /// The table's metadata-ish column (image: `metadata`, file:
+    /// `thumbMetadata`).
+    meta_col: &'static str,
+}
+
+const IMAGE_SPEC: MediaTableSpec = MediaTableSpec {
+    table: "image",
+    path_cols: &["localPath", "previewThumb"],
+    meta_col: "metadata",
+};
+
+const FILE_SPEC: MediaTableSpec = MediaTableSpec {
+    table: "file",
+    path_cols: &["localPath", "folderPath"],
+    meta_col: "thumbMetadata",
+};
+
+/// The Media.db tables' coercible columns, in SELECT order (the fixed
+/// render order of `coerce_none`; `type` renders as a code token and
+/// `content`/the metadata column fold by shape, so none of the three
+/// coerces).
+const IMAGE_COERCE_COLS: [&str; 6] = [
+    "mediaId",
+    "convId",
+    "cliMsgId",
+    "sendDttm",
+    "localPath",
+    "previewThumb",
+];
+const FILE_COERCE_COLS: [&str; 6] = [
+    "mediaId",
+    "convId",
+    "cliMsgId",
+    "sendDttm",
+    "localPath",
+    "folderPath",
+];
+
+/// The Media.db `image` id sets the file-name keys section compares
+/// the cache files' 13-digit name parts against (in memory only).
+#[derive(Default)]
+struct MediaKeys {
+    send_dttms: HashSet<i64>,
+    cli_ids: HashSet<String>,
+}
+
+/// One JSON-ish column of a Media.db table: the raw shape census with
+/// its key names, plus (the `content` column only) the batch-24
+/// decode census with the decoded shape and key names.
+#[derive(Default)]
+struct JsonCol {
+    shape: JsonShape,
+    keys: BTreeMap<String, u64>,
+    dec_ok: u64,
+    dec_fail: u64,
+    dec_na: u64,
+    /// The decode's output shape/key names over the ok+na cells (a
+    /// `fail` has no value at all).
+    dec_shape: JsonShape,
+    dec_keys: BTreeMap<String, u64>,
+}
+
+/// One `type` code's census within a Media.db table. Every field is a
+/// count, a fixed class name or a (yes, no, na) triple (H-rule).
+#[derive(Default)]
+struct MediaCode {
+    rows: u64,
+    /// Non-empty counts of the table's path columns, keyed by the
+    /// lower-cased column name (`localpath`, `previewthumb`,
+    /// `folderpath`).
+    presence: BTreeMap<String, u64>,
+    paths: PathStats,
+    size_zero: u64,
+    total_bytes: u64,
+    /// name ↔ row relations, over the rows WITH a localPath.
+    name_climsgid: (u64, u64, u64),
+    name_mediaid: (u64, u64, u64),
+    name_senddttm: (u64, u64, u64),
+    dttm13: (u64, u64, u64),
+    /// row ↔ message-set relations, over ALL rows.
+    rel_climsgid: (u64, u64, u64),
+    rel_mediaid: (u64, u64, u64),
+    rel_pair: (u64, u64, u64),
+    content: JsonCol,
+    meta: JsonCol,
+}
+
+/// Identifier-quoted fixed SELECT (the names are compile-time
+/// literals; the quoting keeps the pattern uniform). `Err` carries
+/// the caller's skip line.
+fn fixed_select(cols: &[&str], table: &str) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for c in cols {
+        parts.push(quote_ident(c)?);
+    }
+    Ok(format!("SELECT {} FROM {}", parts.join(", "), quote_ident(table)?))
+}
+
+/// Scan one Media.db table into per-`type` groups (batch 27d M1).
+/// Tolerant reads as in 27c: every column is read as a Value; a row
+/// whose `rows.next()` errored and every un-coercible value are
+/// COUNTED, never fatal. `Err` carries the section's own skipped or
+/// read-failed line. `collect` is `Some` only for the `image` table —
+/// the file-name keys section's `image.sendDttm`/`image.cliMsgId`
+/// sets.
+fn scan_media_table(
+    conn: &Connection,
+    spec: &MediaTableSpec,
+    pass: &str,
+    root_norm: &str,
+    sets: &MsgSets,
+    mut collect: Option<&mut MediaKeys>,
+) -> Result<(BTreeMap<String, MediaCode>, DbStats), String> {
+    let skipped = |msg: String| format!("local-media-probe: Media.db {}: {msg}", spec.table);
+    let cols = table_columns(conn, spec.table);
+    if cols.is_empty() {
+        return Err(skipped(format!(
+            "skipped (no {} table in Media.db)",
+            spec.table
+        )));
+    }
+    let sel: [&str; 9] = [
+        "mediaId",
+        "convId",
+        "cliMsgId",
+        "type",
+        "sendDttm",
+        spec.path_cols[0],
+        spec.path_cols[1],
+        "content",
+        spec.meta_col,
+    ];
+    let missing: Vec<&str> = sel
+        .iter()
+        .copied()
+        .filter(|c| !cols.iter().any(|h| h == c))
+        .collect();
+    if !missing.is_empty() {
+        return Err(skipped(format!(
+            "skipped (the {} table lacks column(s) {})",
+            spec.table,
+            missing.join(", ")
+        )));
+    }
+    let sql = fixed_select(&sel, spec.table)?;
+    let mut st = conn
+        .prepare(&sql)
+        .map_err(|e| skipped(format!("read failed ({})", crate::shadow::pipeline::sqlite_kind(&e))))?;
+    // Batch 27c convention: the map itself cannot fail per row — only
+    // a `rows.next()` error lands in `row_failed`.
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, SV>(0)?, // mediaId
+                r.get::<_, SV>(1)?, // convId
+                r.get::<_, SV>(2)?, // cliMsgId
+                r.get::<_, SV>(3)?, // type
+                r.get::<_, SV>(4)?, // sendDttm
+                r.get::<_, SV>(5)?, // localPath
+                r.get::<_, SV>(6)?, // previewThumb | folderPath
+                r.get::<_, SV>(7)?, // content
+                r.get::<_, SV>(8)?, // metadata | thumbMetadata
+            ))
+        })
+        .map_err(|e| skipped(format!("read failed ({})", crate::shadow::pipeline::sqlite_kind(&e))))?;
+    let mut groups: BTreeMap<String, MediaCode> = BTreeMap::new();
+    let mut stats = DbStats::default();
+    // The second path column resolves a relative localPath only when
+    // it IS the folderPath column (the image table's previewThumb is
+    // never a join base).
+    let folder_col_is_second = spec.path_cols[1] == "folderPath";
+    for row in rows {
+        let Ok((media_id, conv_id, cli, code, dttm, local, other_path, content_v, meta_v)) = row
+        else {
+            stats.row_failed += 1;
+            continue;
+        };
+        stats.rows += 1;
+        let token = render_value(&code);
+        let g = groups.entry(token).or_default();
+        g.rows += 1;
+        let media_id = v_to_string(media_id, "mediaId", &mut stats.coerce_none);
+        let conv_id = v_to_string(conv_id, "convId", &mut stats.coerce_none);
+        let cli = v_to_string(cli, "cliMsgId", &mut stats.coerce_none);
+        let dttm = v_to_i64(dttm, "sendDttm", &mut stats.coerce_none);
+        let local = v_to_string(local, spec.path_cols[0], &mut stats.coerce_none);
+        let other_path = v_to_string(other_path, spec.path_cols[1], &mut stats.coerce_none);
+        if local.is_some() {
+            *g.presence.entry(spec.path_cols[0].to_ascii_lowercase()).or_insert(0) += 1;
+        }
+        if other_path.is_some() {
+            *g.presence.entry(spec.path_cols[1].to_ascii_lowercase()).or_insert(0) += 1;
+        }
+        // The content/metadata shapes — raw, tolerant: every SV class
+        // folds into one of the five classes.
+        g.content.shape.fold_cell(&content_v, &mut g.content.keys);
+        // The batch-24 decode of `content` (the SAME helper
+        // `--content-shape --decrypt-basic` uses, with the snapshot
+        // key — in memory only, never printed): `ok` = Decoded, `na`
+        // = NotEncrypted (nothing was decrypted), `fail` = the
+        // transform failed (a blob or the wrong-key signature).
+        match decode_field(&content_v, pass) {
+            FieldDecode::Decoded(v) => {
+                g.content.dec_ok += 1;
+                g.content.dec_shape.fold_value(&v, &mut g.content.dec_keys);
+            }
+            FieldDecode::NotEncrypted(v) => {
+                g.content.dec_na += 1;
+                g.content.dec_shape.fold_value(&v, &mut g.content.dec_keys);
+            }
+            FieldDecode::Failed(_) => {
+                g.content.dec_fail += 1;
+            }
+        }
+        g.meta.shape.fold_cell(&meta_v, &mut g.meta.keys);
+        // The row ↔ message-set relations, over ALL rows.
+        match cli.as_ref() {
+            Some(c) => {
+                if sets.cli_ids.contains(c) {
+                    g.rel_climsgid.0 += 1;
+                } else {
+                    g.rel_climsgid.1 += 1;
+                }
+            }
+            None => g.rel_climsgid.2 += 1,
+        }
+        match media_id.as_ref() {
+            Some(m) => {
+                if sets.msg_ids.contains(m) {
+                    g.rel_mediaid.0 += 1;
+                } else {
+                    g.rel_mediaid.1 += 1;
+                }
+            }
+            None => g.rel_mediaid.2 += 1,
+        }
+        match (conv_id.as_ref(), cli.as_ref()) {
+            (Some(cv), Some(c)) => {
+                if sets.pairs.contains(&(cv.clone(), c.clone())) {
+                    g.rel_pair.0 += 1;
+                } else {
+                    g.rel_pair.1 += 1;
+                }
+            }
+            _ => g.rel_pair.2 += 1,
+        }
+        // The file-name keys collect (image table only).
+        if let Some(ck) = collect.as_mut() {
+            if let Some(d) = dttm {
+                ck.send_dttms.insert(d);
+            }
+            if let Some(c) = cli.as_ref() {
+                ck.cli_ids.insert(c.clone());
+            }
+        }
+        // The path census + name relations, over the rows WITH a
+        // localPath.
+        let Some(local) = local else {
+            continue;
+        };
+        let ps = &mut g.paths;
+        ps.rows += 1;
+        *ps.shape.entry(path_shape(&local)).or_insert(0) += 1;
+        let folder = if folder_col_is_second {
+            other_path.as_deref()
+        } else {
+            None
+        };
+        let resolved = resolve_local(&local, folder);
+        let resolved_s = resolved.to_string_lossy().into_owned();
+        let rnorm = norm_path(&resolved_s);
+        if under_root(&rnorm, root_norm) {
+            ps.under_root += 1;
+        } else {
+            ps.not_under_root += 1;
+        }
+        *ps.subs.entry(classify_sub(&resolved_s)).or_insert(0) += 1;
+        let (is_file, len, head) = file_facts(&resolved);
+        if is_file {
+            ps.exists += 1;
+            if len == Some(0) {
+                g.size_zero += 1;
+            }
+            g.total_bytes += len.unwrap_or(0);
+            *ps.magic.entry(magic_class(&head)).or_insert(0) += 1;
+        } else {
+            ps.missing += 1;
+        }
+        let name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match cli.as_ref() {
+            Some(c) => {
+                if name.contains(c) {
+                    g.name_climsgid.0 += 1;
+                } else {
+                    g.name_climsgid.1 += 1;
+                }
+            }
+            None => g.name_climsgid.2 += 1,
+        }
+        match media_id.as_ref() {
+            Some(m) => {
+                if name.contains(m) {
+                    g.name_mediaid.0 += 1;
+                } else {
+                    g.name_mediaid.1 += 1;
+                }
+            }
+            None => g.name_mediaid.2 += 1,
+        }
+        match dttm {
+            Some(d) => {
+                if d > 0 && name.contains(&d.to_string()) {
+                    g.name_senddttm.0 += 1;
+                } else {
+                    g.name_senddttm.1 += 1;
+                }
+                if name_has_dttm(&name, d) {
+                    g.dttm13.0 += 1;
+                } else {
+                    g.dttm13.1 += 1;
+                }
+            }
+            None => {
+                g.name_senddttm.2 += 1;
+                g.dttm13.2 += 1;
+            }
+        }
+    }
+    Ok((groups, stats))
+}
+
+/// Render one Media.db table's census (most rows first, deterministic
+/// tie-break on the rendered code token; the [`CODE_CAP`] convention).
+fn media_table_lines(
+    spec: &MediaTableSpec,
+    groups: &BTreeMap<String, MediaCode>,
+    stats: &DbStats,
+    coerce_cols: &[&'static str],
+) -> Vec<String> {
+    let t = spec.table;
+    let mut lines = vec![format!(
+        "local-media-probe: Media.db {t}: rows={} row_failed={} coerce_none={}",
+        stats.rows,
+        stats.row_failed,
+        coerce_none_field(coerce_cols, &stats.coerce_none)
+    )];
+    let mut ordered: Vec<(&String, &MediaCode)> = groups.iter().collect();
+    ordered.sort_by(|a, b| b.1.rows.cmp(&a.1.rows).then(a.0.cmp(b.0)));
+    for (token, g) in ordered.iter().take(CODE_CAP) {
+        let ps = &g.paths;
+        let presence: Vec<String> = spec
+            .path_cols
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}={}",
+                    c.to_ascii_lowercase(),
+                    g.presence.get(c.to_ascii_lowercase().as_str()).copied().unwrap_or(0)
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} rows={} {}",
+            g.rows,
+            presence.join(" ")
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} paths shape={} under_root=yes:{} no:{}",
+            shape_fields(ps),
+            ps.under_root,
+            ps.not_under_root
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} paths sub={}",
+            sub_fields(ps)
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} files exists=yes:{} no:{} size_zero:{} total_bytes={}",
+            ps.exists, ps.missing, g.size_zero, g.total_bytes
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} magic {}",
+            magic_fields(&ps.magic)
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} name climsgid=yes:{} no:{} na:{} \
+             mediaid=yes:{} no:{} na:{} senddttm=yes:{} no:{} na:{} dttm13=yes:{} no:{} na:{}",
+            g.name_climsgid.0,
+            g.name_climsgid.1,
+            g.name_climsgid.2,
+            g.name_mediaid.0,
+            g.name_mediaid.1,
+            g.name_mediaid.2,
+            g.name_senddttm.0,
+            g.name_senddttm.1,
+            g.name_senddttm.2,
+            g.dttm13.0,
+            g.dttm13.1,
+            g.dttm13.2
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} rel climsgid_in_message=yes:{} no:{} \
+             na:{} mediaid_in_message=yes:{} no:{} na:{} pair_in_message=yes:{} no:{} na:{}",
+            g.rel_climsgid.0,
+            g.rel_climsgid.1,
+            g.rel_climsgid.2,
+            g.rel_mediaid.0,
+            g.rel_mediaid.1,
+            g.rel_mediaid.2,
+            g.rel_pair.0,
+            g.rel_pair.1,
+            g.rel_pair.2
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} content {} decrypt=ok:{} fail:{} na:{}",
+            g.content.shape.fields(),
+            g.content.dec_ok,
+            g.content.dec_fail,
+            g.content.dec_na
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} content decoded {}",
+            g.content.dec_shape.fields()
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} content keys {}",
+            keys_fields(&g.content.keys, KEY_CAP)
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} content decoded keys {}",
+            keys_fields(&g.content.dec_keys, KEY_CAP)
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} metadata {}",
+            g.meta.shape.fields()
+        ));
+        lines.push(format!(
+            "local-media-probe: Media.db {t} type={token} metadata keys {}",
+            keys_fields(&g.meta.keys, KEY_CAP)
+        ));
+    }
+    let more = groups.len().saturating_sub(CODE_CAP);
+    if more > 0 {
+        lines.push(format!(
+            "local-media-probe: Media.db {t}: more_types={more} (capped at {CODE_CAP} by rows)"
+        ));
+    }
+    lines
+}
+
+/// The Media.db section (batch 27d M1): the `image` and `file` tables,
+/// by `type` code. READ-ONLY — the same two-attempt top-level open
+/// (`mode=ro&immutable=1`, cipher then plain) the inventory uses;
+/// tolerant reads; a missing DB, a missing table or a read failure is
+/// REPORTED as a skip line, never fatal. Nothing prints but counts,
+/// fixed classes, schema names and rendered code tokens (H-rule).
+/// Returns the section's lines plus the `image` id sets for the
+/// file-name keys section.
+fn media_db_lines(p: &Prepared, root_norm: &str, sets: &MsgSets) -> (Vec<String>, MediaKeys) {
+    let mut collect = MediaKeys::default();
+    let path = p.uid_dir.join(MEDIA_DB);
+    if !path.is_file() {
+        return (
+            vec![format!(
+                "local-media-probe: {MEDIA_DB}: skipped (no {MEDIA_DB} in the snapshot)"
+            )],
+            collect,
+        );
+    }
+    let (conn, how) = match open_top_level(&path, p.passphrase.as_str(), p.profile) {
+        TopOpen::Cipher(c) => (c, "cipher"),
+        TopOpen::Plain(c) => (c, "plain"),
+        TopOpen::Failed(kind) => {
+            return (vec![format!("local-media-probe: {MEDIA_DB} opened=no ({kind})")], collect)
+        }
+    };
+    let mut lines = vec![format!(
+        "local-media-probe: {MEDIA_DB} opened=yes ({how}) (read-only; by type, tolerant reads)"
+    )];
+    for (spec, coerce_cols) in [
+        (&IMAGE_SPEC, &IMAGE_COERCE_COLS[..]),
+        (&FILE_SPEC, &FILE_COERCE_COLS[..]),
+    ] {
+        // Only the image table feeds the file-name keys section.
+        let collect_opt = if spec.table == "image" {
+            Some(&mut collect)
+        } else {
+            None
+        };
+        match scan_media_table(
+            &conn,
+            spec,
+            p.passphrase.as_str(),
+            root_norm,
+            sets,
+            collect_opt,
+        ) {
+            Ok((groups, stats)) => {
+                lines.extend(media_table_lines(spec, &groups, &stats, coerce_cols))
+            }
+            Err(skip) => lines.push(skip),
+        }
+    }
+    (lines, collect)
+}
+
+// --- batch 27d: Res.db (the resource cache) -------------------------------------
+
+const RES_COERCE_COLS: [&str; 1] = ["uid"];
+const REF_COERCE_COLS: [&str; 2] = ["msgId", "uid"];
+
+/// One `type` code's `res` census (rows; the params shape and key
+/// names; the uid ↔ cache-file-STEM hits per `<sub>`).
+#[derive(Default)]
+struct ResCode {
+    rows: u64,
+    params: JsonShape,
+    keys: BTreeMap<String, u64>,
+    uid_hits: BTreeMap<MediaSub, u64>,
+}
+
+/// The Res.db section (batch 27d M1): `res` by `type` — the params
+/// shape and key names plus the uid↔file-stem hits per `<sub>` — and
+/// `ref`'s membership counters (`msgId` vs the message ids, `uid` vs
+/// the `res` uids). READ-ONLY, tolerant reads, counts only; a
+/// missing DB/table/column or a read failure is REPORTED, never
+/// fatal.
+fn res_db_lines(p: &Prepared, sets: &MsgSets, rc: &RevCov) -> Vec<String> {
+    let path = p.uid_dir.join(RES_DB);
+    if !path.is_file() {
+        return vec![format!(
+            "local-media-probe: {RES_DB}: skipped (no {RES_DB} in the snapshot)"
+        )];
+    }
+    let (conn, how) = match open_top_level(&path, p.passphrase.as_str(), p.profile) {
+        TopOpen::Cipher(c) => (c, "cipher"),
+        TopOpen::Plain(c) => (c, "plain"),
+        TopOpen::Failed(kind) => {
+            return vec![format!("local-media-probe: {RES_DB} opened=no ({kind})")]
+        }
+    };
+    let mut lines = vec![format!(
+        "local-media-probe: {RES_DB} opened=yes ({how}) (read-only; tolerant reads)"
+    )];
+
+    // --- res: uid, type, params ------------------------------------------------
+    let mut res_uids: HashSet<String> = HashSet::new();
+    let cols = table_columns(&conn, "res");
+    if cols.is_empty() {
+        lines.push("local-media-probe: Res.db res: skipped (no res table in Res.db)".into());
+    } else {
+        let missing: Vec<&str> = ["uid", "type", "params"]
+            .iter()
+            .copied()
+            .filter(|c| !cols.iter().any(|h| h == c))
+            .collect();
+        if !missing.is_empty() {
+            lines.push(format!(
+                "local-media-probe: Res.db res: skipped (the res table lacks column(s) {})",
+                missing.join(", ")
+            ));
+        } else {
+            let scan = (|| -> Result<(BTreeMap<String, ResCode>, DbStats), String> {
+                let sql = fixed_select(&["uid", "type", "params"], "res")?;
+                let mut st = conn.prepare(&sql).map_err(|e| {
+                    format!(
+                        "local-media-probe: Res.db res: read failed ({})",
+                        crate::shadow::pipeline::sqlite_kind(&e)
+                    )
+                })?;
+                let rows = st.query_map([], |r| {
+                    Ok((
+                        r.get::<_, SV>(0)?, // uid
+                        r.get::<_, SV>(1)?, // type
+                        r.get::<_, SV>(2)?, // params
+                    ))
+                }).map_err(|e| {
+                    format!(
+                        "local-media-probe: Res.db res: read failed ({})",
+                        crate::shadow::pipeline::sqlite_kind(&e)
+                    )
+                })?;
+                let mut groups: BTreeMap<String, ResCode> = BTreeMap::new();
+                let mut stats = DbStats::default();
+                for row in rows {
+                    let Ok((uid, rtype, params)) = row else {
+                        stats.row_failed += 1;
+                        continue;
+                    };
+                    stats.rows += 1;
+                    let token = render_value(&rtype);
+                    let g = groups.entry(token).or_default();
+                    g.rows += 1;
+                    let uid = v_to_string(uid, "uid", &mut stats.coerce_none);
+                    g.params.fold_cell(&params, &mut g.keys);
+                    if let Some(u) = uid.as_ref() {
+                        res_uids.insert(u.clone());
+                        // Is the uid a cache file STEM under any
+                        // `<sub>`? (counts only — the fixed
+                        // vocabulary prints, never a name).
+                        for sub in SUB_FIELDS {
+                            if rc
+                                .stems
+                                .get(&sub)
+                                .is_some_and(|set| set.contains(u))
+                            {
+                                *g.uid_hits.entry(sub).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+                Ok((groups, stats))
+            })();
+            match scan {
+                Ok((groups, stats)) => {
+                    lines.push(format!(
+                        "local-media-probe: Res.db res: rows={} row_failed={} coerce_none={}",
+                        stats.rows,
+                        stats.row_failed,
+                        coerce_none_field(&RES_COERCE_COLS, &stats.coerce_none)
+                    ));
+                    let mut ordered: Vec<(&String, &ResCode)> = groups.iter().collect();
+                    ordered.sort_by(|a, b| b.1.rows.cmp(&a.1.rows).then(a.0.cmp(b.0)));
+                    for (token, g) in ordered.iter().take(CODE_CAP) {
+                        lines.push(format!(
+                            "local-media-probe: Res.db res type={token} rows={} params {}",
+                            g.rows,
+                            g.params.fields()
+                        ));
+                        lines.push(format!(
+                            "local-media-probe: Res.db res type={token} params keys {}",
+                            keys_fields(&g.keys, KEY_CAP)
+                        ));
+                        let hits: Vec<String> = SUB_FIELDS
+                            .iter()
+                            .filter(|s| g.uid_hits.get(s).copied().unwrap_or(0) > 0)
+                            .map(|s| format!("{}:{}", s.name(), g.uid_hits[s]))
+                            .collect();
+                        lines.push(format!(
+                            "local-media-probe: Res.db res type={token} uid_file_hits {}",
+                            if hits.is_empty() { "none".into() } else { hits.join(" ") }
+                        ));
+                    }
+                    let more = groups.len().saturating_sub(CODE_CAP);
+                    if more > 0 {
+                        lines.push(format!(
+                            "local-media-probe: Res.db res: more_types={more} \
+                             (capped at {CODE_CAP} by rows)"
+                        ));
+                    }
+                }
+                Err(skip) => lines.push(skip),
+            }
+        }
+    }
+
+    // --- ref: msgId, uid --------------------------------------------------------
+    let cols = table_columns(&conn, "ref");
+    if cols.is_empty() {
+        lines.push("local-media-probe: Res.db ref: skipped (no ref table in Res.db)".into());
+        return lines;
+    }
+    let missing: Vec<&str> = ["msgId", "uid"]
+        .iter()
+        .copied()
+        .filter(|c| !cols.iter().any(|h| h == c))
+        .collect();
+    if !missing.is_empty() {
+        lines.push(format!(
+            "local-media-probe: Res.db ref: skipped (the ref table lacks column(s) {})",
+            missing.join(", ")
+        ));
+        return lines;
+    }
+    let scan = (|| -> Result<((u64, u64, u64, u64, u64, u64), DbStats), String> {
+        let sql = fixed_select(&["msgId", "uid"], "ref")?;
+        let mut st = conn.prepare(&sql).map_err(|e| {
+            format!(
+                "local-media-probe: Res.db ref: read failed ({})",
+                crate::shadow::pipeline::sqlite_kind(&e)
+            )
+        })?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, SV>(0)?, r.get::<_, SV>(1)?)))
+            .map_err(|e| {
+                format!(
+                    "local-media-probe: Res.db ref: read failed ({})",
+                    crate::shadow::pipeline::sqlite_kind(&e)
+                )
+            })?;
+        // (msgid yes, no, na, uid yes, no, na)
+        let mut cnt = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut stats = DbStats::default();
+        for row in rows {
+            let Ok((msgid, uid)) = row else {
+                stats.row_failed += 1;
+                continue;
+            };
+            stats.rows += 1;
+            let msgid = v_to_string(msgid, "msgId", &mut stats.coerce_none);
+            let uid = v_to_string(uid, "uid", &mut stats.coerce_none);
+            match msgid {
+                Some(m) => {
+                    if sets.msg_ids.contains(&m) {
+                        cnt.0 += 1;
+                    } else {
+                        cnt.1 += 1;
+                    }
+                }
+                None => cnt.2 += 1,
+            }
+            match uid {
+                Some(u) => {
+                    if res_uids.contains(&u) {
+                        cnt.3 += 1;
+                    } else {
+                        cnt.4 += 1;
+                    }
+                }
+                None => cnt.5 += 1,
+            }
+        }
+        Ok((cnt, stats))
+    })();
+    match scan {
+        Ok((cnt, stats)) => lines.push(format!(
+            "local-media-probe: Res.db ref: rows={} row_failed={} coerce_none={} \
+             msgid_in_message=yes:{} no:{} na:{} uid_in_res=yes:{} no:{} na:{}",
+            stats.rows,
+            stats.row_failed,
+            coerce_none_field(&REF_COERCE_COLS, &stats.coerce_none),
+            cnt.0,
+            cnt.1,
+            cnt.2,
+            cnt.3,
+            cnt.4,
+            cnt.5
+        )),
+        Err(skip) => lines.push(skip),
+    }
+    lines
+}
+
+// --- batch 27d: the file-name keys -----------------------------------------------
+
+/// The file-name keys section (batch 27d M1): for the cache's
+/// picture/video/resource files, how many carry a 13-digit name part
+/// that equals one of the DB ids — some `message.sendDttm` /
+/// `cliMsgId` / `msgId`, or some `Media.db image.sendDttm` /
+/// `cliMsgId`. A file with several 13-digit runs counts once per
+/// set when ANY of its runs hits. Counts only (H-rule).
+fn name_keys_lines(rc: &RevCov, sets: &MsgSets, media: &MediaKeys) -> Vec<String> {
+    let mut lines = Vec::new();
+    for sub in [MediaSub::Picture, MediaSub::Video, MediaSub::Resource] {
+        let files = rc.dttm13.get(&sub).map(Vec::as_slice).unwrap_or(&[]);
+        let (mut sd, mut mc, mut mi, mut msd, mut mcli) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        for runs in files {
+            if runs
+                .iter()
+                .any(|r| r.parse::<i64>().is_ok_and(|n| sets.send_dttms.contains(&n)))
+            {
+                sd += 1;
+            }
+            if runs.iter().any(|r| sets.cli_ids.contains(r)) {
+                mc += 1;
+            }
+            if runs.iter().any(|r| sets.msg_ids.contains(r)) {
+                mi += 1;
+            }
+            if runs
+                .iter()
+                .any(|r| r.parse::<i64>().is_ok_and(|n| media.send_dttms.contains(&n)))
+            {
+                msd += 1;
+            }
+            if runs.iter().any(|r| media.cli_ids.contains(r)) {
+                mcli += 1;
+            }
+        }
+        lines.push(format!(
+            "local-media-probe: name-keys sub={} files_with_dttm13={} senddttm=yes:{} \
+             climsgid=yes:{} msgid=yes:{} media_image_senddttm=yes:{} media_image_climsgid=yes:{}",
+            sub.name(),
+            files.len(),
+            sd,
+            mc,
+            mi,
+            msd,
+            mcli
+        ));
+    }
+    lines
+}
+
+// --- batch 27d: M2 (the 32-char part of picture names) ---------------------------
+
+/// The M2 milestone lines. The brief's hypothesis — the 32-char part
+/// of a picture file name is the lowercase hex MD5 of a content url —
+/// needs an MD5; NO MD5 implementation exists anywhere in the
+/// dependency tree (sha2/blake2 only — a SHA hex is 64 chars and can
+/// never equal a 32-char part), and the brief forbids adding a crate.
+/// The milestone is therefore SKIPPED and reported exactly as the
+/// brief prescribes: `md5=unavailable`. Fixed text only (H-rule).
+fn md5_section_lines() -> Vec<String> {
+    vec![
+        "local-media-probe: picture-name hash: md5=unavailable (no MD5 implementation exists \
+         in the dependency tree and the brief forbids adding a crate — milestone skipped)"
+            .into(),
+    ]
+}
+
 // --- M2: the report ----------------------------------------------------------
 
 /// The `--local-media-probe` report (read-only; `out` writes the same
@@ -1246,7 +2316,10 @@ pub fn probe_report(
     preflight_columns(p, &MSG_COLS)?;
     let mut groups: BTreeMap<String, CodeCensus> = BTreeMap::new();
     let mut refs: HashSet<String> = HashSet::new();
-    let stats = scan_message_dbs(p, &root_norm, &mut groups, &mut refs)?;
+    // Batch 27d: the same scan also builds the membership sets the
+    // Media.db / Res.db relation counters compare against.
+    let mut sets = MsgSets::default();
+    let stats = scan_message_dbs(p, &root_norm, &mut groups, &mut refs, &mut sets)?;
     lines.push(format!(
         "local-media-probe: message DBs: dbs={} opened={} open_failed={} query_failed={} \
          row_failed={} no_table={} rows={} coerce_none={}",
@@ -1268,9 +2341,29 @@ pub fn probe_report(
     lines.push("== zcloud (Core/Index.db, by zType) ==".into());
     lines.extend(zcloud_lines(p, &root_norm)?);
 
-    // The reverse-coverage walk.
+    // The reverse-coverage walk (batch 27d: the same pass now also
+    // gathers the file STEMS for the Res.db uid check and the
+    // 13-digit name runs for the file-name keys section).
+    let rc = walk_reverse_coverage(root, &refs);
     lines.push("== reverse coverage (files no message row points at) ==".into());
-    lines.extend(reverse_coverage_lines(root, &refs));
+    lines.extend(reverse_coverage_lines(&rc));
+
+    // Batch 27d M1: Media.db (image / file, by type).
+    lines.push("== Media.db (image / file, by type) ==".into());
+    let (media_section, media_keys) = media_db_lines(p, &root_norm, &sets);
+    lines.extend(media_section);
+
+    // Batch 27d M1: Res.db (res / ref).
+    lines.push("== Res.db (res / ref) ==".into());
+    lines.extend(res_db_lines(p, &sets, &rc));
+
+    // Batch 27d M1: the cache file names' 13-digit parts vs the ids.
+    lines.push("== file-name keys (the 13-digit part vs the DB ids) ==".into());
+    lines.extend(name_keys_lines(&rc, &sets, &media_keys));
+
+    // Batch 27d M2: skipped — the dependency tree has no MD5.
+    lines.push("== picture-name 32-char part vs URL hashes (M2) ==".into());
+    lines.extend(md5_section_lines());
 
     if let Some(p_out) = out {
         let mut body = lines.join("\n");
@@ -1936,6 +3029,157 @@ mod tests {
         );
         assert_eq!(coerce_none_field(&PLAN_COERCE_COLS, &c), "fileSize:1");
         assert_eq!(coerce_none_field(&ZCLOUD_COERCE_COLS, &c), "none");
+    }
+
+    // --- batch 27d: the JSON shapes and the file-name keys -----------------
+
+    #[test]
+    fn digit_runs_13_extracts_exact_runs_only() {
+        assert_eq!(
+            digit_runs_13("p1763600000000_00112233.jxl"),
+            vec!["1763600000000".to_string()]
+        );
+        // The whole name IS the run (the video shape).
+        assert_eq!(
+            digit_runs_13("1763600000000"),
+            vec!["1763600000000".to_string()]
+        );
+        // 12- and 14-digit runs never match.
+        assert!(digit_runs_13("x176360000000.jxl").is_empty());
+        assert!(digit_runs_13("x17636000000001.jxl").is_empty());
+        // Two runs both surface; a run is bounded by non-digits.
+        assert_eq!(
+            digit_runs_13("a1763600000000b1763600000001"),
+            vec![
+                "1763600000000".to_string(),
+                "1763600000001".to_string()
+            ]
+        );
+        assert!(digit_runs_13("othername_01.jpg").is_empty());
+        assert!(digit_runs_13("").is_empty());
+    }
+
+    #[test]
+    fn json_shape_folds_the_five_classes_and_key_names() {
+        let mut s = JsonShape::default();
+        let mut keys: BTreeMap<String, u64> = BTreeMap::new();
+        s.fold_cell(
+            &SV::Text(r#"{"href":"SENTINEL-V","photoId":1}"#.into()),
+            &mut keys,
+        );
+        s.fold_cell(&SV::Text("[1,2]".into()), &mut keys);
+        s.fold_cell(&SV::Text(r#""a json string scalar""#.into()), &mut keys);
+        s.fold_cell(&SV::Null, &mut keys);
+        s.fold_cell(&SV::Text(String::new()), &mut keys);
+        s.fold_cell(&SV::Text("plain prose SENTINEL-P".into()), &mut keys);
+        s.fold_cell(&SV::Text("123".into()), &mut keys);
+        s.fold_cell(&SV::Integer(7), &mut keys);
+        s.fold_cell(&SV::Blob(vec![1]), &mut keys);
+        assert_eq!(
+            s.fields(),
+            "json_object:1 json_array:1 text:1 empty:2 other:4"
+        );
+        // Key NAMES print (schema, the content-shape rule); values
+        // never — the SENTINELs above appear nowhere in `fields`.
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get("href"), Some(&1));
+        assert_eq!(keys.get("photoId"), Some(&1));
+    }
+
+    #[test]
+    fn json_shape_folds_decoded_values_and_fingerprints_odd_keys() {
+        let mut s = JsonShape::default();
+        let mut keys: BTreeMap<String, u64> = BTreeMap::new();
+        s.fold_value(&J::Null, &mut keys);
+        s.fold_value(&serde_json::json!({"a": 1, "we ird!": 2}), &mut keys);
+        s.fold_value(&serde_json::json!([1]), &mut keys);
+        s.fold_value(&serde_json::json!("decoded string"), &mut keys);
+        s.fold_value(&serde_json::json!(true), &mut keys);
+        assert_eq!(
+            s.fields(),
+            "json_object:1 json_array:1 text:1 empty:1 other:1"
+        );
+        // The identifier key prints; the odd one fingerprints — never
+        // its raw name.
+        assert_eq!(keys.get("a"), Some(&1));
+        let weird: Vec<&String> = keys.keys().filter(|k| *k != "a").collect();
+        assert_eq!(weird.len(), 1, "{keys:?}");
+        assert!(weird[0].starts_with("k:"), "{weird:?}");
+        assert_eq!(weird[0].len(), 2 + 12);
+        assert!(!weird[0].contains("we ird"), "{weird:?}");
+    }
+
+    #[test]
+    fn keys_fields_orders_by_count_then_name_and_caps() {
+        let mut keys: BTreeMap<String, u64> = BTreeMap::new();
+        assert_eq!(keys_fields(&keys, KEY_CAP), "none");
+        for (k, n) in [("b", 2u64), ("a", 5), ("c", 5), ("d", 1)] {
+            keys.insert(k.into(), n);
+        }
+        assert_eq!(keys_fields(&keys, 4), "a:5 c:5 b:2 d:1");
+        assert_eq!(keys_fields(&keys, 3), "a:5 c:5 b:2 more=+1");
+        assert_eq!(keys_fields(&keys, 2), "a:5 c:5 more=+2");
+        // The brief's top-30 cap: the 35 single-count keys overflow by
+        // exactly 9 (4 + 35 = 39 keys, 30 shown).
+        for i in 0..35 {
+            keys.insert(format!("k{i:02}"), 1);
+        }
+        let out = keys_fields(&keys, KEY_CAP);
+        assert!(out.ends_with(" more=+9"), "{out}");
+        assert!(out.starts_with("a:5 c:5 "), "{out}");
+    }
+
+    #[test]
+    fn name_keys_lines_counts_hits_per_sub() {
+        // A constructed walk + id sets (pure — no filesystem): two
+        // picture files with a 13-digit run, one video file, no
+        // resource file.
+        let mut rc = RevCov::default();
+        rc.dttm13
+            .entry(MediaSub::Picture)
+            .or_default()
+            .push(vec!["1763600000000".to_string()]);
+        rc.dttm13
+            .entry(MediaSub::Picture)
+            .or_default()
+            .push(vec!["1763600000001".to_string()]);
+        rc.dttm13
+            .entry(MediaSub::Video)
+            .or_default()
+            .push(vec!["1763600000001".to_string()]);
+        let mut sets = MsgSets::default();
+        sets.send_dttms.insert(1_763_600_000_000);
+        sets.cli_ids.insert("1763600000001".to_string());
+        sets.msg_ids.insert("1763600000001".to_string());
+        let mut media = MediaKeys::default();
+        media.send_dttms.insert(1_763_600_000_001);
+        media.cli_ids.insert("1763600000000".to_string());
+        let lines = name_keys_lines(&rc, &sets, &media);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains(
+                "sub=picture files_with_dttm13=2 senddttm=yes:1 climsgid=yes:1 msgid=yes:1 \
+                 media_image_senddttm=yes:1 media_image_climsgid=yes:1"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(
+                "sub=video files_with_dttm13=1 senddttm=yes:0 climsgid=yes:1 msgid=yes:1 \
+                 media_image_senddttm=yes:1 media_image_climsgid=yes:0"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(
+                "sub=resource files_with_dttm13=0 senddttm=yes:0 climsgid=yes:0 msgid=yes:0 \
+                 media_image_senddttm=yes:0 media_image_climsgid=yes:0"
+            ),
+            "{}",
+            lines[2]
+        );
     }
 
     // --- M3: the pure decision, every outcome --------------------------------
@@ -3082,6 +4326,579 @@ mod tests {
             let _ = std::fs::remove_dir_all(&snap);
             let _ = std::fs::remove_dir_all(&root);
             let _ = std::fs::remove_dir_all(&store);
+        }
+
+        // --- batch 27d: Media.db / Res.db ----------------------------------
+
+        /// The real Media.db / Res.db DDL (the reviewer's schema
+        /// excerpt), so the batch-27d fixed column lists are exercised
+        /// exactly as the real tables declare them.
+        const IMAGE_DDL: &str = "CREATE TABLE image (
+    mediaId TEXT PRIMARY KEY, convId TEXT, cliMsgId TEXT, fromUid TEXT,
+    content TEXT, type INTEGER, src TEXT, sendDttm INTEGER, ttl INTEGER,
+    localPath TEXT, previewThumb TEXT, modifiedTime INTEGER,
+    metadata TEXT, ev TEXT
+  );";
+        const FILE_DDL: &str = "CREATE TABLE file (
+    mediaId TEXT PRIMARY KEY, convId TEXT, cliMsgId TEXT, fromUid TEXT,
+    content TEXT, type INTEGER, src TEXT, extType INTEGER, sendDttm INTEGER,
+    ttl INTEGER, modifiedTime INTEGER, localPath TEXT, folderPath TEXT,
+    thumbMetadata TEXT, ev TEXT
+  );";
+        const RES_DDL: &str = "CREATE TABLE res (
+    uid TEXT PRIMARY KEY, size INTEGER, type INTEGER, atime INTEGER,
+    params TEXT
+  );";
+        const REF_DDL: &str =
+            "CREATE TABLE ref (msgId TEXT PRIMARY KEY, convId TEXT, uid TEXT);";
+
+        /// Open (creating) a top-level SQLCipher DB keyed by the
+        /// snapshot passphrase — the way the real top-level DBs open
+        /// (batch 27 M1 measured them with the cipher key).
+        fn open_top_fixture(path: &Path, pass: &str) -> Connection {
+            let conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .unwrap();
+            apply_passphrase_key(&conn, pass).unwrap();
+            conn
+        }
+
+        /// The exact Zalo BasicEncryption pipeline (desktop_cipher's
+        /// own test helper): the cell stores
+        /// `JSON.stringify(xor(JSON.stringify(value), key))`.
+        fn enc_cell(value: &serde_json::Value, key: &str) -> String {
+            let plain = serde_json::to_string(value).unwrap();
+            let xored = crate::shadow::import::desktop_cipher::basic_xor_utf16(&plain, key);
+            serde_json::to_string(&serde_json::Value::String(xored)).unwrap()
+        }
+
+        /// The batch-27d end-to-end fixture: a Media.db whose `image`
+        /// row A is the LINK ROW — `localPath` points at the temp-dir
+        /// picture file, and its `cliMsgId`/`sendDttm`/`(convId,
+        /// cliMsgId)`/`mediaId` all match a Desktop `message` row —
+        /// plus the other content shapes (plain object, prose, blob)
+        /// and a Res.db whose `res.uid` values are cache file STEMS
+        /// and whose `ref` rows half-match the message/res sets.
+        /// Asserts every relation counter, and the H-rule end to end.
+        #[test]
+        fn probe_report_media_db_and_res_db_sections() {
+            // The media root: the standard fixture (a JXL picture
+            // named p<13 digits>_<32 hex>, an unreferenced JPEG, a
+            // rescache index, a 13-digit mp4 video) plus one resource
+            // file whose 13-digit part is the SECOND message row's
+            // cliMsgId and whose stem a Res.db `res` row carries.
+            let root = synthetic_media_root();
+            let uid_dir = root.join("media").join("19");
+            let pic_file = uid_dir
+                .join("ZaloDownloads")
+                .join("picture")
+                .join(format!("p{DTTM}_00112233445566778899aabbccddeeff.jxl"));
+            let res_dir = uid_dir.join("ZaloDownloads").join("resource");
+            std::fs::create_dir_all(&res_dir).unwrap();
+            let cli2 = format!("{}", DTTM + 5); // a 13-digit cliMsgId
+            let res_stem = format!("{cli2}_00ff00112233445566778899aabbccdd");
+            let res_file = res_dir.join(format!("{res_stem}.jpg"));
+            std::fs::write(&res_file, [0xFFu8, 0xD8, 0xFF, 0xE0, 1]).unwrap();
+
+            // Two message rows in 111.db (conv id 111): the first's ids
+            // match the Media.db image row A below (the link row); the
+            // second's cliMsgId is the resource file's 13-digit part.
+            let rows = format!(
+                "INSERT INTO message \
+                 (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
+                  sendDttm, message) VALUES \
+                 ('8488000000001', 'cli0001', 2, '{jxl}', NULL, 'pv', 4, {DTTM}, 'never read'); \
+                 INSERT INTO message \
+                 (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
+                  sendDttm, message) VALUES \
+                 ('8488000000005', '{cli2}', 2, NULL, NULL, NULL, NULL, {DTTM}, 'never read');",
+                jxl = q(&pic_file.to_string_lossy()),
+            );
+            let (snap, key) = synthetic_snapshot(PASS, &rows);
+
+            // Media.db: `image` row A (the link row — encrypted
+            // content, the real localPath, ids matching the message
+            // row), row B (a plain-object content), row C (prose),
+            // row D (a BLOB content whose mediaId is still a message
+            // msgId); `file` row F (a RELATIVE localPath resolved via
+            // folderPath to the video file).
+            let enc_a = enc_cell(
+                &serde_json::json!({
+                    "href": "https://fake-stal.zdn.vn/SENTINEL-A.jpg",
+                    "params": "{\"hd\":\"https://fake-stal.zdn.vn/SENTINEL-HD.jpg\"}",
+                    "photoId": "ph-A"
+                }),
+                PASS,
+            );
+            {
+                let conn = open_top_fixture(&snap.join("Media.db"), PASS);
+                conn.execute_batch(&format!("{IMAGE_DDL}\n{FILE_DDL}")).unwrap();
+                let ins_image = "INSERT INTO image (mediaId, convId, cliMsgId, fromUid, \
+                     content, type, src, sendDttm, ttl, localPath, previewThumb, modifiedTime, \
+                     metadata, ev) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+                conn.execute(
+                    ins_image,
+                    rusqlite::params![
+                        "8488000000001", // mediaId = a real message msgId
+                        "111",           // convId = the DB file digits
+                        "cli0001",       // cliMsgId matches the message row
+                        "u",
+                        enc_a,
+                        2,
+                        "s",
+                        DTTM,
+                        0,
+                        pic_file.to_string_lossy(),
+                        "pv",
+                        0,
+                        r#"{"width":100,"height":50}"#,
+                        Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    ins_image,
+                    rusqlite::params![
+                        "mediab", "111", "clib", "u",
+                        r#"{"photoId":"SENTINEL-P","caption":"SENTINEL-CAP"}"#,
+                        2, "s", Option::<i64>::None, 0,
+                        Option::<&str>::None, Option::<&str>::None, 0,
+                        "", Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    ins_image,
+                    rusqlite::params![
+                        "mediac", "111", Option::<&str>::None, "u",
+                        "prose SENTINEL-PROSE",
+                        2, "s", Option::<i64>::None, 0,
+                        Option::<&str>::None, Option::<&str>::None, 0,
+                        Option::<&str>::None, Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    ins_image,
+                    rusqlite::params![
+                        "8488000000005", "111", Option::<&str>::None, "u",
+                        rusqlite::types::Value::Blob(vec![1, 2, 3]),
+                        2, "s", Option::<i64>::None, 0,
+                        Option::<&str>::None, Option::<&str>::None, 0,
+                        Option::<&str>::None, Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO file (mediaId, convId, cliMsgId, fromUid, content, type, \
+                     src, extType, sendDttm, ttl, modifiedTime, localPath, folderPath, \
+                     thumbMetadata, ev) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    rusqlite::params![
+                        "mediaf", "111", &cli2, "u",
+                        r#"{"href":"https://fake-stal.zdn.vn/SENTINEL-F.doc"}"#,
+                        19, "s", 0, Option::<i64>::None, 0, 0,
+                        format!(r"ZaloDownloads\video\{DTTM}"),
+                        uid_dir.to_string_lossy(),
+                        r#"{"t":1}"#,
+                        Option::<&str>::None,
+                    ],
+                )
+                .unwrap();
+                conn.close().map_err(|(_, e)| e).unwrap();
+            }
+
+            // Res.db: `res` uids are cache file STEMS (the resource
+            // file's, the unreferenced picture's) plus one that is
+            // no file; `ref` rows half-match the message and res sets.
+            {
+                let conn = open_top_fixture(&snap.join("Res.db"), PASS);
+                conn.execute_batch(&format!("{RES_DDL}\n{REF_DDL}")).unwrap();
+                conn.execute(
+                    "INSERT INTO res (uid, size, type, atime, params) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        &res_stem, 5, 1, 0,
+                        r#"{"cdnUrl":"https://fake-stal.zdn.vn/SENTINEL-R","ttl":3600}"#,
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO res (uid, size, type, atime, params) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["othername_01", 1, 1, 0, Option::<&str>::None],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO res (uid, size, type, atime, params) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["no-such-file", 1, 2, 0, "notjson"],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO ref (msgId, convId, uid) VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["8488000000001", "111", &res_stem],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO ref (msgId, convId, uid) VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["ghost-msg", "111", "never-in-res"],
+                )
+                .unwrap();
+                conn.close().map_err(|(_, e)| e).unwrap();
+            }
+
+            let uin = sha12(PASS.as_bytes());
+            let a = args_for(&snap, &uin, &key);
+            let p = prepare(&a).unwrap();
+            let lines = probe_report(&p, &root, None).unwrap();
+            let joined = lines.join("\n");
+
+            // Both top-level DBs open with the snapshot key.
+            assert!(
+                joined.contains("local-media-probe: Media.db opened=yes (cipher)"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Res.db opened=yes (cipher)"),
+                "{joined}"
+            );
+
+            // The image census: 4 rows, one localPath (the real JXL),
+            // under the root, picture, exists, 4 bytes, jxl magic.
+            assert!(
+                joined
+                    .contains("local-media-probe: Media.db image: rows=4 row_failed=0 coerce_none=none"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 rows=4 localpath=1 previewthumb=1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 paths shape=abs_drive:1 \
+                     abs_unc:0 relative:0 file_url:0 other:0 under_root=yes:1 no:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 files exists=yes:1 no:0 \
+                     size_zero:0 total_bytes=4"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 magic jpg:0 png:0 gif:0 webp:0 jxl:1"
+                ),
+                "{joined}"
+            );
+            // The name relations (the batch-27 convention: only the
+            // rows WITH a localPath participate; `na` is an id that is
+            // NULL among those rows): the cache file name carries the
+            // 13-digit sendDttm, never the ids.
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 name climsgid=yes:0 no:1 na:0 \
+                     mediaid=yes:0 no:1 na:0 senddttm=yes:1 no:0 na:0 dttm13=yes:1 no:0 na:0"
+                ),
+                "{joined}"
+            );
+            // The row ↔ message-set relations: row A matches on every
+            // axis (cliMsgId, mediaId-as-msgId, the (convId, cliMsgId)
+            // pair); row D's mediaId is the other message msgId; rows
+            // B and C match nothing (their ids exist but are not
+            // message ids); row D has no cliMsgId (na).
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 rel climsgid_in_message=yes:1 \
+                     no:1 na:2 mediaid_in_message=yes:2 no:2 na:0 pair_in_message=yes:1 no:1 na:2"
+                ),
+                "{joined}"
+            );
+            // The content shapes and the batch-24 decode: one
+            // encrypted cell (ok), one BLOB (fail), two kept (na).
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 content json_object:1 \
+                     json_array:0 text:1 empty:0 other:2 decrypt=ok:1 fail:1 na:2"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 content decoded json_object:2 \
+                     json_array:0 text:1 empty:0 other:0"
+                ),
+                "{joined}"
+            );
+            // The key names (schema; values never): row B's raw object
+            // keys, then the decrypted+kept objects' keys.
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 content keys caption:1 photoId:1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 content decoded keys photoId:2 \
+                     caption:1 href:1 params:1"
+                ),
+                "{joined}"
+            );
+            // The metadata shapes and keys.
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 metadata json_object:1 \
+                     json_array:0 text:0 empty:3 other:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db image type=2 metadata keys height:1 width:1"
+                ),
+                "{joined}"
+            );
+
+            // The file census: one row, RELATIVE localPath resolved via
+            // folderPath to the existing mp4.
+            assert!(
+                joined
+                    .contains("local-media-probe: Media.db file: rows=1 row_failed=0 coerce_none=none"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 rows=1 localpath=1 folderpath=1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 paths shape=abs_drive:0 \
+                     abs_unc:0 relative:1 file_url:0 other:0 under_root=yes:1 no:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 files exists=yes:1 no:0 \
+                     size_zero:0 total_bytes=10"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 name climsgid=yes:0 no:1 na:0 \
+                     mediaid=yes:0 no:1 na:0 senddttm=yes:0 no:0 na:1 dttm13=yes:0 no:0 na:1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 rel climsgid_in_message=yes:1 \
+                     no:0 na:0 mediaid_in_message=yes:0 no:1 na:0 pair_in_message=yes:1 no:0 na:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 content json_object:1 \
+                     json_array:0 text:0 empty:0 other:0 decrypt=ok:0 fail:0 na:1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Media.db file type=19 metadata json_object:1 \
+                     json_array:0 text:0 empty:0 other:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Media.db file type=19 metadata keys t:1"),
+                "{joined}"
+            );
+
+            // The res census: uids that ARE cache file stems, per
+            // `<sub>`, plus the params shapes and key names.
+            assert!(
+                joined
+                    .contains("local-media-probe: Res.db res: rows=3 row_failed=0 coerce_none=none"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Res.db res type=1 rows=2 params json_object:1 \
+                     json_array:0 text:0 empty:1 other:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Res.db res type=1 params keys cdnUrl:1 ttl:1"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Res.db res type=1 uid_file_hits picture:1 resource:1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: Res.db res type=2 rows=1 params json_object:0 \
+                     json_array:0 text:0 empty:0 other:1"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Res.db res type=2 params keys none"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Res.db res type=2 uid_file_hits none"),
+                "{joined}"
+            );
+            // ref: one msgId the messages know, one they do not; one
+            // uid in res, one not.
+            assert!(
+                joined.contains(
+                    "local-media-probe: Res.db ref: rows=2 row_failed=0 coerce_none=none \
+                     msgid_in_message=yes:1 no:1 na:0 uid_in_res=yes:1 no:1 na:0"
+                ),
+                "{joined}"
+            );
+
+            // The walk gained the resource file: 5 files seen, 3
+            // unreferenced (the JPEG, the mp4 and the resource file —
+            // only the message row's localPath counts as a reference).
+            assert!(
+                joined.contains(
+                    "local-media-probe: reverse coverage: uids=1 uids_with_zalodownloads=1 \
+                     files_seen=5 rescache_skipped=1 referenced=1 cap=200000 cap_hit=no"
+                ),
+                "{joined}"
+            );
+            assert!(joined.contains("local-media-probe: unref total=3"), "{joined}");
+
+            // The file-name keys: the picture and video files' 13-digit
+            // parts equal a message sendDttm and a Media.db image
+            // sendDttm; the resource file's equals a message cliMsgId.
+            assert!(
+                joined.contains(
+                    "local-media-probe: name-keys sub=picture files_with_dttm13=1 \
+                     senddttm=yes:1 climsgid=yes:0 msgid=yes:0 media_image_senddttm=yes:1 \
+                     media_image_climsgid=yes:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: name-keys sub=video files_with_dttm13=1 \
+                     senddttm=yes:1 climsgid=yes:0 msgid=yes:0 media_image_senddttm=yes:1 \
+                     media_image_climsgid=yes:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-probe: name-keys sub=resource files_with_dttm13=1 \
+                     senddttm=yes:0 climsgid=yes:1 msgid=yes:0 media_image_senddttm=yes:0 \
+                     media_image_climsgid=yes:0"
+                ),
+                "{joined}"
+            );
+
+            // M2: no MD5 in the dependency tree — reported, skipped.
+            assert!(
+                joined.contains("local-media-probe: picture-name hash: md5=unavailable"),
+                "{joined}"
+            );
+
+            // H-rule self-check: no path value, file name, uid, msgId,
+            // cliMsgId, url or message text anywhere.
+            for banned in [
+                "8488000000001",
+                "8488000000005",
+                "cli0001",
+                "1763600000005",
+                "1763600000000",
+                res_stem.as_str(),
+                "00ff00112233445566778899aabbccdd",
+                "00112233",
+                "othername",
+                "SENTINEL",
+                "never read",
+                "ghost-msg",
+                "no-such-file",
+                "never-in-res",
+                "https://",
+                "zdn.vn",
+                "prose",
+                "mediab",
+                "mediac",
+                "mediaf",
+                "ph-A",
+            ] {
+                assert!(!joined.contains(banned), "a value leaked: {banned}\n{joined}");
+            }
+            let _ = std::fs::remove_dir_all(&snap);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// A snapshot without Media.db / Res.db reports both sections
+        /// as skipped (never fatal) and still prints the md5 line and
+        /// the name-keys section over the walk alone.
+        #[test]
+        fn probe_report_skips_media_and_res_when_absent() {
+            let root = synthetic_media_root();
+            let (snap, key) = synthetic_snapshot(
+                PASS,
+                "INSERT INTO message (msgId, cliMsgId, msgType, message) VALUES \
+                 ('1', 'c1', 1, 'x');",
+            );
+            let uin = sha12(PASS.as_bytes());
+            let a = args_for(&snap, &uin, &key);
+            let p = prepare(&a).unwrap();
+            let lines = probe_report(&p, &root, None).unwrap();
+            let joined = lines.join("\n");
+            assert!(
+                joined
+                    .contains("local-media-probe: Media.db: skipped (no Media.db in the snapshot)"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: Res.db: skipped (no Res.db in the snapshot)"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-probe: picture-name hash: md5=unavailable"),
+                "{joined}"
+            );
+            // The name-keys section still renders: the walk still
+            // counts the picture file's 13-digit run, but without a
+            // sendDttm-carrying message row (and no Media.db) no set
+            // matches.
+            assert!(
+                joined.contains(
+                    "local-media-probe: name-keys sub=picture files_with_dttm13=1 \
+                     senddttm=yes:0 climsgid=yes:0 msgid=yes:0 media_image_senddttm=yes:0 \
+                     media_image_climsgid=yes:0"
+                ),
+                "{joined}"
+            );
+            let _ = std::fs::remove_dir_all(&snap);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

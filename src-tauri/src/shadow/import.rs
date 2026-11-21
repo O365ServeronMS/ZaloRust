@@ -745,8 +745,10 @@ fn top_level_db_names(uid_dir: &Path) -> Result<Vec<String>, String> {
 }
 
 /// How one top-level DB answered the two open attempts (M1).
+/// `pub(crate)` so the batch-27d local-media sections can open
+/// `Media.db` / `Res.db` through the exact same two-attempt path.
 #[derive(Debug)]
-enum TopOpen {
+pub(crate) enum TopOpen {
     /// The snapshot passphrase + detected profile opened it — the same
     /// open path and key as `Core/*.db`.
     Cipher(Connection),
@@ -764,8 +766,9 @@ enum TopOpen {
 /// SQLite open on the same immutable read-only URI. A connection whose
 /// `sqlite_master` verify passes is returned live (the caller
 /// inventories through it); otherwise the log-safe error KIND (never
-/// sqlite's message text — it can quote the file path).
-fn open_top_level(path: &Path, passphrase: &str, profile: CipherProfile) -> TopOpen {
+/// sqlite's message text — it can quote the file path). `pub(crate)`
+/// so the batch-27d local-media sections reuse the identical path.
+pub(crate) fn open_top_level(path: &Path, passphrase: &str, profile: CipherProfile) -> TopOpen {
     if let Ok(conn) = open_desktop_db(path, passphrase, profile) {
         return TopOpen::Cipher(conn);
     }
