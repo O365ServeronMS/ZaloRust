@@ -455,20 +455,34 @@ pub fn cell_epoch() -> u64 {
 /// reader open happens with the key cell's new value.
 pub static STORE_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// The gate's read guard for ONE gate instance (F2): production
+/// callers go through [`store_gate_read`]; the tests prove the gate's
+/// write-waits-for-read semantics through this same function on a
+/// FRESH LOCAL instance (batch 23b T2: the process-wide static is
+/// shared with every parallel test — conversion tests hold its
+/// write guard for a full rekey — so a writer queued there behind an
+/// unrelated guard could outlive any fixed budget and made the
+/// 5-second assert flaky under the full suite).
+pub fn gate_read(gate: &std::sync::RwLock<()>) -> std::sync::RwLockReadGuard<'_, ()> {
+    gate.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The gate's write guard for ONE gate instance (F2) — see
+/// [`gate_read`]; production callers go through [`store_gate_write`].
+pub fn gate_write(gate: &std::sync::RwLock<()>) -> std::sync::RwLockWriteGuard<'_, ()> {
+    gate.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The store gate's read guard (media cycle: hold it for the cycle's
 /// DB use and drop it when the connection goes away).
 pub fn store_gate_read() -> std::sync::RwLockReadGuard<'static, ()> {
-    STORE_GATE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    gate_read(&STORE_GATE)
 }
 
 /// The store gate's write guard (conversion engines: from the journal
 /// step through the rekey-back/finalize).
 pub fn store_gate_write() -> std::sync::RwLockWriteGuard<'static, ()> {
-    STORE_GATE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    gate_write(&STORE_GATE)
 }
 
 /// (F2) [`open_store`] for callers that live in THIS process with the
@@ -1941,11 +1955,26 @@ mod tests {
     #[test]
     fn the_store_gate_write_guard_waits_for_a_held_read_guard() {
         // F2: the write guard (a conversion) blocks until every read
-        // guard (a media cycle) is released — unit-level, no app launch.
-        let read = store_gate_read();
+        // guard (a media cycle) is released. Batch 23b (T2): proven
+        // through the SAME guard-producing functions production uses
+        // (`gate_read`/`gate_write`) on a FRESH LOCAL gate instance.
+        // The process-wide STORE_GATE is shared with every parallel
+        // test — conversion tests hold its write guard for a full
+        // rekey, so a writer queued there behind an unrelated guard
+        // could wait past any fixed budget and made the old
+        // global-static version flaky under the full suite. The local
+        // instance has zero contention, so the budgets below are
+        // exact, and the waiting semantics it proves are the identical
+        // code path. The production wiring — both accessors lock the
+        // ONE process-wide static — is pinned at the end by try_write/
+        // try_read probes that never block and cannot be flaked by
+        // whatever unrelated guards other tests hold.
+        let gate = std::sync::Arc::new(std::sync::RwLock::<()>::new(()));
+        let writer_gate = std::sync::Arc::clone(&gate);
+        let read = gate_read(&gate);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let writer = std::thread::spawn(move || {
-            let _write = store_gate_write();
+            let _write = gate_write(&writer_gate);
             let _ = tx.send(());
             // Hold it briefly so the main thread also observes it held.
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1960,6 +1989,21 @@ mod tests {
             "the write guard is acquired once the read guard is released"
         );
         writer.join().unwrap();
+        // The production wiring, both directions, never waiting:
+        // holding the READ accessor's guard makes a write acquisition
+        // on the static fail…
+        let read = store_gate_read();
+        assert!(
+            STORE_GATE.try_write().is_err(),
+            "store_gate_read and store_gate_write must share the process-wide gate"
+        );
+        drop(read);
+        // …and holding the WRITE accessor's guard makes both a read
+        // and a write acquisition on the static fail.
+        let write = store_gate_write();
+        assert!(STORE_GATE.try_read().is_err());
+        assert!(STORE_GATE.try_write().is_err());
+        drop(write);
     }
 
     // --- open_store (R4) -----------------------------------------------------

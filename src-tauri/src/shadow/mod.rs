@@ -377,3 +377,16 @@ mod probe_import_codes;
 /// optional, no required env).
 #[cfg(test)]
 mod probe_shadow_content_shape;
+
+/// Content-agreement probe (batch 23b T1): join EVERY mapped Desktop
+/// message DB to the shadow copy by msgId (the batch-15 join) and
+/// ask, per wire msgType family, WHICH transform — eq, drop-k, b64,
+/// reversed, char-shift, xor — turns the Desktop `message` cell
+/// (after ONE JSON-string unwrap) into the shadow payload's
+/// `$.content`, plus the object-side containment/parse tests for
+/// media families. COUNTS ONLY (never a content value, id or hash
+/// of content; key names and msgType vocabulary are shape). Ignored:
+/// needs `ZR_SNAPSHOT_DIR`, `ZR_D7_KEY_FILE`, `ZR_UIN_HASH`,
+/// `ZR_MAPPING`; the shadow DB is read through a temp COPY.
+#[cfg(test)]
+mod probe_import_content_agree;

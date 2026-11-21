@@ -1324,7 +1324,9 @@ fn read_source_rows(
 
 /// A source value as a string (ids stored as INTEGER become decimal
 /// strings — the capture envelope's ids are strings). NULL/blob → None.
-fn sv_str(v: &SV) -> Option<String> {
+/// Batch 23b: `pub(crate)` so the content-agreement probe joins with
+/// the same coercion `extract_msg_codes` uses.
+pub(crate) fn sv_str(v: &SV) -> Option<String> {
     match v {
         SV::Text(s) => Some(s.clone()),
         SV::Integer(i) => Some(i.to_string()),
