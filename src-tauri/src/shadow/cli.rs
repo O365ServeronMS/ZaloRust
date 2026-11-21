@@ -73,6 +73,15 @@ modes (one per run; everything except --apply is dry-run only):
                               renderer. The FIRST sample DB of the kind, or
                               with --all-dbs every DB of the message kind
                               summed; --out <file> writes the same as JSON
+  --decrypt-basic            with --content-shape (batch 24): decode each raw
+                              cell with the Desktop BasicEncryption transform
+                              (the snapshot passphrase, in memory only, never
+                              printed) BEFORE the shape folding — decoded
+                              cells fold through the shadow-side classifier,
+                              so the shapes compare directly with the wire
+                              $.content. Valid only with --content-shape;
+                              the output stays shape only (the header gains
+                              ' decrypt=basic')
   --mapping <file>           mapping dry run (docs/import-mapping.md): extract
   [--shadow-copy <dir>]      per the mapping JSON and, with --shadow-copy,
   [--delta]                  classify each write READ-ONLY against a temp
@@ -107,6 +116,10 @@ flags:
                   only, needs --by
 --by <code_col>  with --content-shape: the code column to group by — it
                   must pass the --distinct code-column whitelist
+--decrypt-basic  with --content-shape (batch 24): decode each raw cell
+                  (Desktop BasicEncryption, the snapshot passphrase —
+                  in memory only, never printed) before the shape
+                  folding; valid only with --content-shape
 --all-dbs        with --distinct/--content-shape: aggregate across EVERY
                   DB of the message kind (one2one/group/stranger),
                   summing per-DB counts (batch 15); an index spec is
@@ -138,6 +151,9 @@ the --apply preconditions (each refuses with a clear message, exit 1):
   4. every msgType code in the snapshot mapped (or --unmapped-as-raw)
   5. the target's schema version must match this binary (the run
      never migrates a store — open it once with the matching build)
+  6. the Desktop content column must BasicEncryption-decode cleanly:
+     more than 1% failed rows in the decode census refuses the apply
+     with the counts (a wrong-key detector, batch 24)
   resume: per-DB cursors, written in the same transaction as each
   batch; a killed run resumes where it stopped, and after any per-DB
   error the cursor stays at the last good batch (a re-run retries the
@@ -222,6 +238,12 @@ pub struct ImportArgs {
     /// without it; must pass the batch-14 code-column whitelist
     /// (validated against the inventory at run time).
     pub by: Option<String>,
+    /// `--decrypt-basic` (batch 24 D3): with `--content-shape`, run
+    /// the Desktop BasicEncryption decode on each raw content cell
+    /// (with the snapshot passphrase from `import::prepare` — in
+    /// memory only, never printed) BEFORE the shape folding. Valid
+    /// only with `--content-shape`; the output stays shape only.
+    pub decrypt_basic: bool,
     /// `--apply`: write into the shadow DB (guarded by the
     /// preconditions in `import_apply`).
     pub apply: bool,
@@ -300,7 +322,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let mut by: Option<String> = None;
     let (mut dry_run, mut apply, mut help, mut inventory, mut delta) =
         (false, false, false, false, false);
-    let (mut all_dbs, mut own_uid_from_settings) = (false, false);
+    let (mut all_dbs, mut own_uid_from_settings, mut decrypt_basic) = (false, false, false);
     let (mut i_have_a_backup_plan, mut unmapped_as_raw, mut media_plan) = (false, false, false);
     let mut target: Option<PathBuf> = None;
 
@@ -395,6 +417,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             "--i-have-a-backup-plan" => set_bool_once(&mut i_have_a_backup_plan, flag)?,
             "--unmapped-as-raw" => set_bool_once(&mut unmapped_as_raw, flag)?,
             "--media-plan" => set_bool_once(&mut media_plan, flag)?,
+            // Batch 24 D3: the content-shape probe's decode rider.
+            "--decrypt-basic" => set_bool_once(&mut decrypt_basic, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -409,6 +433,19 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
 
     if dry_run && apply {
         return Err("--dry-run and --apply are mutually exclusive".into());
+    }
+    // Batch 24 D3: --decrypt-basic rides the --content-shape mode (it
+    // is that probe's decode step) — checked before the --apply
+    // preconditions so a bare rider never masquerades as one. It
+    // inherits the mode's dry-run only rule: --content-shape
+    // conflicts with --apply below.
+    if decrypt_basic && content_shape.is_none() {
+        return Err(
+            "--decrypt-basic needs --content-shape: it is the content-shape \
+             probe's decode step (the Desktop BasicEncryption unwrap applied \
+             to each raw cell before the shape folding)"
+                .into(),
+        );
     }
     // Batch-12/14 modes stay dry-run only (2.5 wires writes only
     // through its own preconditions): refuse any combination with
@@ -602,6 +639,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             media_plan,
             content_shape,
             by,
+            decrypt_basic,
             apply: false,
             help: true,
         });
@@ -626,6 +664,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         media_plan,
         content_shape,
         by,
+        decrypt_basic,
         apply,
         help: false,
     })
@@ -1708,6 +1747,99 @@ mod tests {
         let e = parse(&with_base(&["--all-dbs"])).unwrap_err();
         assert!(e.contains("--all-dbs needs --distinct"), "{e}");
         assert!(e.contains("or --content-shape"), "{e}");
+    }
+
+    // --- batch 24 D3: --decrypt-basic -------------------------------------
+
+    #[test]
+    fn parse_decrypt_basic_rides_the_content_shape_mode_only() {
+        // With --content-shape (and its --by) it parses.
+        let a = parse(&with_base(&[
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--decrypt-basic",
+        ]))
+        .unwrap();
+        assert!(a.decrypt_basic);
+        assert!(!a.apply);
+        // It also rides --all-dbs + --out (still the same mode).
+        let a = parse(&with_base(&[
+            "--all-dbs",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--decrypt-basic",
+            "--out",
+            "o.json",
+        ]))
+        .unwrap();
+        assert!(a.decrypt_basic && a.all_dbs);
+        // Alone, or on any other mode, it names its mode — checked
+        // BEFORE the --apply preconditions, so the error is the
+        // rider's, never a misleading precondition one.
+        for flags in [
+            vec!["--decrypt-basic"],
+            vec!["--decrypt-basic", "--inventory"],
+            vec!["--decrypt-basic", "--mapping", "m.json"],
+            vec!["--decrypt-basic", "--shadow-copy", r"D:\s"],
+            vec!["--decrypt-basic", "--distinct", "one2one:message.msgType"],
+            vec!["--decrypt-basic", "--media-plan"],
+            vec!["--decrypt-basic", "--apply"],
+        ] {
+            let e = parse(&with_base(&flags)).unwrap_err();
+            assert!(
+                e.contains("--decrypt-basic needs --content-shape"),
+                "{flags:?} -> {e}"
+            );
+        }
+        // With --apply AND --content-shape the mode's own dry-run
+        // conflict fires (the rider inherits it).
+        let e = parse(&args(&[
+            "--apply",
+            "--i-have-a-backup-plan",
+            "--target",
+            r"D:\s",
+            "--mapping",
+            "m.json",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--decrypt-basic",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains("--content-shape is dry-run only and conflicts with --apply"),
+            "{e}"
+        );
+        // Duplicates are an error like every valueless flag.
+        let e = parse(&with_base(&[
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--decrypt-basic",
+            "--decrypt-basic",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--decrypt-basic given twice"), "{e}");
+        // A CONSISTENT invocation yields to help…
+        let a = parse(&args(&[
+            "--help",
+            "--content-shape",
+            "one2one:message.message",
+            "--by",
+            "msgType",
+            "--decrypt-basic",
+        ]))
+        .unwrap();
+        assert!(a.help);
+        // …but the missing-mode rider beats help (the batch-6 rule).
+        let e = parse(&args(&["--help", "--decrypt-basic"])).unwrap_err();
+        assert!(e.contains("--decrypt-basic needs --content-shape"), "{e}");
     }
 
     #[test]

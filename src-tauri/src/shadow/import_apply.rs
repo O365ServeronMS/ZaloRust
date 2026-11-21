@@ -72,6 +72,7 @@ use rusqlite::types::Value as SV;
 use rusqlite::Connection;
 
 use super::cli::ImportArgs;
+use super::import::inventory::quote_ident;
 use super::import::{self, distinct};
 use super::import_map::{self, CodedWrite, ImportCursor, MapDb, Verdict};
 use super::pipeline::sqlite_kind;
@@ -274,6 +275,79 @@ fn unmapped_lines(unmapped: &[UnmappedCode], hatch: bool) -> Vec<String> {
     lines
 }
 
+// --- batch 24 D2: the BasicEncryption decode census (the 1% gate) ---------
+
+/// (batch 24 D2) The plain source column the mapping's `content`
+/// target names — the raw Desktop cell the decode applies to (the
+/// SAME rule `message_row` decodes with). `Ok(None)` when the
+/// message entity maps no content target, or when `content` is a
+/// const/expr — a mapping product, not the raw cell, so there is
+/// nothing to decode and the census is skipped (printed, never
+/// silent).
+fn content_column(ep: &import_map::EntityPlan) -> Result<Option<String>, String> {
+    let Some(spec) = ep.fields.iter().find(|f| f.target == "content") else {
+        return Ok(None);
+    };
+    match &spec.res {
+        import_map::FieldRes::Col(i) => Ok(Some(ep.select[*i].clone())),
+        _ => Ok(None),
+    }
+}
+
+/// (batch 24 D2) The BasicEncryption decode census — the apply's new
+/// precondition: over EVERY mapped message DB (the SAME enumeration
+/// as the code census; DBs that open fine but have no mapped table
+/// are skipped exactly like it — they carry no rows), decode the raw
+/// content column of every row and count the outcomes. Returns the
+/// counts plus the rows read (the gate's denominator). An unreadable
+/// DB refuses fail-closed, same as the code census: "the content
+/// decodes for >99% of the rows" cannot be verified behind a DB that
+/// cannot be read. The passphrase is used in memory only — nothing
+/// here can print it or a decoded value.
+fn decode_census(
+    p: &import::Prepared,
+    plan: &import_map::Plan,
+) -> Result<(import::desktop_cipher::DecodeCounts, usize), String> {
+    let Some(ep) = plan.message.as_ref() else {
+        return Ok((import::desktop_cipher::DecodeCounts::default(), 0));
+    };
+    let Some(content_col) = content_column(ep)? else {
+        return Ok((import::desktop_cipher::DecodeCounts::default(), 0));
+    };
+    let dbs = applicable_dbs(p, plan)?;
+    let mut counts = import::desktop_cipher::DecodeCounts::default();
+    let mut rows = 0usize;
+    for db in &dbs {
+        let conn = import::open_desktop_db(&db.path, p.passphrase.as_str(), p.profile)
+            .map_err(|e| format!("decode census: {} open failed: {e} — refusing", db.rel))?;
+        // The F1 rule: an ABSENT mapped table is a counted skip, not a
+        // refusal (the code census skipped the same DB).
+        let table = mapped_table_exists(&conn, &ep.table).map_err(|e| {
+            format!("decode census: {} sqlite_master read failed: {e} — refusing", db.rel)
+        })?;
+        if !table {
+            continue;
+        }
+        let qt = quote_ident(&ep.table)?;
+        let qc = quote_ident(&content_col)?;
+        let sql = format!("SELECT {qc} FROM {qt}");
+        let read_err = |e: rusqlite::Error| {
+            format!("decode census: {} content read failed: {e} — refusing", db.rel)
+        };
+        let mut st = conn.prepare(&sql).map_err(read_err)?;
+        let cells = st.query_map([], |r| r.get::<_, SV>(0)).map_err(read_err)?;
+        for cell in cells {
+            let cell = cell.map_err(read_err)?;
+            rows += 1;
+            counts.fold(&import::desktop_cipher::decode_field(
+                &cell,
+                p.passphrase.as_str(),
+            ));
+        }
+    }
+    Ok((counts, rows))
+}
+
 // --- the write path ---------------------------------------------------------
 
 /// One applicable message DB of the mapping (the census and the write
@@ -335,6 +409,11 @@ pub struct ApplyStats {
     pub msgs_fill_null: usize,
     pub msgs_update_import: usize,
     pub msgs_unmapped_raw: usize,
+    /// (batch 24 D2) The BasicEncryption decode tallies of the
+    /// extracted rows' content cells — counts only, never a value.
+    pub content_decoded: usize,
+    pub content_not_encrypted: usize,
+    pub content_failed: usize,
     /// Rows whose uidFrom was NULL (not "0") that received the
     /// own-uid substitution via `normalize::sender_for`. Printed as a
     /// number; the rule itself is untouched.
@@ -564,6 +643,11 @@ fn apply_message_batch(
 /// batches. F2: the first batch error of any kind freezes this DB's
 /// cursor for the rest of the call. Exposed separately so tests can
 /// drive one DB directly.
+///
+/// Batch 24 D2: `passphrase` is the snapshot passphrase — the SAME
+/// string the Desktop DB was opened with — used in memory only to
+/// decode each row's content cell; the tallies land in
+/// `stats.content_*` (counts only).
 #[allow(clippy::too_many_arguments)]
 fn apply_message_db(
     conn: &Connection,
@@ -573,6 +657,7 @@ fn apply_message_db(
     kind: MapDb,
     db_id: Option<u64>,
     own_uid: Option<&str>,
+    passphrase: &str,
     batch_size: usize,
     stats: &mut ApplyStats,
 ) -> Result<(), String> {
@@ -582,10 +667,14 @@ fn apply_message_db(
         db_id,
         cursor: stored,
         own_uid,
+        passphrase,
     };
-    let (mut coded, skipped) = import_map::extract_coded(src, plan, &opts)?;
+    let (mut coded, skipped, decode) = import_map::extract_coded(src, plan, &opts)?;
     stats.msgs_extracted += coded.len();
     stats.msgs_skipped += skipped;
+    stats.content_decoded += decode.decoded;
+    stats.content_not_encrypted += decode.not_encrypted;
+    stats.content_failed += decode.failed;
     // The hatch (precondition 4's escape): unmapped rows are written
     // kind=100 with text NULL — never JSON-as-text. A run that got
     // here passed the preflight, so the hatch being off means every
@@ -760,6 +849,45 @@ pub fn run_apply_with_limit(
         }
     }
 
+    // Batch 24 D2, the new precondition: the Desktop content column
+    // must BasicEncryption-decode for >99% of the census rows. The
+    // gate runs BEFORE the target is even opened — zero bytes move on
+    // a refusal (a wrong-key detector: with the right passphrase the
+    // XOR output always parses as JSON, so a widespread `failed` means
+    // the key or the mapping's content column is wrong).
+    let (decode_census_counts, decode_census_rows) = decode_census(&p, &plan)?;
+    if decode_census_rows == 0 {
+        out(
+            "import apply: content decode census: skipped \
+             (no plain content column mapped — nothing to decode)",
+        );
+    } else {
+        let pct = 100.0 * decode_census_counts.failed as f64 / decode_census_rows as f64;
+        out(&format!(
+            "import apply: content decode census: rows={} decoded={} not_encrypted={} \
+             failed={} ({pct:.2}% failed)",
+            decode_census_rows,
+            decode_census_counts.decoded,
+            decode_census_counts.not_encrypted,
+            decode_census_counts.failed
+        ));
+        if decode_census_counts.failed * 100 > decode_census_rows {
+            return Err(format!(
+                "refusing --apply: the Desktop content column failed the BasicEncryption \
+                 decode on {} of {} census row(s) — more than the 1% gate. With the right \
+                 passphrase (the same one that opened the DBs) the decode succeeds, so a \
+                 widespread failure means the key or the mapping's content column is wrong. \
+                 content_decoded={} content_not_encrypted={} content_failed={} — nothing \
+                 was written",
+                decode_census_counts.failed,
+                decode_census_rows,
+                decode_census_counts.decoded,
+                decode_census_counts.not_encrypted,
+                decode_census_counts.failed
+            ));
+        }
+    }
+
     // The target store (no default; the user passed it).
     let db_path = db_file(&target);
     if !db_path.is_file() {
@@ -856,8 +984,9 @@ pub fn run_apply_with_limit(
             db_id: None,
             cursor: None,
             own_uid: own_uid.as_deref(),
+            passphrase: p.passphrase.as_str(),
         };
-        let (writes, _skips) = import_map::extract(&index_conn, &plan, &opts)?;
+        let (writes, _skips, _decode) = import_map::extract(&index_conn, &plan, &opts)?;
         for batch in writes.chunks(APPLY_BATCH_ROWS) {
             if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
                 stats.add_error_kind(format!("begin:{}", sqlite_kind(&e)));
@@ -963,6 +1092,7 @@ pub fn run_apply_with_limit(
             db.kind,
             db.db_id,
             own_uid.as_deref(),
+            p.passphrase.as_str(),
             APPLY_BATCH_ROWS,
             &mut stats,
         )?;
@@ -993,6 +1123,13 @@ pub fn run_apply_with_limit(
         stats.msgs_update_import,
         stats.msgs_ignored,
         stats.msgs_unmapped_raw
+    ));
+    // Batch 24 D2: the content-decode tallies of the rows this run
+    // actually wrote (cursor-skipped DBs contribute nothing) — counts
+    // only, never a value.
+    out(&format!(
+        "import apply: message content decode: decoded={} not_encrypted={} failed={}",
+        stats.content_decoded, stats.content_not_encrypted, stats.content_failed
     ));
     out(&format!(
         "import apply: uidFrom-NULL rows substituted via sender_for: {} \
@@ -1317,6 +1454,7 @@ mod tests {
             media_plan: false,
             content_shape: None,
             by: None,
+            decrypt_basic: false,
             help: false,
         }
     }
@@ -1548,6 +1686,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(snap.parent().unwrap());
     }
 
+    // --- batch 24 D2: the BasicEncryption decode-census gate --------
+
+    /// A cipher DB keyed with the fixture PASS whose msg rows carry
+    /// content cells encrypted with `content_key` — the exact Zalo
+    /// pipeline (`JSON.stringify(xor(JSON.stringify(value), key))`),
+    /// built with bound parameters because the XOR output is not
+    /// safely embeddable in SQL text. Batch 24 fixture; every value
+    /// is synthetic.
+    fn make_cipher_db_enc(
+        path: &Path,
+        content_key: &str,
+        rows: &[(i64, i64, &serde_json::Value)],
+    ) {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        import::apply_passphrase_key(&conn, PASS).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE msg (
+               id INTEGER PRIMARY KEY, cliId TEXT, fromUid TEXT, toUid TEXT,
+               ts INTEGER, type INTEGER, content TEXT
+             );",
+        )
+        .unwrap();
+        for (id, code, value) in rows {
+            let plain = serde_json::to_string(value).unwrap();
+            let xored = import::desktop_cipher::basic_xor_utf16(&plain, content_key);
+            let cell = serde_json::to_string(&serde_json::Value::String(xored)).unwrap();
+            conn.execute(
+                "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+                 VALUES (?1, ?2, 'u1', 'u2', 1690000030, ?3, ?4)",
+                rusqlite::params![id, format!("c{id}"), code, cell],
+            )
+            .unwrap();
+        }
+        conn.close().map_err(|(_, e)| e).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_apply_refuses_when_the_decode_census_fails_above_one_percent() {
+        // Batch 24 D2: a widespread decode failure — the wrong-key
+        // signature — refuses the apply with the counts, BEFORE the
+        // target is opened or backed up: zero bytes move. 333.db
+        // carries three rows whose content cells are encrypted with a
+        // DIFFERENT key; the decode fails on all three, which is 3
+        // of the 11 census rows (27.27%) — far above the 1% gate.
+        let (snap, store, map) = fixture_apply_world("gate");
+        make_cipher_db_enc(
+            &snap.join("Core").join("Message").join("333.db"),
+            // A wrong key sharing NO prefix with the fixture
+            // passphrase (a common prefix would let the two XORs
+            // partially cancel and the cells would decode anyway).
+            "wrongwrongwrongwrongwrongwrong99",
+            &[
+                (301, 1, &json!("wrong key row 1")),
+                (302, 1, &json!("wrong key row 2")),
+                (303, 1, &json!("wrong key row 3")),
+            ],
+        );
+        let before = (
+            sha256_file(&db_file(&store)),
+            sha256_file(&key_file(&store)),
+        );
+        let mut a = apply_args(&snap, &store, &map);
+        a.unmapped_as_raw = true; // past the code preflight, to the gate
+        let (r, lines) = apply_collect_keep(&a, || Some(false));
+        let e = r.unwrap_err();
+        // The refusal names the gate, the counts and the rows.
+        assert!(e.contains("refusing --apply"), "{e}");
+        assert!(
+            e.contains("failed the BasicEncryption decode on 3 of 11 census row(s)"),
+            "{e}"
+        );
+        assert!(e.contains("more than the 1% gate"), "{e}");
+        assert!(
+            e.contains("content_decoded=0 content_not_encrypted=8 content_failed=3"),
+            "{e}"
+        );
+        assert!(e.contains("nothing was written"), "{e}");
+        // F3: the streamed census line survived the failure.
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(
+                "import apply: content decode census: rows=11 decoded=0 not_encrypted=8 \
+                 failed=3 (27.27% failed)"
+            ),
+            "{joined}"
+        );
+        // Zero writes: the store bytes are unchanged and no backup was
+        // made (the gate precedes the target open + backup).
+        assert_eq!(
+            (
+                sha256_file(&db_file(&store)),
+                sha256_file(&key_file(&store))
+            ),
+            before,
+            "no writes performed"
+        );
+        assert!(!store.join("pre-import-backups").exists());
+        let _ = std::fs::remove_dir_all(snap.parent().unwrap());
+    }
+
     // --- F1: DBs without the mapped table --------------------------------
 
     #[test]
@@ -1659,6 +1902,16 @@ mod tests {
         );
         // F1: the fixture DBs all have the mapped table.
         assert!(joined.contains("dbs_no_table=0"), "{joined}");
+        // Batch 24 D2: the decode census over the 8 plaintext fixture
+        // rows (prose / object text — kept as they were), and the
+        // extraction tallies in the final summary.
+        assert!(
+            joined.contains(
+                "import apply: content decode census: rows=8 decoded=0 not_encrypted=8 \
+                 failed=0 (0.00% failed)"
+            ),
+            "{joined}"
+        );
         // The backup precondition: made, verified, path printed.
         assert!(joined.contains("import apply: backup OK: "), "{joined}");
         let manifest_path = lines
@@ -1680,6 +1933,12 @@ mod tests {
         assert!(joined.contains("integrity_check=ok"), "{joined}");
         assert!(
             joined.contains("uidFrom-NULL rows substituted via sender_for: 0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "import apply: message content decode: decoded=0 not_encrypted=8 failed=0"
+            ),
             "{joined}"
         );
 
@@ -2111,6 +2370,7 @@ mod tests {
             MapDb::OneToOne,
             Some(111),
             Some(FAKE_OWN),
+            PASS,
             2,
             &mut stats,
         )
@@ -2151,6 +2411,7 @@ mod tests {
             MapDb::OneToOne,
             Some(111),
             Some(FAKE_OWN),
+            PASS,
             2,
             &mut stats2,
         )
@@ -2449,6 +2710,7 @@ mod tests {
             MapDb::OneToOne,
             Some(111),
             Some(FAKE_OWN),
+            PASS,
             500,
             &mut stats,
         )
@@ -2482,6 +2744,7 @@ mod tests {
             MapDb::OneToOne,
             Some(111),
             None,
+            PASS,
             500,
             &mut stats2,
         )

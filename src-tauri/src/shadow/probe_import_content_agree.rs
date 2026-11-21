@@ -15,6 +15,20 @@
 //! asks, per wire msgType family, WHICH transform — if any — turns
 //! the Desktop text into the shadow's `$.content`.
 //!
+//! Batch 24 D3 adds the `decrypted` section per family: batch 23b's
+//! candidate transforms are now ANSWERED (Claude read the Desktop
+//! app code — the column is `BasicEncryption`-XORed with the same
+//! passphrase that opens the DB), so every matched pair's RAW cell
+//! additionally runs through `desktop_cipher::decode_field` with the
+//! snapshot passphrase (in memory only, never printed). Per family:
+//! the decode outcome counts (`decoded` / `not_encrypted` /
+//! `failed`, over the pairs with a cell to decode); for a string `S`
+//! whether the decoded value equals it (`eq`, `eq_trim`); for an
+//! object `S` whether the decoded object has the SAME key set, and
+//! per identifier-shaped key whether the decoded object's string
+//! value is equal (`obj_eq[key]=n/m`). Counts only — never a decoded
+//! value.
+//!
 //! Per matched pair:
 //! - `D` = the Desktop content cell after ONE JSON-string unwrap
 //!   (the raw text when it does not unwrap; NULL/BLOB → the pair is
@@ -64,9 +78,10 @@
 //! ```
 //!
 //! The classifiers (`desktop_text`, `classify_string`,
-//! `classify_object`), the folds and the whole report are PURE and
-//! unit-tested below, including an end-to-end pass on synthetic
-//! DBs; only the snapshot/shadow I/O lives in the ignored test.
+//! `classify_object`, `decrypted_string`, `decrypted_object`), the
+//! folds and the whole report are PURE and unit-tested below,
+//! including an end-to-end pass on synthetic DBs; only the
+//! snapshot/shadow I/O lives in the ignored test.
 
 use std::collections::BTreeMap;
 
@@ -76,6 +91,7 @@ use rusqlite::Connection;
 use serde_json::Value as J;
 
 use super::cli::ImportArgs;
+use super::import::desktop_cipher::{decode_field, FieldDecode};
 use super::import::{self, DbKind};
 use super::import::content_shape as cs;
 use super::import::inventory::quote_ident;
@@ -329,6 +345,69 @@ pub fn classify_object(
     out
 }
 
+// --- batch 24 D3: the decrypted section (pure) ------------------------------
+
+/// The decrypted section's STRING-side test (pure): `(eq, eq_trim)`
+/// of a decode outcome's value against the shadow string `S`. A
+/// `Failed` outcome (no value) is never equal.
+pub fn decrypted_string(v: Option<&J>, s: &str) -> (bool, bool) {
+    match v.and_then(J::as_str) {
+        Some(x) => (x == s, x.trim() == s.trim()),
+        None => (false, false),
+    }
+}
+
+/// The decrypted section's OBJECT-side test (pure): whether the decode
+/// outcome's value is an object with `S`'s EXACT key set, plus — per
+/// identifier-shaped key of `S` holding a non-empty string — whether
+/// the decoded object's value at that key is the SAME string. Other
+/// keys are never examined and never print (the `d_contains` privacy
+/// rule).
+pub fn decrypted_object(
+    v: Option<&J>,
+    s: &serde_json::Map<String, J>,
+) -> (bool, BTreeMap<String, bool>) {
+    let vo = v.and_then(J::as_object);
+    let same = vo.is_some_and(|o| {
+        let want: std::collections::BTreeSet<&str> = s.keys().map(String::as_str).collect();
+        let got: std::collections::BTreeSet<&str> = o.keys().map(String::as_str).collect();
+        want == got
+    });
+    let mut eq = BTreeMap::new();
+    for (k, sv) in s {
+        if !cs::is_identifier_key(k) {
+            continue;
+        }
+        if let J::String(val) = sv {
+            if !val.is_empty() {
+                eq.insert(k.clone(), vo.is_some_and(|o| o.get(k) == Some(sv)));
+            }
+        }
+    }
+    (same, eq)
+}
+
+/// The decrypted section's tallies for one family (counts only —
+/// never a decoded value).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DecryptedCounters {
+    /// Decode outcomes over the family's pairs WITH a cell to decode
+    /// (the `d_missing` pairs have nothing to decode and are already
+    /// counted in the family header).
+    pub decoded: usize,
+    pub not_encrypted: usize,
+    pub failed: usize,
+    /// Pairs whose `S` is a string (the string side's denominator).
+    pub string_pairs: usize,
+    pub string_eq: usize,
+    pub string_eq_trim: usize,
+    /// Pairs whose `S` is an object (the object side's denominator).
+    pub object_pairs: usize,
+    pub object_same_keys: usize,
+    /// identifier key of S (non-empty string value) → (equal, examined).
+    pub obj_eq: BTreeMap<String, (usize, usize)>,
+}
+
 // --- the fold ---------------------------------------------------------------
 
 /// String-side tallies for one family.
@@ -453,6 +532,8 @@ pub struct FamilyCounters {
     pub s_other: usize,
     pub string: StringCounters,
     pub object: ObjectCounters,
+    /// (batch 24 D3) The decrypted section.
+    pub decrypted: DecryptedCounters,
 }
 
 impl FamilyCounters {
@@ -461,6 +542,42 @@ impl FamilyCounters {
     }
     pub fn fold_object(&mut self, m: &ObjectMatch) {
         self.object.fold(m);
+    }
+    /// (batch 24 D3) Fold one D-present matched pair's decrypted
+    /// section: the RAW cell's decode outcome plus, per side of `S`,
+    /// the agreement tests. Counts only — never a decoded value.
+    /// Callers skip `d_missing` pairs entirely (nothing to decode).
+    pub fn fold_decrypted(&mut self, outcome: &FieldDecode, s: Option<&J>) {
+        match outcome {
+            FieldDecode::Decoded(_) => self.decrypted.decoded += 1,
+            FieldDecode::NotEncrypted(_) => self.decrypted.not_encrypted += 1,
+            FieldDecode::Failed(_) => self.decrypted.failed += 1,
+        }
+        let v = match outcome {
+            FieldDecode::Decoded(v) | FieldDecode::NotEncrypted(v) => Some(v),
+            FieldDecode::Failed(_) => None,
+        };
+        match s {
+            Some(J::String(s)) => {
+                self.decrypted.string_pairs += 1;
+                let (eq, eq_trim) = decrypted_string(v, s);
+                self.decrypted.string_eq += eq as usize;
+                self.decrypted.string_eq_trim += eq_trim as usize;
+            }
+            Some(J::Object(o)) => {
+                self.decrypted.object_pairs += 1;
+                let (same, eqm) = decrypted_object(v, o);
+                self.decrypted.object_same_keys += same as usize;
+                for (k, hit) in eqm {
+                    let e = self.decrypted.obj_eq.entry(k).or_insert((0, 0));
+                    e.1 += 1;
+                    if hit {
+                        e.0 += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -511,6 +628,20 @@ fn d_contains_line(m: &BTreeMap<String, (usize, usize)>) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!("content-agree:   d_contains: {body}")
+}
+
+/// (batch 24 D3) The decrypted section's per-key equality line
+/// (`eq[key]=n/m`) — key NAMES only, counts only.
+fn decrypted_obj_eq_line(m: &BTreeMap<String, (usize, usize)>) -> String {
+    if m.is_empty() {
+        return "content-agree:   decrypted obj_eq: (none)".into();
+    }
+    let body = m
+        .iter()
+        .map(|(k, (eq, tot))| format!("{k}={eq}/{tot}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("content-agree:   decrypted obj_eq: {body}")
 }
 
 /// The whole report: the grand header, the per-family blocks (EVERY
@@ -574,6 +705,22 @@ pub fn render(families: &BTreeMap<String, FamilyCounters>, grand: &Grand) -> Vec
             f.object.transform_parses.get("char_shift").copied().unwrap_or(0)
         ));
         lines.push(len_line("len_rel_vs_serialized", &f.object.len_rel));
+        // Batch 24 D3: the decrypted section — the decode outcome
+        // counts over the D-present pairs, then the per-side
+        // agreement tests. Every line prints, zeros included.
+        lines.push(format!(
+            "content-agree:   decrypted: decoded={} not_encrypted={} failed={}",
+            f.decrypted.decoded, f.decrypted.not_encrypted, f.decrypted.failed
+        ));
+        lines.push(format!(
+            "content-agree:   decrypted string: pairs={} eq={} eq_trim={}",
+            f.decrypted.string_pairs, f.decrypted.string_eq, f.decrypted.string_eq_trim
+        ));
+        lines.push(format!(
+            "content-agree:   decrypted object: pairs={} same_keys={}",
+            f.decrypted.object_pairs, f.decrypted.object_same_keys
+        ));
+        lines.push(decrypted_obj_eq_line(&f.decrypted.obj_eq));
     }
     for (token, f) in families {
         lines.push(family_verdict(token, f));
@@ -710,18 +857,31 @@ pub fn shadow_content_map(conn: &Connection) -> rusqlite::Result<BTreeMap<String
     Ok(out)
 }
 
+/// (batch 23b) One Desktop message row for the join: the msgId, `D`
+/// (the cell after ONE JSON-string unwrap) and the RAW cell — the
+/// batch-24 decrypted section decodes the raw cell. No row value
+/// other than (msgId, D, the raw cell) ever leaves this function.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesktopCell {
+    pub id: String,
+    /// `D` — `None` when the raw cell is NULL/BLOB (a matched pair,
+    /// tallied `d_missing`).
+    pub d: Option<String>,
+    /// The raw SQLite cell, exactly as stored (batch 24 D3 input).
+    pub raw: SV,
+}
+
 /// (batch 23b) One Desktop message row reduced to the join key plus
-/// `D`: the msgId source column and the CONTENT source column the
-/// mapping names — nothing else is ever read. Both must be PLAIN
-/// column mappings (a const/expr is a mapping product, refused
-/// fail-closed exactly like `extract_msg_codes`). Rows whose msgId
-/// is NULL/BLOB are skipped and counted; a NULL/BLOB content cell is
-/// `D = None` (a matched pair, tallied `d_missing`). No row value
-/// other than (msgId, D) ever leaves this function.
+/// `D` and the raw cell: the msgId source column and the CONTENT
+/// source column the mapping names — nothing else is ever read. Both
+/// must be PLAIN column mappings (a const/expr is a mapping product,
+/// refused fail-closed exactly like `extract_msg_codes`). Rows whose
+/// msgId is NULL/BLOB are skipped and counted; a NULL/BLOB content
+/// cell keeps `D = None` (a matched pair, tallied `d_missing`).
 pub fn extract_msg_texts(
     conn: &Connection,
     ep: &import_map::EntityPlan,
-) -> Result<(Vec<(String, Option<String>)>, usize), String> {
+) -> Result<(Vec<DesktopCell>, usize), String> {
     let col_of = |target: &str| -> Result<String, String> {
         let Some(spec) = ep.fields.iter().find(|f| f.target == target) else {
             return Err(format!(
@@ -755,7 +915,11 @@ pub fn extract_msg_texts(
     for row in rows {
         let (idv, contentv) = row.map_err(|e| format!("{}: {e}", ep.table))?;
         match import_map::sv_str(&idv) {
-            Some(id) => out.push((id, desktop_text(&contentv))),
+            Some(id) => out.push(DesktopCell {
+                id,
+                d: desktop_text(&contentv),
+                raw: contentv,
+            }),
             None => skipped += 1,
         }
     }
@@ -807,6 +971,7 @@ fn probe_import_content_agree() {
         media_plan: false,
         content_shape: None,
         by: None,
+        decrypt_basic: false,
         apply: false,
         help: false,
     };
@@ -860,9 +1025,9 @@ fn probe_import_content_agree() {
                 Ok((pairs, skipped)) => {
                     grand.opened += 1;
                     grand.rows_skipped += skipped;
-                    for (id, d) in pairs {
+                    for cell in pairs {
                         grand.desktop_rows += 1;
-                        let Some(side) = smap.get(&id) else {
+                        let Some(side) = smap.get(&cell.id) else {
                             grand.no_shadow_match += 1;
                             continue;
                         };
@@ -873,7 +1038,18 @@ fn probe_import_content_agree() {
                         };
                         let f = families.entry(token.clone()).or_default();
                         f.matched += 1;
-                        match (&d, &side.content) {
+                        // Batch 24 D3: the decrypted section — decode
+                        // the RAW cell with the snapshot passphrase
+                        // (in memory only, never printed) and fold
+                        // the outcome + the per-side agreement counts.
+                        // d_missing pairs have no cell to decode.
+                        if cell.d.is_some() {
+                            f.fold_decrypted(
+                                &decode_field(&cell.raw, p.passphrase.as_str()),
+                                side.content.as_ref(),
+                            );
+                        }
+                        match (&cell.d, &side.content) {
                             (None, _) => f.d_missing += 1,
                             (Some(d), Some(J::String(s))) => {
                                 f.fold_string(&classify_string(d, s));
@@ -939,6 +1115,11 @@ fn probe_import_content_agree() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The FAKE passphrase standing in for the snapshot D7 key in the
+    /// synthetic decrypted-section tests (batch 24 D3) — never a real
+    /// key, never real content.
+    const FAKE_KEY: &str = "fakefakefakefakefakefakefake24";
 
     fn b64_encode(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
@@ -1194,6 +1375,101 @@ mod tests {
         }
     }
 
+    // --- batch 24 D3: the decrypted section (pure) ----------------------
+
+    #[test]
+    fn decrypted_string_classifies_each_outcome() {
+        // A decoded value equal to S: eq and eq_trim.
+        let v = json!("match me");
+        assert_eq!(decrypted_string(Some(&v), "match me"), (true, true));
+        // A whitespace-only difference.
+        assert_eq!(decrypted_string(Some(&v), "  match me "), (false, true));
+        // A non-string decoded value against a string S.
+        assert_eq!(decrypted_string(Some(&json!({"a": 1})), "x"), (false, false));
+        assert_eq!(decrypted_string(Some(&json!(7)), "x"), (false, false));
+        assert_eq!(decrypted_string(Some(&json!("")), "x"), (false, false));
+        // A Failed outcome carries no value: never equal.
+        assert_eq!(decrypted_string(None, "x"), (false, false));
+        // Empty S equals only an empty decoded string.
+        assert_eq!(decrypted_string(Some(&json!("")), ""), (true, true));
+    }
+
+    #[test]
+    fn decrypted_object_classifies_each_outcome() {
+        let s = json!({
+            "href": "https://sentinel-dec.example/x",
+            "title": "SENTINEL-DEC-T",
+            "count": 7,
+            "empty": "",
+            "we ird!": "SENTINEL-DEC-NONID"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        // Same key set: same_keys true even where a string value
+        // differs — the per-key eq carries the difference.
+        let same_keys = json!({
+            "href": "https://sentinel-dec.example/x",
+            "title": "different text, same keys",
+            "count": 7,
+            "empty": "",
+            "we ird!": "SENTINEL-DEC-NONID"
+        });
+        let (ok, eqm) = decrypted_object(Some(&same_keys), &s);
+        assert!(ok, "the exact key set matches");
+        assert_eq!(
+            eqm.len(),
+            2,
+            "href + title only — number/empty/non-identifier keys are never examined"
+        );
+        assert!(eqm["href"], "the equal string value");
+        assert!(!eqm["title"], "the differing string value");
+        // A different key set.
+        let (ok2, _) = decrypted_object(Some(&json!({"href": "x", "extra": 1})), &s);
+        assert!(!ok2, "an extra key breaks same_keys");
+        // Non-object decoded values.
+        assert!(!decrypted_object(Some(&json!("x")), &s).0);
+        assert!(!decrypted_object(Some(&json!(null)), &s).0);
+        // A Failed outcome: no value, but the per-key denominators
+        // still count the pair as examined-and-not-equal.
+        let (ok3, eq3) = decrypted_object(None, &s);
+        assert!(!ok3);
+        assert_eq!(eq3.len(), 2);
+        assert!(!eq3["href"] && !eq3["title"]);
+    }
+
+    #[test]
+    fn fold_decrypted_partitions_and_agrees_per_side() {
+        let mut f = FamilyCounters::default();
+        // A Decoded string pair that agrees, a Failed string pair, an
+        // s_other pair (outcome counted, no agreement), a d_missing
+        // pair (skipped by the caller, nothing here).
+        f.fold_decrypted(
+            &FieldDecode::Decoded(json!("SENTINEL-FOLD ok")),
+            Some(&json!("SENTINEL-FOLD ok")),
+        );
+        f.fold_decrypted(
+            &FieldDecode::Failed(super::super::import::desktop_cipher::DecodeFail::XorParse),
+            Some(&json!("SENTINEL-FOLD other")),
+        );
+        f.fold_decrypted(&FieldDecode::NotEncrypted(json!(7)), Some(&json!(9)));
+        let d = &f.decrypted;
+        assert_eq!((d.decoded, d.not_encrypted, d.failed), (1, 1, 1));
+        assert_eq!((d.string_pairs, d.string_eq, d.string_eq_trim), (2, 1, 1));
+        assert_eq!((d.object_pairs, d.object_same_keys), (0, 0));
+        assert!(d.obj_eq.is_empty());
+        // An object pair through the fold: same keys + per-key eq.
+        f.fold_decrypted(
+            &FieldDecode::Decoded(json!({"href": "https://sentinel-fold/x", "title": "T"})),
+            Some(&json!({"href": "https://sentinel-fold/x", "title": "other"})),
+        );
+        let d = &f.decrypted;
+        assert_eq!(d.decoded, 2);
+        assert_eq!((d.object_pairs, d.object_same_keys), (1, 1));
+        assert_eq!(d.obj_eq.get("href"), Some(&(1, 1)));
+        assert_eq!(d.obj_eq.get("title"), Some(&(0, 1)));
+    }
+
     // --- the fold, the report and the verdict ----------------------------
 
     #[test]
@@ -1208,6 +1484,17 @@ mod tests {
         }
         fam.fold_string(&classify_string("unrelated SENTINEL-U one", "target SENTINEL-V one"));
         fam.matched = 10;
+        // Batch 24 D3: fold the decrypted section over the same 10
+        // pairs — 9 decode to exactly S, 1 fails.
+        for i in 0..9 {
+            let s = format!("webchat body {i} SENTINEL-PLAIN-{i}");
+            let sv = json!(s);
+            fam.fold_decrypted(&FieldDecode::Decoded(sv.clone()), Some(&sv));
+        }
+        fam.fold_decrypted(
+            &FieldDecode::Failed(super::super::import::desktop_cipher::DecodeFail::XorParse),
+            Some(&json!("target SENTINEL-V one")),
+        );
         // And a family with no testable pairs at all.
         let mut fam2 = FamilyCounters::default();
         fam2.matched = 2;
@@ -1265,6 +1552,29 @@ mod tests {
         // The verdicts.
         assert!(joined.contains("verdict: webchat char_shift(delta=3) 90.0%"), "{joined}");
         assert!(joined.contains("verdict: chat.photo none (no testable pairs)"), "{joined}");
+        // Batch 24 D3: the decrypted section lines — the tallies, and
+        // the all-zero lines for the d_missing-only family.
+        assert!(
+            joined.contains("content-agree:   decrypted: decoded=9 not_encrypted=0 failed=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted string: pairs=10 eq=9 eq_trim=9"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted: decoded=0 not_encrypted=0 failed=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted string: pairs=0 eq=0 eq_trim=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted object: pairs=0 same_keys=0"),
+            "{joined}"
+        );
+        assert!(joined.contains("content-agree:   decrypted obj_eq: (none)"), "{joined}");
         // No content leaked anywhere.
         for sentinel in ["SENTINEL-PLAIN", "SENTINEL-U", "SENTINEL-V"] {
             assert!(!joined.contains(sentinel), "{sentinel} leaked:\n{joined}");
@@ -1404,9 +1714,9 @@ mod tests {
         let (pairs, skipped) = extract_msg_texts(&desktop, ep).unwrap();
         assert_eq!(skipped, 1, "the NULL-msgId row");
         assert_eq!(pairs.len(), 6);
-        assert_eq!(pairs[0].1.as_deref(), Some("SENTINEL-E2E-PLAIN"));
-        assert_eq!(pairs[1].1.as_deref(), Some("  SENTINEL-E2E-TRIM  "));
-        assert_eq!(pairs[4].1, None, "the NULL content cell has no D");
+        assert_eq!(pairs[0].d.as_deref(), Some("SENTINEL-E2E-PLAIN"));
+        assert_eq!(pairs[1].d.as_deref(), Some("  SENTINEL-E2E-TRIM  "));
+        assert_eq!(pairs[4].d, None, "the NULL content cell has no D");
 
         // The shadow-shaped side.
         let shadow = Connection::open_in_memory().unwrap();
@@ -1440,16 +1750,19 @@ mod tests {
         let smap = shadow_content_map(&shadow).unwrap();
         assert_eq!(smap.len(), 5);
 
-        // The ignored probe's join + fold, verbatim.
+        // The ignored probe's join + fold, verbatim — with a FAKE key
+        // standing in for the snapshot passphrase (the plain string
+        // scalar cells take the Failed path here; the dedicated
+        // decrypted-section test below covers the Decoded path).
         let mut families: BTreeMap<String, FamilyCounters> = BTreeMap::new();
         let mut obj_pairs: Vec<ObjPair> = Vec::new();
         let mut grand = Grand {
             shadow_messages: smap.len(),
             ..Grand::default()
         };
-        for (id, d) in pairs {
+        for cell in pairs {
             grand.desktop_rows += 1;
-            let Some(side) = smap.get(&id) else {
+            let Some(side) = smap.get(&cell.id) else {
                 grand.no_shadow_match += 1;
                 continue;
             };
@@ -1460,7 +1773,10 @@ mod tests {
             };
             let f = families.entry(token.clone()).or_default();
             f.matched += 1;
-            match (&d, &side.content) {
+            if cell.d.is_some() {
+                f.fold_decrypted(&decode_field(&cell.raw, FAKE_KEY), side.content.as_ref());
+            }
+            match (&cell.d, &side.content) {
                 (None, _) => f.d_missing += 1,
                 (Some(d), Some(J::String(s))) => f.fold_string(&classify_string(d, s)),
                 (Some(d), Some(J::Object(o))) => {
@@ -1527,8 +1843,218 @@ mod tests {
         );
         assert!(joined.contains("verdict: NULL none (no testable pairs)"), "{joined}");
 
+        // Batch 24 D3: the decrypted section over the SAME fixture
+        // (folded with the FAKE key): every plain string-scalar cell
+        // takes the Failed path (the unencrypted standard shape), the
+        // NULL-cell pair is skipped (d_missing), and the counts stay
+        // zeros for it.
+        assert!(
+            joined.contains("content-agree:   decrypted: decoded=0 not_encrypted=0 failed=3"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted string: pairs=2 eq=0 eq_trim=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted object: pairs=1 same_keys=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted obj_eq: href=0/1 title=0/1"),
+            "{joined}"
+        );
+
         // PRIVACY: no content value, no id, no url from either side.
         for sentinel in ["SENTINEL-E2E", "sentinel-e2e-cdn", "sid-000"] {
+            assert!(!joined.contains(sentinel), "{sentinel} leaked:\n{joined}");
+        }
+    }
+
+    #[test]
+    fn end_to_end_decrypted_section_decodes_synthetic_cells() {
+        // Batch 24 D3, the Decoded path end to end on FAKE DBs: the
+        // Desktop cells are encrypted with the exact Zalo pipeline
+        // (cell = JSON.stringify(xor(JSON.stringify(value), key)),
+        // key = the FAKE passphrase), the shadow contents equal the
+        // decoded values — the decrypted section must report Decoded
+        // plus eq / same_keys / obj_eq. A plain string-literal cell
+        // (the unencrypted standard shape) and a NULL cell ride along
+        // for the Failed and d_missing paths.
+        use super::super::import::inventory::{
+            inventory_db, KindInventory, SnapshotInventories,
+        };
+        use rusqlite::params;
+
+        let enc = |v: &J, key: &str| -> String {
+            let plain = serde_json::to_string(v).unwrap();
+            let xored = super::super::import::desktop_cipher::basic_xor_utf16(&plain, key);
+            serde_json::to_string(&J::String(xored)).unwrap()
+        };
+
+        let desktop = Connection::open_in_memory().unwrap();
+        desktop
+            .execute_batch(
+                "CREATE TABLE message (
+                   msgId TEXT, cliMsgId TEXT, fromUid TEXT, toUid TEXT,
+                   serverTime TEXT, msgType INTEGER, message TEXT
+                 );",
+            )
+            .unwrap();
+        let ins = |id: &str, code: i64, cell: SV| {
+            desktop
+                .execute(
+                    "INSERT INTO message (msgId, serverTime, msgType, message) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![id, "1690000000000", code, cell],
+                )
+                .unwrap();
+        };
+        // e1: an encrypted webchat string; e2: an encrypted media
+        // object; e3: the unencrypted standard shape (Failed); e4: a
+        // NULL cell (d_missing).
+        ins("e1", 1, SV::Text(enc(&json!("SENTINEL-DEC-PLAIN body"), FAKE_KEY)));
+        ins(
+            "e2",
+            2,
+            SV::Text(enc(
+                &json!({"href": "https://sentinel-dec-cdn/x", "title": "SENTINEL-DEC-T"}),
+                FAKE_KEY,
+            )),
+        );
+        ins(
+            "e3",
+            1,
+            SV::Text(serde_json::to_string(&json!("never encrypted SENTINEL-DEC-RAW")).unwrap()),
+        );
+        ins("e4", 1, SV::Null);
+
+        let doc = r#"{
+          "msgType": {},
+          "entities": { "message": {
+            "db": ["one2one"], "table": "message",
+            "columns": {
+              "msgId": "msgId",
+              "ts": { "expr": "ms_to_ms", "of": "serverTime" },
+              "uidFrom": "fromUid", "idTo": "toUid",
+              "msgType": "msgType", "content": "message"
+            }
+          } }
+        }"#;
+        let mapping = import_map::parse_mapping(doc.as_bytes()).unwrap();
+        let kinds = SnapshotInventories {
+            index: None,
+            one_to_one: Some(KindInventory {
+                source_rel: "Core/Message/111.db".into(),
+                inventory: inventory_db(&desktop).unwrap(),
+            }),
+            group: None,
+            stranger_box: None,
+        };
+        let plan = import_map::plan(&mapping, &kinds).unwrap();
+        let ep = plan.message.as_ref().unwrap();
+        let (pairs, skipped) = extract_msg_texts(&desktop, ep).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(pairs.len(), 4);
+
+        // The shadow-shaped side.
+        let shadow = Connection::open_in_memory().unwrap();
+        shadow
+            .execute_batch("CREATE TABLE messages (msg_id TEXT PRIMARY KEY, payload_json TEXT)")
+            .unwrap();
+        let ins_s = |conn: &Connection, id: &str, payload: &str| {
+            conn.execute(
+                "INSERT INTO messages (msg_id, payload_json) VALUES (?1, ?2)",
+                params![id, payload],
+            )
+            .unwrap();
+        };
+        ins_s(
+            &shadow,
+            "e1",
+            r#"{"msgId":"e1","msgType":"webchat","content":"SENTINEL-DEC-PLAIN body"}"#,
+        );
+        ins_s(
+            &shadow,
+            "e2",
+            r#"{"msgId":"e2","msgType":"chat.photo","content":{"href":"https://sentinel-dec-cdn/x","title":"SENTINEL-DEC-T"}}"#,
+        );
+        ins_s(
+            &shadow,
+            "e3",
+            r#"{"msgId":"e3","msgType":"webchat","content":"never encrypted SENTINEL-DEC-RAW"}"#,
+        );
+        ins_s(&shadow, "e4", r#"{"msgId":"e4","msgType":"webchat","content":7}"#);
+        let smap = shadow_content_map(&shadow).unwrap();
+
+        // The ignored probe's join + fold, verbatim (the FAKE key stands
+        // in for the snapshot passphrase): BOTH the batch-23b sections
+        // and the batch-24 decrypted section.
+        let mut families: BTreeMap<String, FamilyCounters> = BTreeMap::new();
+        let mut obj_pairs: Vec<ObjPair> = Vec::new();
+        for cell in pairs {
+            let Some(side) = smap.get(&cell.id) else { panic!("no shadow row") };
+            let token = match &side.msg_type {
+                Some(mt) => msg_type_token(mt),
+                None => "NULL".to_string(),
+            };
+            let f = families.entry(token.clone()).or_default();
+            f.matched += 1;
+            if cell.d.is_some() {
+                f.fold_decrypted(&decode_field(&cell.raw, FAKE_KEY), side.content.as_ref());
+            }
+            match (&cell.d, &side.content) {
+                (None, _) => f.d_missing += 1,
+                (Some(d), Some(J::String(s))) => f.fold_string(&classify_string(d, s)),
+                (Some(d), Some(J::Object(o))) => {
+                    obj_pairs.push(ObjPair { token, d: d.clone(), obj: o.clone() });
+                }
+                (Some(_), _) => f.s_other += 1,
+            }
+        }
+        for op in &obj_pairs {
+            let m = classify_object(&op.d, &op.obj, &[]);
+            families.entry(op.token.clone()).or_default().fold_object(&m);
+        }
+        let lines = render(&families, &Grand::default());
+        let joined = lines.join("\n");
+
+        // webchat (e1 Decoded+eq, e3 Failed, e4 d_missing):
+        assert!(
+            joined.contains("content-agree: msgType=webchat matched=3 string_pairs=2 object_pairs=0 \
+                             d_missing=1 s_other=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted: decoded=1 not_encrypted=0 failed=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted string: pairs=2 eq=1 eq_trim=1"),
+            "{joined}"
+        );
+        // chat.photo (e2 Decoded, same keys, per-key equality):
+        assert!(
+            joined.contains("content-agree: msgType=chat.photo matched=1 string_pairs=0 object_pairs=1 \
+                             d_missing=0 s_other=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted: decoded=1 not_encrypted=0 failed=0"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted object: pairs=1 same_keys=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("content-agree:   decrypted obj_eq: href=1/1 title=1/1"),
+            "{joined}"
+        );
+
+        // PRIVACY: no decoded value, no key, no id ever prints — the
+        // decrypted section carries counts and key NAMES only.
+        for sentinel in ["SENTINEL-DEC", "sentinel-dec-cdn"] {
             assert!(!joined.contains(sentinel), "{sentinel} leaked:\n{joined}");
         }
     }
@@ -1554,6 +2080,10 @@ mod tests {
         f1.matched = 2;
         f1.fold_string(&classify_string(s, s));
         f1.fold_string(&classify_string(&shift(s, -4), s));
+        // Batch 24 D3: the decrypted section over the same
+        // sentinel-laden pair — counts and key NAMES only, so no new
+        // leak surface exists.
+        f1.fold_decrypted(&FieldDecode::Decoded(json!(s)), Some(&json!(s)));
 
         let obj = json!({
             "href": "https://sentinel-cdn.example/x.jpg",

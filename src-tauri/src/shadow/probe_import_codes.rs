@@ -205,6 +205,7 @@ fn probe_import_codes() {
         media_plan: false,
         content_shape: None,
         by: None,
+        decrypt_basic: false,
         apply: false,
         help: false,
     };

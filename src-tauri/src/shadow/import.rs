@@ -58,6 +58,15 @@ pub mod inventory;
 /// code-shape-only rendering), unit-tested against synthetic DBs.
 pub mod distinct;
 
+/// Batch 24 D1: the Zalo PC `BasicEncryption` field transform — the
+/// exact JS `revealSync` XOR on UTF-16 units plus the
+/// unwrap→XOR→`JSON.parse` decode of one Desktop cell, and the
+/// Decoded/NotEncrypted/Failed outcome the import, the tools and the
+/// content-agreement probe all share. The key is the D7 passphrase,
+/// passed in memory only and never printed.
+pub mod desktop_cipher;
+
+
 /// Batch 23a C1/C2: the content-SHAPE aggregation (key names + type
 /// letters only, never a value) shared by `--content-shape … --by`
 /// and the shadow-side `probe_shadow_content_shape` — the second,
@@ -898,6 +907,17 @@ pub fn run_distinct(a: &ImportArgs) -> Result<Vec<String>, String> {
 /// listed at once, the `plan` convention). `--out <file>` writes the
 /// same data as JSON (BOM-less UTF-8). Nothing writes to the
 /// snapshot; every DB opens `mode=ro&immutable=1`.
+///
+/// Batch 24 D3: `--decrypt-basic` (valid only with `--content-shape`)
+/// runs the Desktop `BasicEncryption` decode
+/// (`desktop_cipher::decode_field`) on each raw cell BEFORE the
+/// shape folding, with the snapshot passphrase from `import::prepare`
+/// (in memory only, never printed). Decoded/kept values fold through
+/// the SHADOW-side classifier — the decoded value is the content
+/// value, the exact shape the wire `$.content` carries — so the
+/// report becomes directly comparable with C2's `msgType=` groups; a
+/// `Failed` decode folds the raw cell as it was. Output stays shape
+/// only; the header gains ` decrypt=basic`.
 pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
     use import_map::MapDb;
 
@@ -962,7 +982,14 @@ pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
 
     // Read: the first sample, or EVERY DB of the message kind summed
     // (batch-15 O2 style — open/query failures counted, not logged
-    // one DB at a time).
+    // one DB at a time). Batch 24 D3: with --decrypt-basic each raw
+    // cell is decoded before folding, using the snapshot passphrase
+    // (in memory only, never printed).
+    let decrypt_pass: Option<&str> = if a.decrypt_basic {
+        Some(p.passphrase.as_str())
+    } else {
+        None
+    };
     let mut groups: std::collections::BTreeMap<String, content_shape::ShapeGroup> =
         Default::default();
     let mut dbs = 0usize;
@@ -984,13 +1011,15 @@ pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
             }
             dbs += 1;
             match open_desktop_db(&msg_dir.join(name), p.passphrase.as_str(), p.profile) {
-                Ok(conn) => match fold_content_shape_db(&conn, spec, by, &mut groups) {
-                    Ok(()) => opened += 1,
-                    // Read failures are COUNTED, not printed one DB at
-                    // a time (the batch-15 O2 convention; the error
-                    // would name table/column names only).
-                    Err(_) => failed += 1,
-                },
+                Ok(conn) => {
+                    match fold_content_shape_db(&conn, spec, by, &mut groups, decrypt_pass) {
+                        Ok(()) => opened += 1,
+                        // Read failures are COUNTED, not printed one DB at
+                        // a time (the batch-15 O2 convention; the error
+                        // would name table/column names only).
+                        Err(_) => failed += 1,
+                    }
+                }
                 Err(_) => failed += 1,
             }
         }
@@ -1000,7 +1029,7 @@ pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
         let path = sample_db_path(&p, &kinv.source_rel);
         let conn = open_desktop_db(&path, p.passphrase.as_str(), p.profile)
             .map_err(|e| format!("{who}: {e}"))?;
-        fold_content_shape_db(&conn, spec, by, &mut groups)
+        fold_content_shape_db(&conn, spec, by, &mut groups, decrypt_pass)
             .map_err(|e| format!("{who}: {e}"))?;
         source = kinv.source_rel.clone();
         dbs = 1;
@@ -1014,16 +1043,18 @@ pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if a.all_dbs {
         lines.push(format!(
-            "content-shape: {} by={} source=ALL dbs={dbs} opened={opened} failed={failed}",
+            "content-shape: {} by={} source=ALL dbs={dbs} opened={opened} failed={failed}{}",
             distinct::spec_str(spec),
-            by
+            by,
+            if a.decrypt_basic { " decrypt=basic" } else { "" }
         ));
     } else {
         lines.push(format!(
-            "content-shape: {} by={} source={}",
+            "content-shape: {} by={} source={}{}",
             distinct::spec_str(spec),
             by,
-            source
+            source,
+            if a.decrypt_basic { " decrypt=basic" } else { "" }
         ));
     }
     for grp in &capped {
@@ -1059,11 +1090,20 @@ pub fn run_content_shape(a: &ImportArgs) -> Result<Vec<String>, String> {
 /// from the inventory; no other column is ever touched). Code values
 /// group by their RENDERED batch-14 token, so every group label in
 /// the report is unique and shape-safe by construction.
+///
+/// Batch 24 D3: with `pass` (the snapshot passphrase, `--decrypt-basic`)
+/// each raw cell runs through `desktop_cipher::decode_field` BEFORE
+/// the folding; a Decoded/NotEncrypted value folds through the
+/// SHADOW-side classifier (`fold_content_json` — the decoded value is
+/// the content value, the exact shape the wire `$.content` carries),
+/// a Failed decode folds the raw cell as it was. The passphrase is
+/// used in memory only; nothing here can print a value.
 fn fold_content_shape_db(
     conn: &Connection,
     spec: &distinct::DistinctSpec,
     by: &str,
     groups: &mut std::collections::BTreeMap<String, content_shape::ShapeGroup>,
+    pass: Option<&str>,
 ) -> Result<(), String> {
     use rusqlite::types::Value as SV;
     let qt = inventory::quote_ident(&spec.table)?;
@@ -1076,7 +1116,15 @@ fn fold_content_shape_db(
         .map_err(|e| format!("{}: {e}", spec.table))?;
     for (code, content) in rows.flatten() {
         let token = distinct::render_value(&code);
-        groups.entry(token).or_default().fold_cell(&content);
+        let g = groups.entry(token).or_default();
+        match pass.map(|k| desktop_cipher::decode_field(&content, k)) {
+            Some(desktop_cipher::FieldDecode::Decoded(v))
+            | Some(desktop_cipher::FieldDecode::NotEncrypted(v)) => {
+                g.fold_content_json(Some(&v));
+            }
+            Some(desktop_cipher::FieldDecode::Failed(_)) => g.fold_cell(&content),
+            None => g.fold_cell(&content),
+        }
     }
     Ok(())
 }
@@ -1187,6 +1235,8 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
     let mut msg_by_kind: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut attachment_rows: i64 = 0;
+    // Batch 24 D2: the content-decode tallies, summed across DBs.
+    let mut decode_total = desktop_cipher::DecodeCounts::default();
     let (mut dbs_opened, mut dbs_failed) = (0usize, 0usize);
 
     // Index.db: the account-wide entities (+ attachment refs if the
@@ -1205,9 +1255,15 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         match open_desktop_db(&index_path, p.passphrase.as_str(), p.profile) {
             Ok(conn) => {
                 dbs_opened += 1;
-                let opts = ExtractOpts { kind: MapDb::Index, db_id: None, cursor: None, own_uid: own_uid.as_deref() };
+                let opts = ExtractOpts {
+                    kind: MapDb::Index,
+                    db_id: None,
+                    cursor: None,
+                    own_uid: own_uid.as_deref(),
+                    passphrase: p.passphrase.as_str(),
+                };
                 match import_map::extract(&conn, &plan, &opts) {
-                    Ok((writes, skips)) => {
+                    Ok((writes, skips, _decode)) => {
                         c_conv.skipped += skips.conversation;
                         c_contact.skipped += skips.contact;
                         c_group.skipped += skips.group;
@@ -1300,13 +1356,22 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
         } else {
             None
         };
-        let opts = ExtractOpts { kind: map_kind, db_id, cursor, own_uid: own_uid.as_deref() };
+        let opts = ExtractOpts {
+            kind: map_kind,
+            db_id,
+            cursor,
+            own_uid: own_uid.as_deref(),
+            passphrase: p.passphrase.as_str(),
+        };
         let mut extracted_here = 0usize;
         match import_map::extract(&conn, &plan, &opts) {
-            Ok((writes, skips)) => {
+            Ok((writes, skips, dcount)) => {
                 c_msg.skipped += skips.message;
                 extracted_here = writes.len();
                 *msg_by_kind.entry(map_kind.name()).or_default() += writes.len();
+                decode_total.decoded += dcount.decoded;
+                decode_total.not_encrypted += dcount.not_encrypted;
+                decode_total.failed += dcount.failed;
                 for w in &writes {
                     let verdict = shadow
                         .as_ref()
@@ -1376,6 +1441,12 @@ pub fn run_mapping_dry(a: &ImportArgs) -> Result<Vec<String>, String> {
             "import dry-run: messages: {} by_kind={}",
             c_msg.line(),
             by_kind
+        ));
+        // Batch 24 D2: the content-decode tallies — counts only, never
+        // a value (the decoded content stays inside the Writes).
+        lines.push(format!(
+            "import dry-run: message content decode: decoded={} not_encrypted={} failed={}",
+            decode_total.decoded, decode_total.not_encrypted, decode_total.failed
         ));
     }
     if plan.attachment.is_some() {
@@ -1730,6 +1801,7 @@ mod tests {
             media_plan: false,
             content_shape: None,
             by: None,
+            decrypt_basic: false,
             help: false,
         }
     }
@@ -2546,6 +2618,15 @@ mod tests {
             ),
             "{joined}"
         );
+        // Batch 24 D2: the content-decode tallies — the four fixture
+        // cells are plaintext (prose / object text), so the decode
+        // keeps them as they were. Counts only, never a value.
+        assert!(
+            joined.contains(
+                "import dry-run: message content decode: decoded=0 not_encrypted=4 failed=0"
+            ),
+            "{joined}"
+        );
         // The delta line: no cursor yet (nothing applied ever), the
         // raw-table totals, and the cursor an apply would write. Note
         // rowid: `id INTEGER PRIMARY KEY` IS the rowid alias here, so
@@ -3177,6 +3258,211 @@ mod tests {
         // Immutable proof again.
         let names = listing(&dir.join("Core").join("Message"));
         assert_eq!(names.len(), 6, "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 24 D3: --content-shape --decrypt-basic (end to end) -------
+
+    /// A Desktop-shaped cipher DB whose `message` rows hold PROPER
+    /// BasicEncryption cells — `JSON.stringify(xor(JSON.stringify(
+    /// value), pass))`, the exact Zalo pipeline, encrypted with the
+    /// fixture passphrase (the same one the CLI passes to decode).
+    /// Built with bound parameters: the XOR output is not safely
+    /// embeddable in SQL text. Synthetic data only — every decoded
+    /// value carries a SENTINEL so the tests prove nothing prints.
+    #[cfg(windows)]
+    fn make_cipher_db_encrypted(
+        path: &Path,
+        pass: &str,
+        rows: &[(&str, i64, &serde_json::Value)],
+    ) {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap();
+        apply_passphrase_key(&conn, pass).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+               msgId TEXT PRIMARY KEY, serverTime TEXT, msgType INTEGER, message TEXT
+             );",
+        )
+        .unwrap();
+        for (id, code, value) in rows {
+            let plain = serde_json::to_string(value).unwrap();
+            let xored = desktop_cipher::basic_xor_utf16(&plain, pass);
+            let cell = serde_json::to_string(&serde_json::Value::String(xored)).unwrap();
+            conn.execute(
+                "INSERT INTO message (msgId, serverTime, msgType, message) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, "1690000000000", code, cell],
+            )
+            .unwrap();
+        }
+        conn.close().map_err(|(_, e)| e).unwrap();
+    }
+
+    /// The batch-24 --decrypt-basic fixture: an encrypted media object
+    /// shape (x2) under code 30 and an encrypted webchat prose string
+    /// (x2) under code 31 — SENTINEL-laden so no decoded value may
+    /// ever appear in any output.
+    #[cfg(windows)]
+    fn enc_rows() -> Vec<(&'static str, i64, serde_json::Value)> {
+        vec![
+            (
+                "m1",
+                30,
+                json!({"href": "https://sentinel-dec-cdn.example/x",
+                       "params": "{\"fileSize\":\"987654321\"}",
+                       "title": "SENTINEL-DEC-TITLE-1",
+                       "type": "file"}),
+            ),
+            (
+                "m2",
+                30,
+                json!({"href": "https://sentinel-dec-cdn.example/y",
+                       "params": "{\"fileExt\":\"pdf\"}",
+                       "title": "SENTINEL-DEC-TITLE-2",
+                       "type": "file"}),
+            ),
+            ("m3", 31, json!("prose with SENTINEL-DEC-PROSE-1 words")),
+            ("m4", 31, json!("more SENTINEL-DEC-PROSE-2 prose here")),
+        ]
+    }
+
+    /// A synthetic snapshot whose one2one sample holds the encrypted
+    /// fixture. Returns the key path.
+    #[cfg(windows)]
+    fn synthetic_snapshot_encrypted(dir: &Path, pass: &str) -> PathBuf {
+        write_manifest_json(dir, valid_manifest_json());
+        let core = dir.join("Core");
+        std::fs::create_dir_all(core.join("Message")).unwrap();
+        make_cipher_db_sql(&core.join("Index.db"), pass, INDEX_DB_SQL);
+        let rows = enc_rows();
+        let borrowed: Vec<(&str, i64, &serde_json::Value)> =
+            rows.iter().map(|(i, c, v)| (*i, *c, v)).collect();
+        make_cipher_db_encrypted(&core.join("Message").join("111.db"), pass, &borrowed);
+        for name in ["g222.db", "stranger_box.db", "undefined.db", "weird.db"] {
+            std::fs::write(core.join("Message").join(name), b"fake").unwrap();
+        }
+        let key = dir.join("d7.bin");
+        fake_d7_key_file(&key, pass);
+        key
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_content_shape_decrypt_basic_decodes_before_folding() {
+        // With --decrypt-basic the raw cells decode first, so code 30
+        // shows the REAL object shape (comparable with the shadow
+        // $.content families) and code 31 the prose not_json class;
+        // without it every row stays the batch-23a string-scalar
+        // census. Output stays shape only — the header gains
+        // " decrypt=basic".
+        let dir = temp_dir("shape24");
+        let pass = "fakefakefakefakefakefakefake1234";
+        let key = synthetic_snapshot_encrypted(&dir, pass);
+        let uin = sha12(pass.as_bytes());
+
+        // ON: decoded shapes.
+        let mut a = shape_args(&dir, &uin, &key, "msgType", false);
+        a.decrypt_basic = true;
+        let lines = run_content_shape(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(
+                "content-shape: one2one:message.message by=msgType source=Core/Message/111.db \
+                 decrypt=basic"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=30 rows=2 json_object=2 json_array=0 \
+                 json_string_scalar=0 not_json=0 null=0"
+            ),
+            "{joined}"
+        );
+        // The decoded objects' signature — key names + one nesting
+        // level, exactly the C2-comparable shape.
+        assert!(
+            joined.contains(
+                "content-shape:  {href:s,params:s{fileSize:s},title:s,type:s} x 1"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape:  {href:s,params:s{fileExt:s},title:s,type:s} x 1"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=31 rows=2 json_object=0 json_array=0 \
+                 json_string_scalar=0 not_json=2 null=0"
+            ),
+            "{joined}"
+        );
+        assert!(joined.contains("content-shape: grand rows=4 groups=2"), "{joined}");
+        // PRIVACY: the decoded values — urls, titles, prose, the
+        // params string — never appear in ANY line.
+        for sentinel in [
+            "SENTINEL-DEC",
+            "sentinel-dec-cdn",
+            "987654321",
+        ] {
+            assert!(!joined.contains(sentinel), "{sentinel} leaked:\n{joined}");
+        }
+
+        // OFF: the pre-batch-24 census — every cell a JSON string scalar.
+        let a = shape_args(&dir, &uin, &key, "msgType", false);
+        let lines = run_content_shape(&a).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("decrypt=basic"),
+            "the rider only prints when on: {joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=30 rows=2 json_object=0 json_array=0 \
+                 json_string_scalar=2 not_json=0 null=0"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "content-shape: code=31 rows=2 json_object=0 json_array=0 \
+                 json_string_scalar=2 not_json=0 null=0"
+            ),
+            "{joined}"
+        );
+
+        // Immutable proof: nothing was created in the snapshot.
+        let names = listing(&dir.join("Core").join("Message"));
+        assert_eq!(names.len(), 5, "{names:?}");
+        // The CLI exit-code path: success → 0 with the rider; the
+        // bare rider is a parse error → 2.
+        let argv = vec![
+            "--from-snapshot".to_string(),
+            dir.to_string_lossy().into_owned(),
+            "--account".to_string(),
+            "default".to_string(),
+            "--uin-hash".to_string(),
+            uin,
+            "--key-file".to_string(),
+            key.to_string_lossy().into_owned(),
+            "--content-shape".to_string(),
+            "one2one:message.message".to_string(),
+            "--by".to_string(),
+            "msgType".to_string(),
+            "--decrypt-basic".to_string(),
+        ];
+        assert_eq!(crate::shadow::cli::main(&argv), 0);
+        // The bare rider is a parse error → exit 2.
+        let mut argv2 = argv[..argv.len() - 6].to_vec();
+        argv2.push("--decrypt-basic".to_string());
+        assert_eq!(crate::shadow::cli::main(&argv2), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -199,6 +199,7 @@ fn probe_import_overlap() {
         media_plan: false,
         content_shape: None,
         by: None,
+        decrypt_basic: false,
         apply: false,
         help: false,
     };
@@ -306,7 +307,7 @@ fn probe_import_overlap() {
             }
         };
         let db_id = pick.id.parse::<u64>().ok();
-        let (writes, _skips) = import_map::extract(
+        let (writes, _skips, _decode) = import_map::extract(
             &conn,
             &plan,
             &import_map::ExtractOpts {
@@ -314,6 +315,10 @@ fn probe_import_overlap() {
                 db_id,
                 cursor: None,
                 own_uid: own_uid.as_deref(),
+                // Batch 24: the extract decodes the content cells with
+                // the snapshot passphrase; this probe compares ids,
+                // type/ts/sender only, so the tallies are unused here.
+                passphrase: p.passphrase.as_str(),
             },
         )
         .expect("extraction must not fail on an opened DB");

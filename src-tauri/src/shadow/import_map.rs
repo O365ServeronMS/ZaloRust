@@ -96,6 +96,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::Write;
+use super::import::desktop_cipher::{decode_field, DecodeCounts, FieldDecode};
 use super::import::inventory::{
     quote_ident, KindInventory, SnapshotInventories, TableInfo,
 };
@@ -954,6 +955,13 @@ pub struct ExtractOpts<'a> {
     /// the capture path applies. `None` keeps the sender NULL. The
     /// value is never printed or logged anywhere.
     pub own_uid: Option<&'a str>,
+    /// (batch 24 D2) The snapshot passphrase — the SAME string the
+    /// Desktop DB was opened with (the partition `cipherKey` Claude
+    /// found the BasicEncryption transform initialised with). It is
+    /// used in memory ONLY to decode the `content` cell through
+    /// `desktop_cipher::decode_field`, and is never printed, logged,
+    /// stored or hashed anywhere new.
+    pub passphrase: &'a str,
 }
 
 /// Per-entity skip counts (rows the mapping read but could not turn
@@ -977,13 +985,17 @@ fn applicable<'a>(slot: &'a Option<EntityPlan>, kind: &MapDb) -> Option<&'a Enti
 /// entities apply to the kind). One source row becomes at most one
 /// Write — the same values the capture path produces. Callers stream
 /// DB-by-DB so memory stays bounded by one conversation's history.
+/// The third element tallies the BasicEncryption decode outcomes of
+/// the mapped `content` column (batch 24 D2: `decoded` /
+/// `not_encrypted` / `failed` — counts only, never a value).
 pub fn extract(
     conn: &Connection,
     plan: &Plan,
     opts: &ExtractOpts,
-) -> Result<(Vec<Write>, ExtractSkips), String> {
+) -> Result<(Vec<Write>, ExtractSkips, DecodeCounts), String> {
     let mut out = Vec::new();
     let mut skips = ExtractSkips::default();
+    let mut decode = DecodeCounts::default();
     match opts.kind {
         MapDb::Index => {
             if let Some(ep) = applicable(&plan.conversation, &opts.kind) {
@@ -1028,6 +1040,8 @@ pub fn extract(
                         opts.kind,
                         opts.db_id,
                         opts.own_uid,
+                        opts.passphrase,
+                        &mut decode,
                     ) {
                         Some(w) => out.push(w),
                         None => skips.message += 1,
@@ -1036,7 +1050,7 @@ pub fn extract(
             }
         }
     }
-    Ok((out, skips))
+    Ok((out, skips, decode))
 }
 
 /// Row count of an entity's table (attachment refs, delta totals).
@@ -1185,18 +1199,20 @@ fn read_source_rows_with_rowid(
 /// (batch 16 P1, item 2.5) The message-entity extraction WITH the raw
 /// codes — the apply step's read path. Same rows, same skips, same
 /// `Write` values as [`extract`] (it is the same `message_row`); the
-/// extra fields are the facts [`CodedWrite`] documents. One source row
-/// still becomes at most one write, so memory stays bounded by one
-/// conversation's history.
+/// extra fields are the facts [`CodedWrite`] documents, plus the
+/// BasicEncryption decode tallies of the mapped `content` column
+/// (batch 24 D2 — counts only). One source row still becomes at most
+/// one write, so memory stays bounded by one conversation's history.
 pub fn extract_coded(
     conn: &Connection,
     plan: &Plan,
     opts: &ExtractOpts,
-) -> Result<(Vec<CodedWrite>, usize), String> {
+) -> Result<(Vec<CodedWrite>, usize, DecodeCounts), String> {
     let mut out = Vec::new();
     let mut skipped = 0usize;
+    let mut decode = DecodeCounts::default();
     let Some(ep) = applicable(&plan.message, &opts.kind) else {
-        return Ok((out, skipped));
+        return Ok((out, skipped, decode));
     };
     let ts_name = ep.ts_col().expect("plan guarantees a unit-declared ts");
     let delta = opts.cursor.map(|c| (ts_name, c));
@@ -1209,7 +1225,16 @@ pub fn extract_coded(
         };
         let raw_ts = ts_idx.map(|i| sv_i64(&vals[i]).unwrap_or(0)).unwrap_or(0);
         let raw_code = string_field_opt(ep, vals, "msgType", opts.db_id);
-        match message_row(ep, vals, &plan.msg_type, opts.kind, opts.db_id, opts.own_uid) {
+        match message_row(
+            ep,
+            vals,
+            &plan.msg_type,
+            opts.kind,
+            opts.db_id,
+            opts.own_uid,
+            opts.passphrase,
+            &mut decode,
+        ) {
             Some(write) => out.push(CodedWrite {
                 write,
                 raw_code,
@@ -1220,7 +1245,7 @@ pub fn extract_coded(
             None => skipped += 1,
         }
     }
-    Ok((out, skipped))
+    Ok((out, skipped, decode))
 }
 
 /// (batch 15 O1) The minimal code-cross-tab extractor: one
@@ -1518,6 +1543,18 @@ fn raw_field(ep: &EntityPlan, vals: &[SV], db_id: Option<u64>) -> String {
 /// One `msg`-table row → the same `Write::Message` the capture path
 /// would produce for that message (source "import", is_group from the
 /// DB kind). None = skip (counted by the caller).
+///
+/// Batch 24 D2: the mapped `content` column's RAW cell is decoded
+/// through `desktop_cipher::decode_field` with the snapshot passphrase
+/// (the partition `cipherKey` — the same string the DB was opened
+/// with) BEFORE `content_json` and the media parsing. The decoded
+/// value becomes the payload content — a plain string for webchat (no
+/// longer the double-encoded text), the parsed object for media (so
+/// `MEDIA_CODES` parsing is a no-op for these rows; it stays as a
+/// safety net). A `Failed` decode keeps the raw cell value as it was
+/// (the pre-batch-24 path) and is counted — the apply gate (1% of the
+/// census) is what turns a widespread failure into a refusal.
+#[allow(clippy::too_many_arguments)]
 fn message_row(
     ep: &EntityPlan,
     vals: &[SV],
@@ -1525,6 +1562,8 @@ fn message_row(
     kind: MapDb,
     db_id: Option<u64>,
     own_uid: Option<&str>,
+    passphrase: &str,
+    decode: &mut DecodeCounts,
 ) -> Option<Write> {
     // msgId (required, non-empty).
     let msg_id = string_field(ep, vals, "msgId", db_id)?;
@@ -1568,6 +1607,21 @@ fn message_row(
     let mapped_mt = desktop_mt.map(|s| mtm.get(&s).cloned().unwrap_or(s));
     let kind_code = msg_type_code(mapped_mt.as_deref().unwrap_or(""));
 
+    // Batch 24 D2: decode the raw `content` cell BEFORE the payload /
+    // `content_json` / media parsing. Only a PLAIN column mapping
+    // carries the raw Desktop cell — a const/expr content is a mapping
+    // product and is never decoded (nor counted).
+    let mut decoded_content: Option<Value> = None;
+    if let Some(spec) = ep.fields.iter().find(|f| f.target == "content") {
+        if let FieldRes::Col(i) = &spec.res {
+            let outcome = decode_field(&vals[*i], passphrase);
+            decode.fold(&outcome);
+            if let FieldDecode::Decoded(v) | FieldDecode::NotEncrypted(v) = &outcome {
+                decoded_content = Some(v.clone());
+            }
+        }
+    }
+
     // Payload: every mapped target under its target name, with the
     // core fields normalized to the capture envelope semantics.
     let mut pay = serde_json::Map::new();
@@ -1588,7 +1642,13 @@ fn message_row(
                 Some(s) => Value::String(s.clone()),
                 None => Value::Null,
             },
-            "content" => content_json(kind_code, j),
+            // The decoded value when the decode produced one; a
+            // Failed decode (or a const/expr content) keeps the raw
+            // value as it was.
+            "content" => match decoded_content.take() {
+                Some(v) => content_json(kind_code, v),
+                None => content_json(kind_code, j),
+            },
             _ => j,
         };
         pay.insert(spec.target.clone(), j);
@@ -2045,6 +2105,13 @@ mod tests {
         conn
     }
 
+    /// The FAKE passphrase the extraction tests thread through
+    /// `ExtractOpts` (batch 24 D2) — a synthetic 32-char string, never
+    /// a real key. The `desktop_like` rows are plaintext, so the
+    /// content decode is the NotEncrypted passthrough; the dedicated
+    /// decode test below encrypts its fixture cells WITH this string.
+    const FAKE_PASS: &str = "fakefakefakefakefakefakefake24";
+
     /// The fake Desktop-like schema the brief suggests, plus the
     /// account-wide tables, seeded with a few FAKE rows.
     fn desktop_like() -> Connection {
@@ -2430,8 +2497,9 @@ mod tests {
             db_id: Some(123),
             cursor: None,
             own_uid: None,
+            passphrase: FAKE_PASS,
         };
-        let (writes, skips) = extract(&conn, &p, &opts).unwrap();
+        let (writes, skips, _decode) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 0);
         assert_eq!(writes.len(), 4, "the whole table is the conversation");
 
@@ -2535,7 +2603,7 @@ mod tests {
                 .unwrap()
         };
 
-        let (writes, _) = extract(
+        let (writes, _, _) = extract(
             &conn,
             &p,
             &ExtractOpts {
@@ -2543,6 +2611,7 @@ mod tests {
                 db_id: Some(123),
                 cursor: None,
                 own_uid: Some(FAKE_UID),
+                passphrase: FAKE_PASS,
             },
         )
         .unwrap();
@@ -2563,7 +2632,7 @@ mod tests {
         let pay: Value = serde_json::from_str(&payload103).unwrap();
         assert_eq!(pay["uidFrom"], json!("0"), "the payload keeps the raw uidFrom");
         // Sender NULL still — the sender_id field, not the payload.
-        let (writes, _) = extract(
+        let (writes, _, _) = extract(
             &conn,
             &p,
             &ExtractOpts {
@@ -2571,10 +2640,114 @@ mod tests {
                 db_id: Some(123),
                 cursor: None,
                 own_uid: None,
+                passphrase: FAKE_PASS,
             },
         )
         .unwrap();
         assert_eq!(sender_of(&writes, "103"), None, "no own uid: stays NULL");
+    }
+
+    #[test]
+    fn extract_decodes_basic_encryption_content_cells() {
+        // Batch 24 D2: the raw `content` cell runs through the
+        // Desktop BasicEncryption decode (the SAME fake passphrase the
+        // ExtractOpts carries — the real one is the D7 key) BEFORE the
+        // payload / content_json / media parsing. The fixture cells are
+        // synthetic, encrypted with that fake key.
+        let enc = |v: &Value, key: &str| -> String {
+            let plain = serde_json::to_string(v).unwrap();
+            let xored = super::super::import::desktop_cipher::basic_xor_utf16(&plain, key);
+            serde_json::to_string(&Value::String(xored)).unwrap()
+        };
+        let conn = desktop_like();
+        // 201: an encrypted webchat string -> Decoded: the payload
+        // content is the PLAIN string, so text is too.
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (201, 'c201', 'u1', 'u2', 1690000006, 'chat.text.v2', ?1)",
+            params![enc(&json!("plain SENTINEL-DECODED text"), FAKE_PASS)],
+        )
+        .unwrap();
+        // 202: an encrypted media object -> Decoded: the payload
+        // content is the parsed OBJECT (MEDIA_CODES is a no-op for it
+        // — the object already is the wire shape).
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (202, 'c202', 'u1', 'u2', 1690000007, 'chat.photo', ?1)",
+            params![enc(
+                &json!({"href": "https://fake-stal.example/x.jpg",
+                        "thumb": "https://fake/t.jpg"}),
+                FAKE_PASS
+            )],
+        )
+        .unwrap();
+        // 203: encrypted with a DIFFERENT key -> Failed: the content
+        // keeps the raw cell value as it was, counted `failed`. (The
+        // wrong key shares NO prefix with the fake passphrase — a
+        // common prefix would let the two XORs partially cancel.)
+        let wrong_cell =
+            enc(&json!("needs the right key"), "wrongwrongwrongwrongwrongwrong24");
+        conn.execute(
+            "INSERT INTO msg (id, cliId, fromUid, toUid, ts, type, content) \
+             VALUES (203, 'c203', 'u1', 'u2', 1690000008, 'chat.text.v2', ?1)",
+            params![wrong_cell],
+        )
+        .unwrap();
+
+        let inv = inventories(&conn, &conn);
+        let m = parse_mapping(MAPPING_JSON.as_bytes()).unwrap();
+        let p = plan(&m, &inv).unwrap();
+        let opts = ExtractOpts {
+            kind: MapDb::OneToOne,
+            db_id: Some(123),
+            cursor: None,
+            own_uid: None,
+            passphrase: FAKE_PASS,
+        };
+        let (writes, skips, decode) = extract(&conn, &p, &opts).unwrap();
+        assert_eq!(skips.message, 0);
+        assert_eq!(writes.len(), 7, "4 plaintext + 3 encrypted rows");
+
+        // The tallies: 101-104 are plaintext (prose / object text) so
+        // the decode keeps them as they were; 201/202 decode; 203 fails.
+        assert_eq!(
+            decode,
+            DecodeCounts { decoded: 2, not_encrypted: 4, failed: 1 },
+            "{decode:?}"
+        );
+
+        let find = |id: &str| -> &Write {
+            writes
+                .iter()
+                .find(|w| matches!(w, Write::Message { msg_id, .. } if msg_id == id))
+                .unwrap()
+        };
+        // 201: the decoded STRING is the content and the text.
+        let Write::Message { text, kind, payload, .. } = find("201") else { panic!() };
+        assert_eq!(*kind, 1, "chat.text.v2 -> webchat");
+        assert_eq!(text.as_deref(), Some("plain SENTINEL-DECODED text"));
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"], json!("plain SENTINEL-DECODED text"));
+
+        // 202: the decoded OBJECT is the content (no text — media
+        // objects never become text).
+        let Write::Message { text, kind, payload, .. } = find("202") else { panic!() };
+        assert_eq!(*kind, 2, "chat.photo pass-through");
+        assert!(text.is_none(), "media content is not text");
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            pay["content"],
+            json!({"href": "https://fake-stal.example/x.jpg",
+                   "thumb": "https://fake/t.jpg"}),
+            "the decoded object is the payload content, the wire shape"
+        );
+
+        // 203: Failed — the raw cell value kept as it was (the
+        // pre-batch-24 shape), counted so the apply gate can see it.
+        let Write::Message { text, payload, .. } = find("203") else { panic!() };
+        assert_eq!(text.as_deref(), Some(wrong_cell.as_str()));
+        let pay: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(pay["content"], json!(wrong_cell), "kept as it was");
     }
 
     #[test]
@@ -2652,8 +2825,9 @@ mod tests {
             db_id: Some(77),
             cursor: None,
             own_uid: None,
+            passphrase: FAKE_PASS,
         };
-        let (writes, skips) = extract(&conn, &p, &opts).unwrap();
+        let (writes, skips, _decode) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 0);
         // Group kind: conv = idTo = the db_id const; is_group true.
         let Write::Message { conv_id, is_group, payload, .. } = &writes[0] else { panic!() };
@@ -2679,8 +2853,9 @@ mod tests {
             db_id: None,
             cursor: None,
             own_uid: None,
+            passphrase: FAKE_PASS,
         };
-        let (writes, skips) = extract(&conn, &p, &opts).unwrap();
+        let (writes, skips, _decode) = extract(&conn, &p, &opts).unwrap();
         assert_eq!((skips.conversation, skips.contact, skips.group), (0, 0, 0));
         assert_eq!(writes.len(), 3, "1 conversation + 1 contact + 1 group");
         let conv = writes.iter().find_map(|w| match w {
@@ -2728,8 +2903,9 @@ mod tests {
             db_id: Some(1),
             cursor: None,
             own_uid: None,
+            passphrase: FAKE_PASS,
         };
-        let (writes, skips) = extract(&conn, &p, &opts).unwrap();
+        let (writes, skips, _decode) = extract(&conn, &p, &opts).unwrap();
         assert_eq!(skips.message, 3, "unparsable ts, no conv source, NULL ts");
         assert_eq!(writes.len(), 4, "the four good rows still extract");
     }
@@ -2757,8 +2933,9 @@ mod tests {
             db_id: Some(1),
             cursor: Some(ImportCursor { max_ts: 300, max_rowid: 2 }),
             own_uid: None,
+            passphrase: FAKE_PASS,
         };
-        let (writes, _) = extract(&conn, &p, &opts).unwrap();
+        let (writes, _, _) = extract(&conn, &p, &opts).unwrap();
         // Include iff rowid > 2 OR raw ts > 300: row 3 (rowid 3) is
         // included by rowid even though its ts equals the watermark;
         // rows 4 (400) and 5 (rowid 5) by both. Only rows 1 and 2
@@ -3000,10 +3177,16 @@ mod tests {
         let inv = inventories(&conn, &conn);
         let m = parse_mapping(MAPPING_JSON.as_bytes()).unwrap();
         let p = plan(&m, &inv).unwrap();
-        let (writes, _) = extract(
+        let (writes, _, _) = extract(
             &conn,
             &p,
-            &ExtractOpts { kind: MapDb::OneToOne, db_id: Some(1), cursor: None, own_uid: None },
+            &ExtractOpts {
+                kind: MapDb::OneToOne,
+                db_id: Some(1),
+                cursor: None,
+                own_uid: None,
+                passphrase: FAKE_PASS,
+            },
         )
         .unwrap();
         let verdicts: Vec<(&str, Verdict)> = writes

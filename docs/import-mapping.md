@@ -2,7 +2,8 @@
 
 This is the how-to for the tools batch 12 added to `zalors import`,
 the batch-14 addition, the batch-15 additions, the batch-16
-additions, and the batch-23a content-shape additions:
+additions, the batch-23a content-shape additions, and the batch-24
+BasicEncryption decode additions:
 
 - `--inventory` — what tables/columns a cold snapshot actually holds
   (audit §4 item 2.2/2.3 groundwork);
@@ -13,7 +14,8 @@ additions, and the batch-23a content-shape additions:
 - `--mapping <file>` + `--shadow-copy <dir>` (+ `--delta`, and batch
   15's `--own-uid-from-settings`) — the declarative mapping dry run
   with a read-only classification against a temp COPY of your shadow
-  store (item 2.4);
+  store (item 2.4); batch 24: the extraction now DECODES the Desktop
+  `message` cell (BasicEncryption) and reports the outcome counts;
 - `probe_import_overlap` — the 2.3 acceptance probe (≥99% msgId
   overlap, 100% type/ts/sender on the matches) that a mapping must
   pass before any apply step is even proposed; batch 15 adds the
@@ -25,15 +27,21 @@ additions, and the batch-23a content-shape additions:
 - `--content-shape <kind>:<table>.<col> --by <code_col>` (batch 23a)
   — the content-SHAPE probe over a snapshot: per distinct code, the
   JSON-shape census of one content column plus its top key
-  signatures, unable by construction to print a value;
+  signatures, unable by construction to print a value; batch 24 adds
+  `--decrypt-basic`, which decodes each raw cell first;
 - `probe_shadow_content_shape` (batch 23a) — the shadow half of the
   same shape census, grouped by the payload's wire `$.msgType` on a
   temp COPY of the store; batch 23b combines the two halves with the
   batch-15 cross-tab to fill the mapping's `msgType` table;
+- `probe_import_content_agree` (batch 23b) — the transform-hunting
+  probe (counts only); batch 24 adds its `decrypted` section, the
+  direct verification that the BasicEncryption decode reproduces the
+  shadow `$.content`;
 - `--apply` (batch 16, §7) — the guarded write step (item 2.5): all
   preconditions enforced in code, a verified pre-import backup,
   batched savepoint writes with per-DB resume cursors, and a
-  zero-change second run;
+  zero-change second run; batch 24 adds the decode-census gate
+  (refuse when more than 1% of the census rows fail to decode);
 - `--media-plan` (batch 16, §8) — the media hardlink PREP dry run
   (item 2.6): counts only, no hashing, no hardlinks.
 
@@ -213,7 +221,7 @@ target\debug\zalors.exe import `
   --account default --uin-hash dca62c394a68 `
   --key-file "D:\.opencode\d7\zalo-desktop-uin-key-2026-11-19.bin" `
   --content-shape one2one:message.message --by msgType `
-  [--all-dbs] [--out shapes.json]
+  [--all-dbs] [--decrypt-basic] [--out shapes.json]
 ```
 
 - The spec is `<dbkind>:<table>.<content_col>` (the `--distinct`
@@ -257,6 +265,16 @@ target\debug\zalors.exe import `
   NO text, id, url, number or file name taken from the content can
   appear — the unit tests feed sentinel-bearing contents and assert
   every output line clean.
+- `--decrypt-basic` (batch 24, valid only with `--content-shape`):
+  decode each RAW cell through the Desktop `BasicEncryption`
+  transform FIRST — the exact pipeline Claude read out of the Zalo PC
+  app code (§1f) — using the snapshot passphrase (in memory only,
+  never printed). A decoded cell then folds through the SHADOW-side
+  classifier, so each code's shapes become directly comparable with
+  the C2 `msgType=` families (the decoded value IS the wire
+  `$.content` value); a cell that fails to decode folds as the raw
+  cell it is. The header gains ` decrypt=basic`; the output stays
+  shape only.
 
 **The shadow half — `probe_shadow_content_shape` (C2):**
 
@@ -307,6 +325,49 @@ evidence, in this order of trust:
    batch-15 cross-tab and the overlap probe before proposing an
    apply; the apply preflight (§7 precondition 4) is the final gate
    that lists anything still unmapped.
+
+## 1f. Batch 24 — the Desktop `message` BasicEncryption decode
+
+Claude read the Zalo PC 26.11.12 app code (static, read-only): the
+Desktop data-transform layer (`main-dist/utility-process-sqlite.js`)
+configures the SQLite adapter's `message` table with exactly ONE
+field transform — `version 0, sentiveFields ["message"], methodology
+BasicEncryption` — and initialises the transformer with the
+partition's `cipherKey`: the SAME string the DB is opened with, i.e.
+the D7 passphrase the import already uses. The column stores a JSON
+string literal whose value is the XOR of the content's JSON text
+with that passphrase (UTF-16 units, key cycling from the start), so
+decoding is: JSON-unwrap the cell → XOR → `JSON.parse` — which
+yields the content value (a string for webchat, an object for
+media). Batch 23b's length evidence agrees: the length is preserved
+and webchat D is longer than S by the JSON quotes and escapes.
+
+The shared implementation is `shadow/import/desktop_cipher.rs`
+(`basic_xor_utf16` + `decode_field`), used by:
+
+- **the extraction** (§2/§4/§7): the mapped `content` column's raw
+  cell is decoded BEFORE the payload build, with the same passphrase
+  that opened the DB — a decoded value becomes the payload content
+  (a plain string for webchat, the parsed object for media). Each
+  extract counts `content_decoded` / `content_not_encrypted` /
+  `content_failed`, surfaced in the dry-run summary and the apply
+  output. A cell that is not a JSON string scalar keeps its own
+  JSON meaning (or the raw text) as it was; a `Failed` decode keeps
+  the raw cell value and is counted. Only a PLAIN column mapping is
+  decoded — a const/expr content is a mapping product, not the raw
+  cell.
+- **`--content-shape --decrypt-basic`** (§1d).
+- **`probe_import_content_agree`'s `decrypted` section** (batch 23b +
+  24): per msgType family, the decode outcome counts plus, for a
+  string `S`, whether the decoded value equals it (`eq`, `eq_trim`)
+  and, for an object `S`, whether the decoded object has the same
+  key set and per identifier key whether the string values are
+  equal (`obj_eq[key]=n/m`). Counts only.
+
+The passphrase is passed in memory only, exactly the way
+`import::prepare` already passes it — nothing in this path logs,
+prints, stores or hashes it, and no probe or tool ever prints a
+decrypted value.
 
 ## 2. Write the mapping JSON
 
@@ -455,7 +516,11 @@ Output, per entity mapped:
 
 ```
 import dry-run: messages: extracted=4 new=2 fill_null=1 ignored=1 update_import=0 skipped=0 by_kind=one2one=4
+import dry-run: message content decode: decoded=2 not_encrypted=2 failed=0
 ```
+
+- The second line (batch 24) counts the BasicEncryption decode of
+  the mapped `content` column (§1f) — counts only, never a value.
 
 - `extracted` — rows the mapping turned into `Write`s (`skipped` =
   rows it could not: NULL keys, an unparsable ts, a blob in a direct
@@ -631,6 +696,22 @@ each with a unit test on synthetic fixtures):
    `ZR_OWN_UID`), and that rule is NOT changed by this batch; the
    number is the reviewer's input for deciding whether NULL should
    stay "self" on the import path.
+6. (batch 24) The Desktop content column must **decode cleanly**: a
+   pre-apply census decodes the raw `content` cell of every row in
+   every mapped DB with the same passphrase that opened them, and
+   the run REFUSES when more than 1% of the census rows fail
+   (`Failed` — the wrong-key signature: with the right passphrase
+   the XOR output is always valid JSON, so a widespread failure
+   means the key or the mapping's content column is wrong), printing
+   the counts:
+
+   ```
+   import apply: content decode census: rows=8418 decoded=8390 not_encrypted=27 failed=1 (0.01% failed)
+   ```
+
+   A mapping with no plain content column skips the census (printed,
+   never silent). The refusal fires before the target is even opened
+   — zero bytes move.
 
 **The write path**: extract → `writer::apply` with `source='import'`,
 inside batches of 500 rows per `BEGIN IMMEDIATE … COMMIT`, each row
