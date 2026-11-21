@@ -36,8 +36,8 @@
 //!   columns (`msgId, msgType, localPath, folderPath, previewThumb,
 //!   fileSize, cliMsgId, sendDttm`).
 //!
-//! The M3 decision itself is a PURE function over (attachment row,
-//! Desktop row, filesystem facts) — [`plan_outcome`] — unit-tested
+//! The M2/M3 decisions themselves are PURE functions over gathered
+//! facts — the plan v2 choice is [`choose_candidate`] — unit-tested
 //! with synthetic inputs for every outcome; the callers only gather
 //! facts and count.
 //!
@@ -77,6 +77,33 @@
 //! part of a picture name the MD5 of a content url?) is SKIPPED and
 //! reported `md5=unavailable`: no MD5 implementation exists anywhere
 //! in the dependency tree and the brief forbids adding a crate.
+//!
+//! Batch 27e (plan v2 — matches by cache NAME keys): the real-data
+//! run killed the `message.localPath` route as the primary link too
+//! (EMPTY for 57.6k of the 58.5k import attachments), but the 27d
+//! probe found the link IN THE CACHE FILE NAMES: the `picture` and
+//! `video` files carry the Desktop `msgId` — the shadow import row's
+//! own `msg_id` — and the `resource` files carry the `cliMsgId`. The
+//! plan therefore builds ONE in-memory index `key13 → Vec<Candidate>`
+//! from a single read-only walk (the same traversal, `*.rescache`
+//! skip and 200k cap as the probe's reverse coverage), gathers each
+//! attachment's candidates from the msgId keys (subs
+//! picture/video/file), the cliMsgId keys (sub resource) and the
+//! localPath route (one more candidate source, so nothing found
+//! before is lost; `fileNoise` never becomes a candidate), and
+//! classifies them through the PURE [`choose_candidate`]: magic fit
+//! via the class projection of `media::magic_ok`, the 0/512 MB size
+//! rule, then renderable-over-JXL, picture/video-before-resource,
+//! larger size. The archive viewer runs in WebView2, which cannot
+//! render JPEG XL — a renderable copy (jpg/png/gif/webp, mp4) is
+//! preferred over JXL whenever both exist. The report adds the
+//! winner attribution (picture/video/resource/file/localPath), the
+//! multi-image fitting histogram, the picture-vs-resource size
+//! ratio (is `resource` a thumbnail or the original?), the msgType-18
+//! video census (the rows batch 27b must CREATE) and the index
+//! totals. Still a DRY RUN — nothing is written anywhere, and the
+//! only file facts ever gathered remain the first 16 bytes and
+//! `metadata().len()`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -488,8 +515,17 @@ const MSG_COERCE_COLS: [&str; 7] = [
     "sendDttm",
 ];
 
-/// The plan scan's coercible columns, in PLAN_COLS order.
-const PLAN_COERCE_COLS: [&str; 4] = ["msgId", "localPath", "folderPath", "fileSize"];
+/// The plan scan's coercible columns, in PLAN_COLS order (batch 27e
+/// adds `cliMsgId` — the resource candidates' key — and coerces
+/// `msgType` for the msgType-18 video census).
+const PLAN_COERCE_COLS: [&str; 6] = [
+    "msgId",
+    "msgType",
+    "cliMsgId",
+    "localPath",
+    "folderPath",
+    "fileSize",
+];
 
 /// The zcloud census's coercible columns.
 const ZCLOUD_COERCE_COLS: [&str; 2] = ["localPath", "zSize"];
@@ -579,8 +615,18 @@ const MSG_COLS: [&str; 8] = [
     "sendDttm",
 ];
 
-/// The columns the M3 plan reads.
-const PLAN_COLS: [&str; 5] = ["msgId", "msgType", "localPath", "folderPath", "fileSize"];
+/// The columns the M3 plan reads (batch 27e: `cliMsgId` joins the
+/// fixed set — the `resource` cache files key by it; `msgType` feeds
+/// the videos census; `fileSize` is still read only so a type
+/// surprise in it is counted exactly like the probe counts one).
+const PLAN_COLS: [&str; 6] = [
+    "msgId",
+    "msgType",
+    "cliMsgId",
+    "localPath",
+    "folderPath",
+    "fileSize",
+];
 
 /// Identifier-quoted fixed SELECT over `message`.
 fn msg_scan_sql(cols: &[&str]) -> Result<String, String> {
@@ -2375,191 +2421,523 @@ pub fn probe_report(
     Ok(lines)
 }
 
-// --- M3: the pure plan decision ----------------------------------------------
+// --- batch 27e M1: the candidate index ----------------------------------------
 
-/// One shadow attachment row the plan classifies (values stay in
-/// memory; nothing here prints).
-pub struct PlanAtt<'a> {
-    /// The shadow `attachments.kind` (image | video | file | voice | …).
-    pub kind: Option<&'a str>,
-    /// The shadow `attachments.status`.
-    pub status: &'a str,
+/// The `<sub>`s the candidate index walks and keys (the brief's M1
+/// list). `fileNoise` and every other `<sub>` is walked for the cap
+/// accounting only — never opened, never decoded.
+const INDEXED_SUBS: [MediaSub; 4] = [
+    MediaSub::Picture,
+    MediaSub::Video,
+    MediaSub::Resource,
+    MediaSub::File,
+];
+
+/// The route a candidate arrived by — the winner attribution (the
+/// brief's five source labels): an index candidate wins as its
+/// `<sub>` (picture / video / resource / file), the batch-27
+/// `message.localPath` route wins as `localPath`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandVia {
+    /// Keyed by the cache file NAME (the single walk).
+    Index,
+    /// The Desktop row's own `localPath`, resolved against the root.
+    LocalPath,
 }
 
-/// The Desktop row facts for one message id (`None` = no Desktop row
-/// carries it — `no_desktop_row`).
-pub struct PlanDesk<'a> {
-    pub local_path: Option<&'a str>,
-    pub folder_path: Option<&'a str>,
-}
-
-/// The filesystem facts of the RESOLVED local path — gathered by the
-/// caller with [`resolve_local`] + [`file_facts`] (the module's only
-/// file reads).
-pub struct PlanFs {
-    pub under_root: bool,
+/// The facts the pure choice sees — no path, no id, nothing that
+/// could print a value even by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandFacts {
     pub sub: MediaSub,
-    pub exists: bool,
-    pub size: Option<u64>,
-    pub head: Vec<u8>,
+    pub via: CandVia,
+    pub size: u64,
+    pub magic: MagicClass,
 }
 
-impl PlanFs {
-    /// Gather the facts for one resolved path (pure w.r.t. the DBs).
-    pub fn of_resolved(resolved: &Path, root_norm: &str) -> PlanFs {
-        let path_s = resolved.to_string_lossy().into_owned();
-        let (exists, size, head) = file_facts(resolved);
-        PlanFs {
-            under_root: under_root(&norm_path(&path_s), root_norm),
-            sub: classify_sub(&path_s),
-            exists,
-            size,
-            head,
+impl CandFacts {
+    /// The winner label — the brief's fixed five-name vocabulary.
+    pub fn winner_label(&self) -> &'static str {
+        match self.via {
+            CandVia::LocalPath => "localPath",
+            CandVia::Index => self.sub.name(),
         }
     }
 }
 
-/// The plan's would-copy size cap (the store's own download cap).
-pub const WOULD_COPY_MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// One import-sourced attachment's plan outcome — exactly one per
-/// row. The brief's eight labels plus `size_excluded` (the file
-/// exists but its size is 0 or over the 512 MB cap — the would_copy
-/// definition's own size clause, reported separately so no row is
-/// silently mislabeled).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PlanOutcome {
-    AlreadyDownloaded,
-    WouldCopy,
-    MagicMismatch,
-    MissingFile,
-    NoLocalPath,
-    NoiseObfuscated,
-    NoDesktopRow,
-    OutsideRoot,
-    SizeExcluded,
+/// One index entry: `key13 → Candidate { sub, size, magic class,
+/// path }` (the brief's shape). The path stays IN MEMORY for the
+/// later, user-approved copy batch (27b) — nothing in this module
+/// ever prints it.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub sub: MediaSub,
+    pub via: CandVia,
+    pub size: u64,
+    pub magic: MagicClass,
+    pub path: PathBuf,
 }
 
-impl PlanOutcome {
+impl Candidate {
+    /// The facts the pure choice sees.
+    pub fn facts(&self) -> CandFacts {
+        CandFacts {
+            sub: self.sub,
+            via: self.via,
+            size: self.size,
+            magic: self.magic,
+        }
+    }
+}
+
+/// Per-sub index totals (the report's `index sub=…` lines; counts
+/// and the fixed vocabulary only).
+#[derive(Default)]
+struct SubIndex {
+    files: u64,
+    keyed: u64,
+    unkeyed: u64,
+    keys: HashSet<String>,
+}
+
+/// The candidate index (batch 27e M1): ONE in-memory map
+/// `key13 → Vec<Candidate>` built by a single read-only walk. The
+/// key is the cache file STEM's exactly-13-digit run — a Desktop
+/// `msgId` under `picture`/`video`/`file`, a `cliMsgId` under
+/// `resource`; a stem with zero or several runs counts as `unkeyed`
+/// per `<sub>`. Paths never leave this structure.
+#[derive(Default)]
+pub struct CandIndex {
+    entries: BTreeMap<String, Vec<Candidate>>,
+    subs: BTreeMap<MediaSub, SubIndex>,
+    uids: u64,
+    uids_with_zdl: u64,
+    files_seen: u64,
+    rescache_skipped: u64,
+    indexed: u64,
+    cap_hit: bool,
+}
+
+/// The single read-only walk (the §10.2 reverse-coverage traversal
+/// reused): every uid under `<root>\media`, an explicit stack, no
+/// symlink following, `*.rescache` skipped, the hard [`WALK_CAP`]
+/// cap on every file seen. The only file facts ever gathered are the
+/// first 16 bytes and `metadata().len()`, and only for the indexed
+/// `<sub>`s.
+fn walk_candidate_index(root: &Path) -> CandIndex {
+    let mut ix = CandIndex::default();
+    let Ok(uids) = std::fs::read_dir(root.join("media")) else {
+        return ix; // no media tree: an empty index, not an error
+    };
+    for uid in uids.flatten() {
+        if !uid.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        ix.uids += 1;
+        let zdl = uid.path().join("ZaloDownloads");
+        if !zdl.is_dir() {
+            continue;
+        }
+        ix.uids_with_zdl += 1;
+        let mut stack = vec![zdl];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let Ok(ft) = e.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    stack.push(e.path());
+                    continue;
+                }
+                ix.files_seen += 1;
+                if ix.files_seen > WALK_CAP {
+                    ix.cap_hit = true;
+                    return ix;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.to_ascii_lowercase().ends_with(".rescache") {
+                    ix.rescache_skipped += 1;
+                    continue;
+                }
+                let ep = e.path();
+                let sub = classify_sub(&ep.to_string_lossy());
+                if !INDEXED_SUBS.contains(&sub) {
+                    continue; // cap accounting only — never opened
+                }
+                let runs = ep
+                    .file_stem()
+                    .map(|s| digit_runs_13(&s.to_string_lossy()))
+                    .unwrap_or_default();
+                let key = if runs.len() == 1 {
+                    runs.into_iter().next()
+                } else {
+                    None
+                };
+                {
+                    let si = ix.subs.entry(sub).or_default();
+                    si.files += 1;
+                    match key.as_ref() {
+                        Some(k) => {
+                            si.keyed += 1;
+                            si.keys.insert(k.clone());
+                        }
+                        None => si.unkeyed += 1,
+                    }
+                }
+                let Some(key) = key else { continue };
+                let (is_file, len, head) = file_facts(&ep);
+                if !is_file {
+                    continue; // vanished mid-walk: keyed, but no facts to offer
+                }
+                ix.indexed += 1;
+                ix.entries.entry(key).or_default().push(Candidate {
+                    sub,
+                    via: CandVia::Index,
+                    size: len.unwrap_or(0),
+                    magic: magic_class(&head),
+                    path: ep,
+                });
+            }
+        }
+    }
+    ix
+}
+
+// --- batch 27e M2: the pure choice -------------------------------------------
+
+/// The plan's would-copy size cap (unchanged from v1: the store's own
+/// download cap).
+pub const WOULD_COPY_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// One import-sourced attachment's plan v2 outcome — the brief's six
+/// labels. `already_downloaded` is decided by the CALLER from the row
+/// status BEFORE the candidate lookup, so [`choose_candidate`] never
+/// returns it — it lives on this enum so every row still lands in
+/// exactly one bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Choice {
+    AlreadyDownloaded,
+    WouldCopyRenderable,
+    WouldCopyJxlOnly,
+    MagicMismatch,
+    SizeExcluded,
+    NoCandidate,
+}
+
+impl Choice {
     /// The report's field name (the brief's exact labels).
     pub fn field(self) -> &'static str {
         match self {
-            PlanOutcome::AlreadyDownloaded => "already_downloaded",
-            PlanOutcome::WouldCopy => "would_copy",
-            PlanOutcome::MagicMismatch => "magic_mismatch",
-            PlanOutcome::MissingFile => "missing_file",
-            PlanOutcome::NoLocalPath => "no_local_path",
-            PlanOutcome::NoiseObfuscated => "noise_obfuscated",
-            PlanOutcome::NoDesktopRow => "no_desktop_row",
-            PlanOutcome::OutsideRoot => "outside_root",
-            PlanOutcome::SizeExcluded => "size_excluded",
+            Choice::AlreadyDownloaded => "already_downloaded",
+            Choice::WouldCopyRenderable => "would_copy_renderable",
+            Choice::WouldCopyJxlOnly => "would_copy_jxl_only",
+            Choice::MagicMismatch => "magic_mismatch",
+            Choice::SizeExcluded => "size_excluded",
+            Choice::NoCandidate => "no_candidate",
         }
     }
+
+    /// Does this outcome copy bytes?
+    fn copies(self) -> bool {
+        matches!(
+            self,
+            Choice::WouldCopyRenderable | Choice::WouldCopyJxlOnly
+        )
+    }
 }
 
-/// The M3 decision, PURE over (attachment row, Desktop row, fs facts)
-/// — unit-tested with synthetic inputs for every outcome. One row
-/// lands in exactly one outcome, in this priority:
-///
-/// 1. the attachment is `downloaded` already — nothing to plan;
-/// 2. no Desktop row carries this message id;
-/// 3. the Desktop row has no `localPath`;
-/// 4. the resolved path is outside `--local-media-root`;
-/// 5. the path is under `fileNoise` — obfuscated, never decoded;
-/// 6. the file does not exist;
-/// 7. the size is 0 or over the 512 MB cap (`size_excluded`);
-/// 8. the magic does not fit the shadow kind (M4: JXL is an image);
-/// 9. otherwise `would_copy`.
-///
-/// `fs` is `None` only when the Desktop row has no usable path (the
-/// caller passes `Some` whenever `desk` names a non-empty localPath);
-/// a `None` here is classified `no_local_path` so the function is
-/// total over its inputs.
-pub fn plan_outcome(
-    att: &PlanAtt,
-    desk: Option<&PlanDesk>,
-    fs: Option<&PlanFs>,
-) -> PlanOutcome {
-    if att.status == "downloaded" {
-        return PlanOutcome::AlreadyDownloaded;
+/// The class-level projection of `media::magic_ok` — the brief's M2
+/// fit lists: image accepts jpg/png/gif/webp/jxl (both on-disk
+/// forms); video accepts mp4/webm; file, voice and unknown kinds are
+/// not sniffed (the size rule drops the empty files). Unit-tested to
+/// agree with the byte-level sniff on a representative head of every
+/// class.
+fn magic_class_ok(kind: Option<&str>, m: MagicClass) -> bool {
+    match kind {
+        Some("image") => matches!(
+            m,
+            MagicClass::Jpg
+                | MagicClass::Png
+                | MagicClass::Gif
+                | MagicClass::Webp
+                | MagicClass::Jxl
+                | MagicClass::JxlContainer
+        ),
+        Some("video") => matches!(m, MagicClass::Mp4 | MagicClass::WebmMkv),
+        _ => true,
     }
-    let Some(d) = desk else {
-        return PlanOutcome::NoDesktopRow;
-    };
-    if d.local_path.filter(|l| !l.is_empty()).is_none() {
-        return PlanOutcome::NoLocalPath;
-    }
-    let Some(f) = fs else {
-        return PlanOutcome::NoLocalPath;
-    };
-    if !f.under_root {
-        return PlanOutcome::OutsideRoot;
-    }
-    if f.sub == MediaSub::FileNoise {
-        return PlanOutcome::NoiseObfuscated;
-    }
-    if !f.exists {
-        return PlanOutcome::MissingFile;
-    }
-    let size = f.size.unwrap_or(0);
-    if size == 0 || size > WOULD_COPY_MAX_BYTES {
-        return PlanOutcome::SizeExcluded;
-    }
-    if !crate::shadow::media::magic_ok(att.kind, &f.head) {
-        return PlanOutcome::MagicMismatch;
-    }
-    PlanOutcome::WouldCopy
 }
 
-// --- M3: the report ----------------------------------------------------------
+/// The brief's preference rule 1: renderable (jpg/png/gif/webp/
+/// mp4/webm — everything WebView2 shows inline) beats JXL. The
+/// classes the rule does not name (pdf/zip/html/other) sit BETWEEN
+/// the two — the minimal total order in which renderable still beats
+/// JXL (documented in the mapping doc's §10.6).
+fn render_rank(m: MagicClass) -> u8 {
+    match m {
+        MagicClass::Jpg
+        | MagicClass::Png
+        | MagicClass::Gif
+        | MagicClass::Webp
+        | MagicClass::Mp4
+        | MagicClass::WebmMkv => 0,
+        MagicClass::Jxl | MagicClass::JxlContainer => 2,
+        _ => 1,
+    }
+}
 
-/// One import-sourced attachment row as read from the store.
+/// The brief's preference rule 2: picture/video before resource. The
+/// subs the rule does not name sit around it (§10.6): `file` between
+/// the two, every other `<sub>` last.
+fn sub_rank(sub: MediaSub) -> u8 {
+    match sub {
+        MediaSub::Picture | MediaSub::Video => 0,
+        MediaSub::File => 1,
+        MediaSub::Resource => 2,
+        _ => 3,
+    }
+}
+
+/// Does candidate `a` beat candidate `b` under the preference order
+/// (renderable → sub → size)? Pure.
+fn better(a: &CandFacts, b: &CandFacts) -> bool {
+    match render_rank(a.magic).cmp(&render_rank(b.magic)) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => match sub_rank(a.sub).cmp(&sub_rank(b.sub)) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a.size > b.size,
+        },
+    }
+}
+
+/// Does the candidate pass BOTH filters — the magic fits the kind AND
+/// the size is in range (0 < size ≤ the 512 MB cap)? Pure.
+fn fits_filters(kind: Option<&str>, c: &CandFacts) -> bool {
+    magic_class_ok(kind, c.magic) && c.size > 0 && c.size <= WOULD_COPY_MAX_BYTES
+}
+
+/// The best FITTING candidate by the preference order, or `None`
+/// when no candidate fits. Ties keep the FIRST candidate —
+/// deterministic in the input order. Pure.
+fn best_fitting(kind: Option<&str>, cands: &[CandFacts]) -> Option<CandFacts> {
+    let mut best: Option<CandFacts> = None;
+    for c in cands {
+        if !fits_filters(kind, c) {
+            continue;
+        }
+        let take = match best {
+            Some(b) => better(c, &b),
+            None => true,
+        };
+        if take {
+            best = Some(*c);
+        }
+    }
+    best
+}
+
+/// The best candidate of one already-fitting pool restricted to a
+/// single `<sub>` (the picture-vs-resource section's per-sub pick).
+fn best_in_sub(pool: &[CandFacts], sub: MediaSub) -> Option<CandFacts> {
+    let mut best: Option<CandFacts> = None;
+    for c in pool.iter().filter(|c| c.sub == sub) {
+        let take = match best {
+            Some(b) => better(c, &b),
+            None => true,
+        };
+        if take {
+            best = Some(*c);
+        }
+    }
+    best
+}
+
+/// The M2 choice, PURE over (kind, candidate facts) — unit-tested for
+/// every arm:
+///
+/// 1. `no_candidate` — no candidate at all;
+/// 2. `magic_mismatch` — candidates exist but none fits the kind;
+/// 3. `size_excluded` — some fit the magic but every fitting one is
+///    0 bytes or over the 512 MB cap;
+/// 4. otherwise the best fitting candidate decides:
+///    `would_copy_jxl_only` when it is JXL (the archive viewer runs
+///    in WebView2, which cannot render JPEG XL), else
+///    `would_copy_renderable`.
+///
+/// `already_downloaded` is decided by the caller BEFORE the lookup
+/// (the row's status) and never passes through here.
+pub fn choose_candidate(kind: Option<&str>, cands: &[CandFacts]) -> Choice {
+    if cands.is_empty() {
+        return Choice::NoCandidate;
+    }
+    let Some(best) = best_fitting(kind, cands) else {
+        // The two empty reasons: a magic filter that dropped
+        // everything vs a size filter that dropped every fitting one.
+        return if cands.iter().any(|c| magic_class_ok(kind, c.magic)) {
+            Choice::SizeExcluded
+        } else {
+            Choice::MagicMismatch
+        };
+    };
+    match best.magic {
+        MagicClass::Jxl | MagicClass::JxlContainer => Choice::WouldCopyJxlOnly,
+        _ => Choice::WouldCopyRenderable,
+    }
+}
+
+// --- M3: the report (v2, batch 27e) -------------------------------------------
+
+/// One import-sourced attachment row as read from the store (values
+/// in memory; the kind/status are shadow vocabulary, the id never
+/// prints).
 struct AttRow {
     msg_id: String,
     kind: Option<String>,
     status: String,
 }
 
-/// The plan's per-kind outcome counts, in the fixed field order.
-#[derive(Default)]
-struct KindOutcomes {
-    rows: u64,
-    outcomes: BTreeMap<PlanOutcome, u64>,
+/// The Desktop row facts the v2 plan keeps for each needed msg id
+/// (values in memory; nothing here prints).
+struct DeskRow {
+    /// The coerced `msgType` (the videos census).
+    msg_type: Option<i64>,
+    /// The `resource` candidates' key.
+    cli_msg_id: Option<String>,
+    /// The batch-27 localPath route.
+    local_path: Option<String>,
+    folder_path: Option<String>,
 }
 
-impl KindOutcomes {
-    fn line(&self, kind: &str) -> String {
-        let fields: Vec<String> = [
-            PlanOutcome::AlreadyDownloaded,
-            PlanOutcome::WouldCopy,
-            PlanOutcome::MagicMismatch,
-            PlanOutcome::MissingFile,
-            PlanOutcome::NoLocalPath,
-            PlanOutcome::NoiseObfuscated,
-            PlanOutcome::NoDesktopRow,
-            PlanOutcome::OutsideRoot,
-            PlanOutcome::SizeExcluded,
-        ]
-        .iter()
-        .map(|o| {
-            format!(
-                "{}={}",
-                o.field(),
-                self.outcomes.get(o).copied().unwrap_or(0)
-            )
-        })
-        .collect();
-        format!(
-            "local-media-plan: kind={kind} rows={} {}",
-            self.rows,
-            fields.join(" ")
-        )
+/// Gather ONE attachment's candidates (M2's lookup): the index
+/// entries keyed by the shadow `msg_id` — the Desktop `msgId`; the
+/// subs keyed by it are picture/video/file — the entries keyed by the
+/// Desktop row's `cliMsgId` (the `resource` sub), and the batch-27
+/// `message.localPath` route (sub from the path) when it resolves
+/// under the root — so nothing found before is lost. A `fileNoise`
+/// path NEVER becomes a candidate (its contents are never decoded);
+/// duplicates by normalized path drop (the same file can be both a
+/// keyed entry and a localPath target).
+fn gather_candidates(
+    ix: &CandIndex,
+    root_norm: &str,
+    msg_id: &str,
+    desk: Option<&DeskRow>,
+) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(v) = ix.entries.get(msg_id) {
+        for c in v {
+            if matches!(c.sub, MediaSub::Picture | MediaSub::Video | MediaSub::File)
+                && seen.insert(norm_path(&c.path.to_string_lossy()))
+            {
+                out.push(c.clone());
+            }
+        }
+    }
+    if let Some(cli) = desk.and_then(|d| d.cli_msg_id.as_deref()) {
+        if let Some(v) = ix.entries.get(cli) {
+            for c in v {
+                if c.sub == MediaSub::Resource
+                    && seen.insert(norm_path(&c.path.to_string_lossy()))
+                {
+                    out.push(c.clone());
+                }
+            }
+        }
+    }
+    if let Some(d) = desk {
+        if let Some(local) = d.local_path.as_deref().filter(|l| !l.is_empty()) {
+            let resolved = resolve_local(local, d.folder_path.as_deref());
+            let rs = resolved.to_string_lossy().into_owned();
+            let rnorm = norm_path(&rs);
+            let sub = classify_sub(&rs);
+            // Under the root only, and never a fileNoise path —
+            // those are counted by the probe, never decoded.
+            if under_root(&rnorm, root_norm)
+                && sub != MediaSub::FileNoise
+                && seen.insert(rnorm)
+            {
+                let (is_file, len, head) = file_facts(&resolved);
+                if is_file {
+                    out.push(Candidate {
+                        sub,
+                        via: CandVia::LocalPath,
+                        size: len.unwrap_or(0),
+                        magic: magic_class(&head),
+                        path: resolved,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Per-kind aggregation of the v2 outcomes: rows, (count, bytes) per
+/// outcome, and the winner attribution (the fixed five labels).
+#[derive(Default)]
+struct KindPlan {
+    rows: u64,
+    outcomes: BTreeMap<Choice, (u64, u64)>,
+    winners: BTreeMap<&'static str, u64>,
+}
+
+/// One message's in-scope image attachments vs their fitting
+/// candidates (the multi-image section).
+#[derive(Default)]
+struct ImgMsg {
+    atts: u64,
+    fitting: u64,
+}
+
+/// The picture-vs-resource ratio buckets (the brief's four,
+/// half-open exactly as their labels read: `<0.25`, `0.25–0.75`,
+/// `0.75–1.33` inclusive of 1.33, `>1.33`).
+const RATIO_LABELS: [&str; 4] = ["<0.25", "0.25–0.75", "0.75–1.33", ">1.33"];
+
+fn ratio_bucket(r: f64) -> usize {
+    if r < 0.25 {
+        0
+    } else if r < 0.75 {
+        1
+    } else if r <= 1.33 {
+        2
+    } else {
+        3
     }
 }
 
-/// The `--local-media-plan` report (DRY RUN ONLY — no writes of any
-/// kind). Called by `import::run_local_media_plan` after parse
-/// guaranteed `--target` + `--local-media-root`; the root exists.
+/// The fixed field order of the outcomes lines.
+const CHOICE_FIELDS: [Choice; 6] = [
+    Choice::AlreadyDownloaded,
+    Choice::WouldCopyRenderable,
+    Choice::WouldCopyJxlOnly,
+    Choice::MagicMismatch,
+    Choice::SizeExcluded,
+    Choice::NoCandidate,
+];
+
+/// The brief's five winner labels, in print order.
+const WINNER_FIELDS: [&str; 5] = ["picture", "video", "resource", "file", "localPath"];
+
+/// The `--local-media-plan` report, v2 (batch 27e, DRY RUN ONLY — no
+/// writes of any kind). Called by `import::run_local_media_plan`
+/// after parse guaranteed `--target` + `--local-media-root`; the root
+/// exists.
+///
+/// The matching lives in the cache file NAMES: one walk builds
+/// `key13 → Vec<Candidate>` (picture/video/file keyed by the shadow
+/// `msg_id` — the Desktop `msgId`; resource keyed by the Desktop
+/// `cliMsgId`), the batch-27 `message.localPath` route adds one more
+/// candidate source, and the PURE [`choose_candidate`] classifies
+/// every import-sourced attachment. Everything printed is a count,
+/// a fixed vocabulary word or a byte total (H-rule — no path value,
+/// file name, uid, msgId or message text ever reaches a line).
 pub fn plan_report(
     a: &super::super::cli::ImportArgs,
     root: &Path,
@@ -2567,8 +2945,8 @@ pub fn plan_report(
 ) -> Result<Vec<String>, String> {
     // The store, READ-ONLY with the normal key resolution (the
     // `repair_cli`/`media_cli` pattern). A Locked passphrase store
-    // refuses: this CLI never accepts a password, not on argv, not in
-    // env.
+    // refuses: this CLI never accepts a password, not on argv, not
+    // in env.
     let db_path = crate::shadow::db_file(target);
     if !db_path.is_file() {
         return Err(format!(
@@ -2598,8 +2976,11 @@ pub fn plan_report(
     let p = super::prepare(a)?;
     let root_norm = norm_path(&root.to_string_lossy());
 
-    // The import-sourced attachments (any status), ordered. Kinds
-    // and statuses are shadow vocabulary words (shape); ids stay in
+    // The store reads: the import-sourced attachments (any status),
+    // every import-sourced message id (the plan's `needed` ids — the
+    // msgType-18 video census must also see the messages WITHOUT an
+    // attachment row), and the ids that DO have an attachment row.
+    // Kinds and statuses are shadow vocabulary words; ids stay in
     // memory and never print.
     let sqlite_err = |e: rusqlite::Error| {
         format!(
@@ -2628,9 +3009,15 @@ pub fn plan_report(
         .filter_map(Result::ok)
         .collect();
     drop(st);
-
-    // The membership sets for the M3 `no_attachment_row` census (all
-    // sources: "no shadow attachment" is literal).
+    let import_msg_ids: HashSet<String> = {
+        let mut st = conn
+            .prepare("SELECT msg_id FROM messages WHERE source = 'import'")
+            .map_err(sqlite_err)?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sqlite_err)?;
+        rows.filter_map(Result::ok).collect()
+    };
     let att_msg_ids: HashSet<String> = {
         let mut st = conn
             .prepare("SELECT DISTINCT msg_id FROM attachments")
@@ -2640,29 +3027,21 @@ pub fn plan_report(
             .map_err(sqlite_err)?;
         rows.filter_map(Result::ok).collect()
     };
-    let msg_ids: HashSet<String> = {
-        let mut st = conn
-            .prepare("SELECT msg_id FROM messages")
-            .map_err(sqlite_err)?;
-        let rows = st
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(sqlite_err)?;
-        rows.filter_map(Result::ok).collect()
-    };
 
-    // The msg ids the plan needs Desktop rows for.
-    let needed: HashSet<String> = atts.iter().map(|a| a.msg_id.clone()).collect();
+    // The msg ids the plan needs Desktop rows for (every import
+    // message — the attachments' ids are a subset).
+    let needed: HashSet<String> = import_msg_ids.clone();
 
-    // Scan every message DB once: keep the Desktop row for each
-    // needed msg id, and count the rows WITH a local file that have no
-    // shadow attachment row at all (per Desktop msgType).
+    // Scan every message DB once (tolerant reads as in 27c): keep
+    // each needed msgId's Desktop row — its cliMsgId (the resource
+    // candidates' key), its localPath (the batch-27 route) and its
+    // msgType (the videos census).
     preflight_columns(&p, &PLAN_COLS)?;
     let sql = msg_scan_sql(&PLAN_COLS)?;
     let names = super::message_db_names(&p.uid_dir)?;
     let msg_dir = p.uid_dir.join("Core").join("Message");
-    let mut desk_rows: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
-    let mut no_attachment_row: BTreeMap<String, u64> = BTreeMap::new();
-    let mut not_in_shadow: BTreeMap<String, u64> = BTreeMap::new();
+    let mut desk_rows: BTreeMap<String, DeskRow> = BTreeMap::new();
+    let mut cli_needed: HashSet<String> = HashSet::new();
     let mut scan = DbStats::default();
     for (name, kind) in &names {
         match kind {
@@ -2685,91 +3064,142 @@ pub fn plan_report(
             scan.query_failed += 1;
             continue;
         };
-        // Batch 27c: the same tolerant reads as the probe census — the
-        // old fixed-type reads silently skipped failed rows here
-        // (`let Ok(..) = row else { continue }`); now every surprise is
-        // counted and never drops the row.
         let Ok(rows) = st.query_map([], |r| {
             Ok((
                 r.get::<_, SV>(0)?, // msgId
                 r.get::<_, SV>(1)?, // msgType
-                r.get::<_, SV>(2)?, // localPath
-                r.get::<_, SV>(3)?, // folderPath
-                r.get::<_, SV>(4)?, // fileSize (selected by the fixed list; counted, not used)
+                r.get::<_, SV>(2)?, // cliMsgId
+                r.get::<_, SV>(3)?, // localPath
+                r.get::<_, SV>(4)?, // folderPath
+                r.get::<_, SV>(5)?, // fileSize (counted, not used)
             ))
         }) else {
             scan.query_failed += 1;
             continue;
         };
         for row in rows {
-            let Ok((msg_id, code, local, folder, fsize)) = row else {
+            let Ok((mid, mtype, cli, local, folder, fsize)) = row else {
                 scan.row_failed += 1;
                 continue;
             };
             scan.rows += 1;
-            let msg_id = v_to_string(msg_id, "msgId", &mut scan.coerce_none);
-            let (lp, fp) = (
-                v_to_string(local, "localPath", &mut scan.coerce_none),
-                v_to_string(folder, "folderPath", &mut scan.coerce_none),
-            );
+            let mid = v_to_string(mid, "msgId", &mut scan.coerce_none);
+            let mtype = v_to_i64(mtype, "msgType", &mut scan.coerce_none);
+            let cli = v_to_string(cli, "cliMsgId", &mut scan.coerce_none);
+            let lp = v_to_string(local, "localPath", &mut scan.coerce_none);
+            let fp = v_to_string(folder, "folderPath", &mut scan.coerce_none);
             // The decision uses the FILE's size, never this cell — it
-            // is coerced so the header counts a surprise in it exactly
-            // like the probe does.
+            // is coerced so the header counts a surprise in it
+            // exactly like the probe does.
             v_to_i64(fsize, "fileSize", &mut scan.coerce_none);
-            let Some(msg_id) = msg_id else { continue };
-            if needed.contains(&msg_id) {
-                desk_rows.insert(msg_id.clone(), (lp.clone(), fp.clone()));
-            }
-            // The Goal's `no_attachment_row` census: a Desktop row
-            // whose local file EXISTS, with no shadow attachment row
-            // for its message id — split by whether the shadow knows
-            // the message at all.
-            if !att_msg_ids.contains(&msg_id) {
-                let Some(local) = lp else { continue };
-                let resolved = resolve_local(&local, fp.as_deref());
-                if file_facts(&resolved).0 {
-                    let token = render_value(&code);
-                    if msg_ids.contains(&msg_id) {
-                        *no_attachment_row.entry(token).or_insert(0) += 1;
-                    } else {
-                        *not_in_shadow.entry(token).or_insert(0) += 1;
-                    }
+            let Some(mid) = mid else { continue };
+            if needed.contains(&mid) {
+                if let Some(c) = cli.as_ref() {
+                    cli_needed.insert(c.clone());
                 }
+                desk_rows.insert(
+                    mid.clone(),
+                    DeskRow {
+                        msg_type: mtype,
+                        cli_msg_id: cli,
+                        local_path: lp,
+                        folder_path: fp,
+                    },
+                );
             }
         }
     }
 
-    // Classify every attachment (the pure decision over gathered
-    // facts) and sum what would_copy would add.
-    let mut kinds: BTreeMap<String, KindOutcomes> = BTreeMap::new();
-    let mut would_copy_bytes: u64 = 0;
+    // M1: the candidate index — ONE read-only walk of the root.
+    let ix = walk_candidate_index(root);
+
+    // Classify every attachment (the pure choice over the gathered
+    // facts) and fold the report sections.
+    let mut kinds: BTreeMap<String, KindPlan> = BTreeMap::new();
     let mut matched = 0u64;
+    let mut total_bytes = 0u64;
+    let mut hist = [0u64; 4];
+    let mut img_msgs: BTreeMap<String, ImgMsg> = BTreeMap::new();
+    let mut ratio = [0u64; 4];
+    let mut ratio_pairs = 0u64;
+    let mut magic_pairs: BTreeMap<(MagicClass, MagicClass), u64> = BTreeMap::new();
     for att in &atts {
-        let kind = att.kind.clone().unwrap_or_else(|| "none".into());
-        let ko = kinds.entry(kind).or_default();
-        ko.rows += 1;
-        let desk_view = desk_rows.get(&att.msg_id).map(|(l, f)| PlanDesk {
-            local_path: l.as_deref(),
-            folder_path: f.as_deref(),
-        });
-        let fs_view = match &desk_view {
-            Some(d) if d.local_path.filter(|l| !l.is_empty()).is_some() => {
-                let resolved = resolve_local(d.local_path.unwrap_or_default(), d.folder_path);
-                matched += 1;
-                Some(PlanFs::of_resolved(&resolved, &root_norm))
-            }
-            _ => None,
-        };
-        let att_view = PlanAtt {
-            kind: att.kind.as_deref(),
-            status: att.status.as_str(),
-        };
-        let outcome = plan_outcome(&att_view, desk_view.as_ref(), fs_view.as_ref());
-        if outcome == PlanOutcome::WouldCopy {
-            would_copy_bytes += fs_view.as_ref().and_then(|f| f.size).unwrap_or(0);
+        let kind_key = att.kind.clone().unwrap_or_else(|| "none".into());
+        let kp = kinds.entry(kind_key).or_default();
+        kp.rows += 1;
+        let desk = desk_rows.get(&att.msg_id);
+        if desk.is_some() {
+            matched += 1;
         }
-        *ko.outcomes.entry(outcome).or_insert(0) += 1;
+        // `already_downloaded` is decided BEFORE the lookup — no
+        // candidates are gathered for a downloaded row.
+        let (choice, best, facts) = if att.status == "downloaded" {
+            (Choice::AlreadyDownloaded, None, Vec::new())
+        } else {
+            let cands = gather_candidates(&ix, &root_norm, &att.msg_id, desk);
+            let facts: Vec<CandFacts> = cands.iter().map(|c| c.facts()).collect();
+            let best = best_fitting(att.kind.as_deref(), &facts);
+            (choose_candidate(att.kind.as_deref(), &facts), best, facts)
+        };
+        let e = kp.outcomes.entry(choice).or_insert((0, 0));
+        e.0 += 1;
+        if let Some(b) = best {
+            // A copy outcome always has a best candidate; the bytes
+            // it would add are its own size.
+            e.1 += b.size;
+            if choice.copies() {
+                total_bytes += b.size;
+                *kp.winners.entry(b.winner_label()).or_insert(0) += 1;
+            }
+        }
+        // The multi-image section: every image attachment not already
+        // downloaded — its FITTING candidate count, and the
+        // picture-vs-resource pair when both have one.
+        if att.kind.as_deref() == Some("image") && att.status != "downloaded" {
+            let fitting: Vec<CandFacts> = facts
+                .iter()
+                .filter(|c| fits_filters(att.kind.as_deref(), c))
+                .copied()
+                .collect();
+            hist[fitting.len().min(3)] += 1;
+            let m = img_msgs.entry(att.msg_id.clone()).or_default();
+            m.atts += 1;
+            m.fitting += fitting.len() as u64;
+            if let (Some(pb), Some(rb)) = (
+                best_in_sub(&fitting, MediaSub::Picture),
+                best_in_sub(&fitting, MediaSub::Resource),
+            ) {
+                ratio_pairs += 1;
+                ratio[ratio_bucket(rb.size as f64 / pb.size as f64)] += 1;
+                *magic_pairs.entry((pb.magic, rb.magic)).or_insert(0) += 1;
+            }
+        }
     }
+
+    // The videos census (the rows batch 27b must CREATE): every
+    // import-sourced message whose Desktop row is msgType 18 —
+    // whether or not the shadow has an attachment row for it.
+    let (mut v_msgs, mut v_fit, mut v_bytes, mut v_no_att) = (0u64, 0u64, 0u64, 0u64);
+    for mid in &import_msg_ids {
+        let Some(d) = desk_rows.get(mid) else {
+            continue;
+        };
+        if d.msg_type != Some(18) {
+            continue;
+        }
+        v_msgs += 1;
+        let cands = gather_candidates(&ix, &root_norm, mid, Some(d));
+        let facts: Vec<CandFacts> = cands.iter().map(|c| c.facts()).collect();
+        if let Some(best) = best_fitting(Some("video"), &facts) {
+            v_fit += 1;
+            v_bytes += best.size;
+            if !att_msg_ids.contains(mid) {
+                v_no_att += 1;
+            }
+        }
+    }
+
+    // --- the lines -----------------------------------------------------------
 
     let mut lines = vec![
         "local-media-plan: DRY RUN ONLY — no writes of any kind (no DB, no files, no temp \
@@ -2802,27 +3232,122 @@ pub fn plan_report(
             kinds.len()
         ),
     ];
-    for (kind, ko) in &kinds {
-        lines.push(ko.line(kind));
-    }
-    lines.push(format!("local-media-plan: total would_copy bytes={would_copy_bytes}"));
-    // The Goal's `no_attachment_row` census, per Desktop msgType code.
-    lines.push(
-        "local-media-plan: desktop rows with a local file, by msgType (no_attachment_row = the \
-         shadow knows the message but has no attachment row for it; not_in_shadow = the message \
-         was never imported at all)"
-            .into(),
-    );
-    let mut nar: Vec<(&String, &u64)> = no_attachment_row.iter().collect();
-    nar.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    for (token, n) in nar.iter().take(CODE_CAP) {
+    // Per shadow kind: rows, every outcome count with the bytes it
+    // would add, and which source won.
+    for (kind, kp) in &kinds {
+        let outcomes: Vec<String> = CHOICE_FIELDS
+            .iter()
+            .map(|c| {
+                let (n, b) = kp.outcomes.get(c).copied().unwrap_or((0, 0));
+                format!("{}={}(bytes={b})", c.field(), n)
+            })
+            .collect();
         lines.push(format!(
-            "local-media-plan:   msgType={token} no_attachment_row={n} not_in_shadow={}",
-            not_in_shadow.get(*token).copied().unwrap_or(0)
+            "local-media-plan: kind={kind} rows={} outcomes {}",
+            kp.rows,
+            outcomes.join(" ")
         ));
+        let won: Vec<String> = WINNER_FIELDS
+            .iter()
+            .map(|w| format!("{w}:{}", kp.winners.get(*w).copied().unwrap_or(0)))
+            .collect();
+        lines.push(format!("local-media-plan: kind={kind} won {}", won.join(" ")));
     }
-    if nar.is_empty() {
-        lines.push("local-media-plan:   none".into());
+    lines.push(format!("local-media-plan: total would_copy bytes={total_bytes}"));
+    // Multi-image messages: the fitting-candidate histogram per
+    // attachment, and the messages whose attachments-per-message
+    // differs from their fitting-candidates-per-message (the
+    // attachment idx ↔ file ordering is unknown, so just count).
+    lines.push(format!(
+        "local-media-plan: image attachments (kind=image, not already downloaded): rows={} \
+         fitting histogram 0:{} 1:{} 2:{} 3+:{}",
+        hist.iter().sum::<u64>(),
+        hist[0],
+        hist[1],
+        hist[2],
+        hist[3]
+    ));
+    lines.push(format!(
+        "local-media-plan: image messages: messages={} atts_vs_fitting_differ={}",
+        img_msgs.len(),
+        img_msgs.values().filter(|m| m.atts != m.fitting).count()
+    ));
+    // Picture vs resource for the same message: is the resource copy
+    // a thumbnail or the original?
+    lines.push(format!(
+        "local-media-plan: picture vs resource (both fitting): pairs={ratio_pairs} ratio \
+         {}:{} {}:{} {}:{} {}:{}",
+        RATIO_LABELS[0],
+        ratio[0],
+        RATIO_LABELS[1],
+        ratio[1],
+        RATIO_LABELS[2],
+        ratio[2],
+        RATIO_LABELS[3],
+        ratio[3]
+    ));
+    {
+        let mut pairs: Vec<(&(MagicClass, MagicClass), &u64)> = magic_pairs.iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let fields: Vec<String> = pairs
+            .iter()
+            .take(CODE_CAP)
+            .map(|((pm, rm), n)| format!("{}/{}={n}", pm.name(), rm.name()))
+            .collect();
+        lines.push(format!(
+            "local-media-plan: picture vs resource magic pairs {}",
+            if fields.is_empty() {
+                "none".into()
+            } else {
+                fields.join(" ")
+            }
+        ));
+        let more = magic_pairs.len().saturating_sub(CODE_CAP);
+        if more > 0 {
+            lines.push(format!(
+                "local-media-plan: picture vs resource magic pairs: more=+{more} (capped at \
+                 {CODE_CAP} by count)"
+            ));
+        }
+    }
+    // Videos: the import messages with a Desktop msgType-18 row.
+    lines.push(format!(
+        "local-media-plan: videos (import messages with Desktop msgType 18): messages={} \
+         with_fitting_candidate={} bytes={} no_attachment_row={}",
+        v_msgs, v_fit, v_bytes, v_no_att
+    ));
+    // Index totals: the walk header, then per sub files / keyed /
+    // unkeyed / keys matching a needed msgId or cliMsgId.
+    lines.push(format!(
+        "local-media-plan: candidate walk: uids={} uids_with_zalodownloads={} files_seen={} \
+         rescache_skipped={} indexed={} cap={} cap_hit={}",
+        ix.uids,
+        ix.uids_with_zdl,
+        ix.files_seen,
+        ix.rescache_skipped,
+        ix.indexed,
+        WALK_CAP,
+        if ix.cap_hit { "yes" } else { "no" }
+    ));
+    for sub in INDEXED_SUBS {
+        let (files, keyed, unkeyed, keys, keys_needed) = match ix.subs.get(&sub) {
+            Some(s) => (
+                s.files,
+                s.keyed,
+                s.unkeyed,
+                s.keys.len(),
+                s.keys
+                    .iter()
+                    .filter(|k| needed.contains(*k) || cli_needed.contains(*k))
+                    .count(),
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
+        lines.push(format!(
+            "local-media-plan: index sub={} files={files} keyed={keyed} unkeyed={unkeyed} \
+             keys={keys} keys_needed={keys_needed}",
+            sub.name()
+        ));
     }
     lines.push("local-media-plan: done (DRY RUN ONLY — nothing was written)".into());
     Ok(lines)
@@ -3182,194 +3707,317 @@ mod tests {
         );
     }
 
-    // --- M3: the pure decision, every outcome --------------------------------
+    // --- batch 27e M2: the pure choice, every outcome and rule -------------------
 
-    fn desk<'a>(local: Option<&'a str>, folder: Option<&'a str>) -> PlanDesk<'a> {
-        PlanDesk {
-            local_path: local,
-            folder_path: folder,
-        }
-    }
-
-    fn fs(under: bool, sub: MediaSub, exists: bool, size: u64, head: &[u8]) -> PlanFs {
-        PlanFs {
-            under_root: under,
+    /// One synthetic candidate (no filesystem, no ids, no paths).
+    fn cf(sub: MediaSub, via: CandVia, size: u64, magic: MagicClass) -> CandFacts {
+        CandFacts {
             sub,
-            exists,
-            size: Some(size),
-            head: head.to_vec(),
+            via,
+            size,
+            magic,
         }
     }
 
     #[test]
-    fn plan_outcome_every_branch() {
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 1];
-        let jxl_bare = [0xFF, 0x0A, 0xE0, 0x0D];
-        let jxl_box = [
-            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A, 0x00,
+    fn choose_candidate_every_outcome() {
+        // 1. no_candidate: nothing to look at.
+        assert_eq!(choose_candidate(Some("image"), &[]), Choice::NoCandidate);
+        // 2. magic_mismatch: candidates exist but none fits the kind.
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(MediaSub::Picture, CandVia::Index, 10, MagicClass::Mp4)]
+            ),
+            Choice::MagicMismatch
+        );
+        // A candidate that fails BOTH filters classifies by the
+        // magic — the first filter.
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(MediaSub::Picture, CandVia::Index, 0, MagicClass::Mp4)]
+            ),
+            Choice::MagicMismatch
+        );
+        // 3. size_excluded: the magic fits but every fitting
+        // candidate is 0 bytes or over the cap.
+        assert_eq!(
+            choose_candidate(
+                Some("file"),
+                &[cf(MediaSub::File, CandVia::LocalPath, 0, MagicClass::Other)]
+            ),
+            Choice::SizeExcluded
+        );
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(
+                    MediaSub::Picture,
+                    CandVia::Index,
+                    WOULD_COPY_MAX_BYTES + 1,
+                    MagicClass::Jpg
+                )]
+            ),
+            Choice::SizeExcluded
+        );
+        // 4. the best fitting candidate decides: JXL (either form) is
+        // would_copy_jxl_only — the archive viewer runs in WebView2,
+        // which cannot render JPEG XL.
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(MediaSub::Picture, CandVia::Index, 4, MagicClass::Jxl)]
+            ),
+            Choice::WouldCopyJxlOnly
+        );
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(MediaSub::Picture, CandVia::Index, 4, MagicClass::JxlContainer)]
+            ),
+            Choice::WouldCopyJxlOnly
+        );
+        // …everything else is would_copy_renderable.
+        assert_eq!(
+            choose_candidate(
+                Some("image"),
+                &[cf(MediaSub::Resource, CandVia::Index, 5, MagicClass::Jpg)]
+            ),
+            Choice::WouldCopyRenderable
+        );
+        // already_downloaded is the caller's pre-lookup decision —
+        // choose_candidate never returns it (the end-to-end fixture
+        // below covers that bucket through the report).
+    }
+
+    #[test]
+    fn choose_candidate_prefers_renderable_over_jxl() {
+        // Rule 1: a renderable copy beats JXL even when the JXL is
+        // bigger and sits in the canonical sub.
+        let cands = [
+            cf(MediaSub::Picture, CandVia::Index, 100, MagicClass::Jxl),
+            cf(MediaSub::Resource, CandVia::Index, 5, MagicClass::Jpg),
         ];
-        let cipher = [0x37, 0x9E, 0x2C, 0xF1, 9];
-
-        // 1. already_downloaded wins over everything.
-        for (desk_v, fs_v) in [
-            (None, None),
-            (Some(desk(None, None)), None),
-            (
-                Some(desk(Some(r"D:\elsewhere\x"), None)),
-                Some(fs(false, MediaSub::Other, false, 0, &[])),
+        assert_eq!(
+            choose_candidate(Some("image"), &cands),
+            Choice::WouldCopyRenderable
+        );
+        assert_eq!(
+            best_fitting(Some("image"), &cands).unwrap().winner_label(),
+            "resource"
+        );
+        // The classes rule 1 does not name sit between the two
+        // (§10.6): pdf/zip/html/other beat JXL too.
+        let cands = [
+            cf(MediaSub::File, CandVia::Index, 100, MagicClass::Jxl),
+            cf(MediaSub::File, CandVia::Index, 5, MagicClass::Zip),
+        ];
+        assert_eq!(
+            choose_candidate(Some("file"), &cands),
+            Choice::WouldCopyRenderable
+        );
+        // mp4/webm are renderable — a video choice is never jxl_only.
+        assert_eq!(
+            choose_candidate(
+                Some("video"),
+                &[cf(MediaSub::Video, CandVia::Index, 7, MagicClass::WebmMkv)]
             ),
+            Choice::WouldCopyRenderable
+        );
+    }
+
+    #[test]
+    fn choose_candidate_prefers_the_source_subs() {
+        // Rule 2: picture/video before resource; the fill-in order
+        // (§10.6) is picture/video > file > resource > every other
+        // <sub>.
+        let mk = |sub| cf(sub, CandVia::Index, 10, MagicClass::Jpg);
+        for (win, lose) in [
+            (MediaSub::Picture, MediaSub::Resource),
+            (MediaSub::Video, MediaSub::Resource),
+            (MediaSub::File, MediaSub::Resource),
         ] {
-            assert_eq!(
-                plan_outcome(
-                    &PlanAtt { kind: Some("image"), status: "downloaded" },
-                    desk_v.as_ref(),
-                    fs_v.as_ref()
-                ),
-                PlanOutcome::AlreadyDownloaded,
-                "downloaded is checked first"
-            );
+            let cands = [mk(lose), mk(win)];
+            let best = best_fitting(Some("image"), &cands).unwrap();
+            assert_eq!(best.sub, win, "{win:?} must beat {lose:?}");
         }
+        // Every other <sub> ranks last, whatever its route.
+        let cands = [
+            cf(MediaSub::Other, CandVia::LocalPath, 10, MagicClass::Jpg),
+            mk(MediaSub::Resource),
+        ];
+        assert_eq!(
+            best_fitting(Some("image"), &cands).unwrap().sub,
+            MediaSub::Resource
+        );
+    }
 
-        // 2. no_desktop_row.
+    #[test]
+    fn choose_candidate_prefers_the_larger_size() {
+        // Rule 3: equal rank, equal sub — the larger file wins.
+        let cands = [
+            cf(MediaSub::Resource, CandVia::Index, 100, MagicClass::Jpg),
+            cf(MediaSub::Resource, CandVia::Index, 200, MagicClass::Jpg),
+        ];
+        assert_eq!(best_fitting(Some("image"), &cands).unwrap().size, 200);
+        // Ties keep the FIRST candidate — deterministic.
+        let cands = [
+            cf(MediaSub::Picture, CandVia::Index, 200, MagicClass::Jpg),
+            cf(MediaSub::Picture, CandVia::Index, 200, MagicClass::Webp),
+        ];
         assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref-import" },
-                None,
-                None
-            ),
-            PlanOutcome::NoDesktopRow
+            best_fitting(Some("image"), &cands).unwrap().magic,
+            MagicClass::Jpg
         );
+    }
 
-        // 3. no_local_path (the Desktop row exists but carries no
-        // usable path; a None fs with a desk row is the same total
-        // classification).
+    #[test]
+    fn choose_candidate_size_bounds() {
+        // 0 bytes never copies; 1 byte does; the 512 MB cap is
+        // inclusive; one byte over it does not.
         assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref-import" },
-                Some(&desk(None, None)),
-                None
+            choose_candidate(
+                Some("file"),
+                &[cf(MediaSub::File, CandVia::Index, 0, MagicClass::Other)]
             ),
-            PlanOutcome::NoLocalPath
+            Choice::SizeExcluded
         );
         assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref" },
-                Some(&desk(Some(""), None)),
-                None
+            choose_candidate(
+                Some("file"),
+                &[cf(MediaSub::File, CandVia::Index, 1, MagicClass::Other)]
             ),
-            PlanOutcome::NoLocalPath
-        );
-
-        // 4. outside_root.
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref" },
-                Some(&desk(Some(r"D:\elsewhere\pic\x.jpg"), None)),
-                Some(&fs(false, MediaSub::Other, true, 10, &jpeg))
-            ),
-            PlanOutcome::OutsideRoot
-        );
-
-        // 5. noise_obfuscated — under fileNoise, before existence:
-        // the contents are never decoded (H-rule).
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("file"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\media\19\ZaloDownloads\fileNoise\x32"), None)),
-                Some(&fs(true, MediaSub::FileNoise, true, 10, &cipher))
-            ),
-            PlanOutcome::NoiseObfuscated
+            Choice::WouldCopyRenderable
         );
         assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("file"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\media\19\ZaloDownloads\fileNoise\x32"), None)),
-                Some(&fs(true, MediaSub::FileNoise, false, 0, &[]))
+            choose_candidate(
+                Some("file"),
+                &[cf(
+                    MediaSub::File,
+                    CandVia::Index,
+                    WOULD_COPY_MAX_BYTES,
+                    MagicClass::Other
+                )]
             ),
-            PlanOutcome::NoiseObfuscated,
-            "fileNoise is about the PATH, not the file"
-        );
-
-        // 6. missing_file.
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\picture\gone.jxl"), None)),
-                Some(&fs(true, MediaSub::Picture, false, 0, &[]))
-            ),
-            PlanOutcome::MissingFile
-        );
-
-        // 7. size_excluded — 0 bytes and over the 512 MB cap (the
-        // would_copy definition's own size clause).
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\picture\empty.jxl"), None)),
-                Some(&fs(true, MediaSub::Picture, true, 0, &[]))
-            ),
-            PlanOutcome::SizeExcluded
-        );
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("video"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\video\huge"), None)),
-                Some(&fs(true, MediaSub::Video, true, WOULD_COPY_MAX_BYTES + 1, &[]))
-            ),
-            PlanOutcome::SizeExcluded
-        );
-
-        // 8. magic_mismatch — image/video are sniffed (M4: JXL is an
-        // image); file/voice never are.
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("image"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\picture\c.jpg"), None)),
-                Some(&fs(true, MediaSub::Picture, true, 10, &cipher))
-            ),
-            PlanOutcome::MagicMismatch
-        );
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: Some("video"), status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\video\v"), None)),
-                Some(&fs(true, MediaSub::Video, true, 10, &jpeg))
-            ),
-            PlanOutcome::MagicMismatch
-        );
-
-        // 9. would_copy — jpeg, JXL in both forms (M4), and the
-        // unsniffed kinds accept anything.
-        for (kind, head) in [
-            (Some("image"), &jpeg[..]),
-            (Some("image"), &jxl_bare[..]),
-            (Some("image"), &jxl_box[..]),
-            (Some("file"), &cipher[..]),
-            (Some("voice"), &cipher[..]),
-            (None, &cipher[..]),
-        ] {
-            assert_eq!(
-                plan_outcome(
-                    &PlanAtt { kind, status: "ref-import" },
-                    Some(&desk(Some(r"D:\Zalo Data\...\picture\a.jxl"), None)),
-                    Some(&fs(true, MediaSub::Picture, true, 1_000, head))
-                ),
-                PlanOutcome::WouldCopy,
-                "kind={:?}",
-                kind
-            );
-        }
-        // The cap boundary itself copies (an unsniffed kind never
-        // fails the magic check, so the size decision is what fires).
-        assert_eq!(
-            plan_outcome(
-                &PlanAtt { kind: None, status: "ref" },
-                Some(&desk(Some(r"D:\Zalo Data\...\video\v"), None)),
-                Some(&fs(true, MediaSub::Video, true, WOULD_COPY_MAX_BYTES, &[]))
-            ),
-            PlanOutcome::WouldCopy,
+            Choice::WouldCopyRenderable,
             "the 512 MB cap is inclusive"
         );
+        assert_eq!(
+            choose_candidate(
+                Some("file"),
+                &[cf(
+                    MediaSub::File,
+                    CandVia::Index,
+                    WOULD_COPY_MAX_BYTES + 1,
+                    MagicClass::Other
+                )]
+            ),
+            Choice::SizeExcluded
+        );
+        // Mixed: one over the cap, one fine — the fine one wins.
+        let cands = [
+            cf(
+                MediaSub::File,
+                CandVia::Index,
+                WOULD_COPY_MAX_BYTES + 1,
+                MagicClass::Zip,
+            ),
+            cf(MediaSub::File, CandVia::Index, 2048, MagicClass::Zip),
+        ];
+        assert_eq!(best_fitting(Some("file"), &cands).unwrap().size, 2048);
+    }
+
+    #[test]
+    fn magic_class_ok_agrees_with_the_byte_sniff() {
+        use crate::shadow::media::magic_ok;
+        let heads: [(MagicClass, Vec<u8>); 12] = [
+            (MagicClass::Jpg, vec![0xFF, 0xD8, 0xFF, 0xE0, 1]),
+            (MagicClass::Png, vec![0x89, 0x50, 0x4E, 0x47, 1]),
+            (MagicClass::Gif, b"GIF89a".to_vec()),
+            (
+                MagicClass::Webp,
+                vec![b'R', b'I', b'F', b'F', 0, 0, 0, 0, b'W', b'E', b'B', b'P'],
+            ),
+            (MagicClass::Jxl, vec![0xFF, 0x0A, 0xE0]),
+            (
+                MagicClass::JxlContainer,
+                vec![
+                    0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+                ],
+            ),
+            (
+                MagicClass::Mp4,
+                vec![0, 0, 0, 0, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'],
+            ),
+            (MagicClass::WebmMkv, vec![0x1A, 0x45, 0xDF, 0xA3, 1]),
+            (MagicClass::Pdf, b"%PDF-1.7\n".to_vec()),
+            (MagicClass::Zip, vec![0x50, 0x4B, 0x03, 0x04, 1]),
+            (MagicClass::Html, b"<!doctype html>".to_vec()),
+            (MagicClass::Other, vec![0x37, 0x9E, 0x2C, 0xF1]),
+        ];
+        for (class, head) in &heads {
+            assert_eq!(
+                &magic_class(head),
+                class,
+                "the fixture head must classify as {class:?}"
+            );
+            for kind in [Some("image"), Some("video"), Some("file"), Some("voice"), None] {
+                assert_eq!(
+                    magic_class_ok(kind, *class),
+                    magic_ok(kind, head),
+                    "class={class:?} kind={kind:?}"
+                );
+            }
+        }
+        // An empty head classifies `other` and never fits image/video
+        // — same verdict from both sides.
+        assert_eq!(
+            magic_class_ok(Some("image"), MagicClass::Other),
+            magic_ok(Some("image"), &[])
+        );
+        assert_eq!(
+            magic_class_ok(Some("video"), MagicClass::Other),
+            magic_ok(Some("video"), &[])
+        );
+    }
+
+    #[test]
+    fn ratio_bucket_boundaries() {
+        // The four buckets, half-open exactly as their labels read:
+        // <0.25, [0.25,0.75), [0.75,1.33] (1.33 inclusive), >1.33.
+        assert_eq!(ratio_bucket(0.24), 0);
+        assert_eq!(ratio_bucket(0.25), 1);
+        assert_eq!(ratio_bucket(0.74), 1);
+        assert_eq!(ratio_bucket(0.75), 2);
+        assert_eq!(ratio_bucket(1.32), 2);
+        assert_eq!(ratio_bucket(1.33), 2);
+        assert_eq!(ratio_bucket(1.34), 3);
+        assert_eq!(ratio_bucket(4.0), 3);
+    }
+
+    #[test]
+    fn winner_labels_are_the_fixed_five() {
+        // An index candidate wins as its <sub> …
+        for (sub, label) in [
+            (MediaSub::Picture, "picture"),
+            (MediaSub::Video, "video"),
+            (MediaSub::Resource, "resource"),
+            (MediaSub::File, "file"),
+        ] {
+            assert_eq!(
+                cf(sub, CandVia::Index, 1, MagicClass::Jpg).winner_label(),
+                label
+            );
+        }
+        // …the localPath route wins as itself, whatever <sub> the
+        // path fell in.
+        for sub in [MediaSub::Picture, MediaSub::Cache, MediaSub::Other] {
+            assert_eq!(
+                cf(sub, CandVia::LocalPath, 1, MagicClass::Jpg).winner_label(),
+                "localPath"
+            );
+        }
     }
 
     // --- the CLI-level fixtures (Windows: the D7 DPAPI wrap) ------------------
@@ -3502,6 +4150,42 @@ mod tests {
                         )
                         .unwrap();
                     }
+                }
+            }
+            dir
+        }
+
+        /// A FAKE shadow store (raw key) for the v2 plan (batch 27e):
+        /// import-sourced messages, plus attachment rows at explicit
+        /// `idx` values — including messages WITHOUT any attachment
+        /// row (the msgType-18 video gap 27b must fill) and
+        /// multi-attachment messages.
+        fn synthetic_store_v2(
+            msgs: &[&str],
+            atts: &[(u8, &str, &str, Option<&str>, &str)],
+        ) -> PathBuf {
+            let dir = temp_dir("store27e");
+            let key = Zeroizing::new(sqlcipher::generate_key().unwrap());
+            sqlcipher::save_key(&key, &crate::shadow::key_file(&dir)).unwrap();
+            {
+                let conn =
+                    sqlcipher::open_with_key(&crate::shadow::db_file(&dir), &key).unwrap();
+                crate::shadow::schema::apply(&conn).unwrap();
+                for mid in msgs {
+                    conn.execute(
+                        "INSERT INTO messages (msg_id, conv_id, ts, type, payload_json, source)
+                         VALUES (?1, 'cM', 1, 1, '{}', 'import')",
+                        [mid],
+                    )
+                    .unwrap();
+                }
+                for (idx, mid, kind, url, status) in atts {
+                    conn.execute(
+                        "INSERT INTO attachments (msg_id, idx, kind, url, status)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![mid, idx, kind, url, status],
+                    )
+                    .unwrap();
                 }
             }
             dir
@@ -3902,99 +4586,157 @@ mod tests {
         }
 
         #[test]
-        fn plan_report_classifies_a_synthetic_store_and_census() {
-            let root = synthetic_media_root();
+        fn plan_report_v2_matches_by_cache_name_keys() {
+            // --- the ZaloDownloads tree (all synthetic, under temp) ---
+            let root = temp_dir("root27e");
             let uid_dir = root.join("media").join("19");
-            let pic_file = uid_dir
-                .join("ZaloDownloads")
-                .join("picture")
-                .join(format!("p{DTTM}_00112233445566778899aabbccddeeff.jxl"));
-            let noise = uid_dir
-                .join("ZaloDownloads")
-                .join("fileNoise")
-                .join("0123456789abcdef0123456789abcdef");
-            std::fs::create_dir_all(noise.parent().unwrap()).unwrap();
-            std::fs::write(&noise, [0x37u8, 0x9E, 0x2C, 0xF1, 1]).unwrap();
-            let vfile = uid_dir
-                .join("ZaloDownloads")
-                .join("video")
-                .join(format!("{DTTM}"));
+            let pic = uid_dir.join("ZaloDownloads").join("picture");
+            let res = uid_dir.join("ZaloDownloads").join("resource");
+            let vid = uid_dir.join("ZaloDownloads").join("video");
+            let fil = uid_dir.join("ZaloDownloads").join("file");
+            let noise = uid_dir.join("ZaloDownloads").join("fileNoise");
+            for dir in [&pic, &res, &vid, &fil, &noise] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            // The msg ids are 13-digit runs (the cache-name keys).
+            let id_a = format!("{DTTM}"); // picture + resource copies
+            let id_b = format!("{}", DTTM + 2); // jxl-only image
+            let id_c = format!("{}", DTTM + 10); // msgType 18, NO attachment row
+            let id_d = format!("{}", DTTM + 20); // magic_mismatch (mp4 in picture)
+            let id_e = format!("{}", DTTM + 30); // size_excluded (0-byte file)
+            let id_f = format!("{}", DTTM + 40); // no_candidate
+            let id_g = format!("{}", DTTM + 50); // multi-image (two attachments)
+            let id_i = format!("{}", DTTM + 60); // already downloaded
+            let id_j = format!("{}", DTTM + 70); // the localPath route
+            let id_k = format!("{}", DTTM + 80); // fileNoise skip
+            let id_m = format!("{}", DTTM + 11); // msgType 18 WITH a row
+            let cli_a = format!("{}", DTTM + 9); // A's cliMsgId — the resource key
 
-            // Desktop rows: a photo row (the JXL) for msg 1; a video
-            // row (relative + folderPath) for msg 2; a fileNoise row
-            // for msg 3; a video row (mp4) for msg 4 whose message is
-            // imported but has NO attachment row (no_attachment_row,
-            // msgType 18); a video row for msg 5 whose message was
-            // never imported (not_in_shadow, msgType 18); a photo row
-            // for msg 6 pointing outside the root; msg 9 with no
-            // localPath; msg 10 pointing at a missing file.
+            std::fs::write(
+                pic.join(format!("p{id_a}_00112233445566778899aabbccddeeff.jxl")),
+                [0xFFu8, 0x0A, 0xE0, 0x0D],
+            )
+            .unwrap(); // 4B JXL — A's picture
+            std::fs::write(
+                pic.join(format!("p{id_b}_00112233445566778899aabbccddee01.jxl")),
+                [0xFFu8, 0x0A, 1, 2, 3, 4],
+            )
+            .unwrap(); // 6B JXL — B
+            std::fs::write(
+                pic.join(format!("p{id_d}_00112233445566778899aabbccddee02.dat")),
+                [0u8, 0, 0, 0, b'f', b't', b'y', b'p', 1, 2],
+            )
+            .unwrap(); // 10B mp4 magic — D's magic_mismatch
+            std::fs::write(
+                pic.join(format!("p{id_g}_00112233445566778899aabbccddee03.jxl")),
+                [0xFFu8, 0x0A, 1, 2, 3, 4, 5],
+            )
+            .unwrap(); // 7B JXL — G (two attachments share it)
+            std::fs::write(
+                pic.join(format!("p{id_i}_00112233445566778899aabbccddee04.jpg")),
+                [0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2],
+            )
+            .unwrap(); // 6B jpg — I (already downloaded)
+            let plain = pic.join("plainname.jpg"); // unkeyed; J's localPath
+            std::fs::write(&plain, [0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]).unwrap(); // 8B jpg
+            std::fs::write(pic.join("index.rescache"), b"opaque").unwrap();
+            std::fs::write(
+                res.join(format!("{cli_a}_00ff00112233445566778899aabbccdd.jpg")),
+                [0xFFu8, 0xD8, 0xFF, 0xE0, 1],
+            )
+            .unwrap(); // 5B jpg — A's resource (the cliMsgId key)
+            std::fs::write(&vid.join(&id_c), [0u8, 0, 0, 0, b'f', b't', b'y', b'p', 1, 2])
+                .unwrap(); // 10B mp4 — C
+            std::fs::write(
+                &vid.join(&id_m),
+                [0u8, 0, 0, 0, b'f', b't', b'y', b'p', 1, 2, 3, 4],
+            )
+            .unwrap(); // 12B mp4 — M
+            std::fs::write(fil.join("readme.pdf"), b"%PDF-1.7\n").unwrap(); // unkeyed
+            let empty = fil.join("empty.bin"); // unkeyed, 0 bytes
+            std::fs::write(&empty, b"").unwrap(); // E's size_excluded
+            let obf = noise.join("0123456789abcdef0123456789abcdef");
+            std::fs::write(&obf, [0x37u8, 0x9E, 0x2C, 0xF1, 1]).unwrap(); // never decoded
+
+            // Desktop rows: J's localPath points at the unkeyed
+            // plain-name picture; K's is RELATIVE (resolved via
+            // folderPath) and lands under fileNoise — counted by the
+            // probe, never decoded, so it can never be a candidate.
             let rows = format!(
                 "INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('1', 'c1', 2, '{jxl}', NULL, 'pv', 4, {DTTM}, 'x'); \
+                 ('{id_a}', '{cli_a}', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('2', 'c2', 18, 'ZaloDownloads\\\\video\\\\{DTTM}', '{uid}', NULL, 10, NULL, \
-                  'x'); \
+                 ('{id_b}', 'clib', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('3', 'c3', 19, '{noise}', NULL, NULL, 5, NULL, 'x'); \
+                 ('{id_c}', 'clic', 18, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('4', 'c4', 18, '{vfile}', NULL, NULL, 10, NULL, 'x'); \
+                 ('{id_d}', 'clid', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('5', 'c5', 18, '{vfile}', NULL, NULL, 10, NULL, 'x'); \
+                 ('{id_e}', 'clie', 19, '{empty_p}', NULL, NULL, NULL, NULL, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('6', 'c6', 2, 'E:\\\\elsewhere\\\\p.jpg', NULL, NULL, NULL, NULL, 'x'); \
+                 ('{id_f}', 'clif', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('9', 'c9', 2, NULL, NULL, NULL, NULL, NULL, 'x'); \
+                 ('{id_g}', 'clig', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
                  INSERT INTO message \
                  (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
                   sendDttm, message) VALUES \
-                 ('10', 'c10', 2, '{gone}', NULL, NULL, NULL, NULL, 'x');",
-                jxl = q(&pic_file.to_string_lossy()),
-                uid = q(&uid_dir.to_string_lossy()),
-                noise = q(&noise.to_string_lossy()),
-                vfile = q(&vfile.to_string_lossy()),
-                gone = q(
-                    &uid_dir
-                        .join("ZaloDownloads")
-                        .join("picture")
-                        .join("gone.jxl")
-                        .to_string_lossy()
-                ),
+                 ('{id_i}', 'clii', 2, NULL, NULL, NULL, NULL, {DTTM}, 'x'); \
+                 INSERT INTO message \
+                 (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
+                  sendDttm, message) VALUES \
+                 ('{id_j}', 'clij', 2, '{plain_p}', NULL, NULL, NULL, NULL, 'x'); \
+                 INSERT INTO message \
+                 (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
+                  sendDttm, message) VALUES \
+                 ('{id_k}', 'clik', 19, 'ZaloDownloads\\\\fileNoise\\\\0123456789abcdef0123456789abcdef', \
+                  '{uid_p}', NULL, NULL, NULL, 'x'); \
+                 INSERT INTO message \
+                 (msgId, cliMsgId, msgType, localPath, folderPath, previewThumb, fileSize, \
+                  sendDttm, message) VALUES \
+                 ('{id_m}', 'clim', 18, NULL, NULL, NULL, NULL, {DTTM}, 'x');",
+                empty_p = q(&empty.to_string_lossy()),
+                plain_p = q(&plain.to_string_lossy()),
+                uid_p = q(&uid_dir.to_string_lossy()),
             );
             let (snap, key) = synthetic_snapshot(PASS, &rows);
 
-            // The shadow store: msg 4 is an imported message WITHOUT
-            // an attachment row; msg 5 is not in the store at all.
-            // Attachments: msg1 JXL would_copy; msg2 mp4 would_copy
-            // (relative resolved via folderPath); msg3 fileNoise;
-            // msg6 outside_root; msg7 no desktop row; msg8
-            // already_downloaded; msg9 no localPath; msg10
-            // missing_file; ghost no desktop row.
-            let store = synthetic_store(&[
-                ("4", "unused", None, "unused"),
-                ("1", "image", Some("https://fake-stal.zdn.vn/a.jpg"), "ref-import"),
-                ("2", "video", Some("https://fake-stal.zdn.vn/v.mp4"), "ref"),
-                ("3", "file", Some("https://fake-stal.zdn.vn/f.bin"), "ref"),
-                ("6", "image", Some("https://fake-stal.zdn.vn/p.jpg"), "ref"),
-                ("7", "image", Some("https://fake-stal.zdn.vn/q.jpg"), "failed"),
-                ("8", "image", Some("https://fake-stal.zdn.vn/r.jpg"), "downloaded"),
-                ("9", "image", Some("https://fake-stal.zdn.vn/s.jpg"), "ref"),
-                ("10", "image", Some("https://fake-stal.zdn.vn/t.jpg"), "ref"),
-                ("ghost", "image", Some("https://fake-stal.zdn.vn/u.jpg"), "ref"),
-            ]);
+            // The shadow store: C is an import-sourced msgType-18
+            // message WITHOUT an attachment row (the one 27b must
+            // create); G carries TWO image attachments; I is
+            // already downloaded.
+            let store = synthetic_store_v2(
+                &[
+                    &id_a, &id_b, &id_c, &id_d, &id_e, &id_f, &id_g, &id_i, &id_j, &id_k,
+                    &id_m,
+                ],
+                &[
+                    (0, &id_a, "image", Some("https://fake-stal.zdn.vn/a.jpg"), "ref-import"),
+                    (0, &id_b, "image", Some("https://fake-stal.zdn.vn/b.jpg"), "ref-import"),
+                    (0, &id_d, "image", Some("https://fake-stal.zdn.vn/d.jpg"), "ref"),
+                    (0, &id_e, "file", Some("https://fake-stal.zdn.vn/e.bin"), "ref"),
+                    (0, &id_f, "image", Some("https://fake-stal.zdn.vn/f.jpg"), "ref"),
+                    (0, &id_g, "image", Some("https://fake-stal.zdn.vn/g0.jpg"), "ref-import"),
+                    (1, &id_g, "image", Some("https://fake-stal.zdn.vn/g1.jpg"), "ref-import"),
+                    (0, &id_i, "image", Some("https://fake-stal.zdn.vn/i.jpg"), "downloaded"),
+                    (0, &id_j, "image", Some("https://fake-stal.zdn.vn/j.jpg"), "ref"),
+                    (0, &id_k, "file", Some("https://fake-stal.zdn.vn/k.bin"), "ref"),
+                    (0, &id_m, "video", Some("https://fake-stal.zdn.vn/m.mp4"), "ref-import"),
+                ],
+            );
 
             let uin = sha12(PASS.as_bytes());
             let mut a = args_for(&snap, &uin, &key);
@@ -4010,65 +4752,163 @@ mod tests {
             );
             assert!(
                 joined.contains(
-                    "local-media-plan: import-sourced attachments: rows=9 desktop_rows_matched=5 \
+                    "local-media-plan: import-sourced attachments: rows=11 desktop_rows_matched=11 \
                      kinds=3"
                 ),
                 "{joined}"
             );
-            // image: msg1 would_copy (JXL is an image, M4), msg6
-            // outside_root, msg7+ghost no_desktop_row, msg8
-            // already_downloaded, msg9 no_local_path, msg10
-            // missing_file (under the root, but gone).
+            // The single walk: 13 files seen (one rescache skipped),
+            // 8 indexed candidates, no cap hit.
             assert!(
                 joined.contains(
-                    "local-media-plan: kind=image rows=7 already_downloaded=1 would_copy=1 \
-                     magic_mismatch=0 missing_file=1 no_local_path=1 noise_obfuscated=0 \
-                     no_desktop_row=2 outside_root=1 size_excluded=0"
+                    "local-media-plan: candidate walk: uids=1 uids_with_zalodownloads=1 \
+                     files_seen=13 rescache_skipped=1 indexed=8 cap=200000 cap_hit=no"
                 ),
                 "{joined}"
             );
-            // video: msg2 would_copy (relative resolved via
-            // folderPath).
+            // The index totals: every unkeyed file counts (the
+            // plain-name picture, the pdf and the 0-byte bin).
             assert!(
                 joined.contains(
-                    "local-media-plan: kind=video rows=1 already_downloaded=0 would_copy=1 \
-                     magic_mismatch=0 missing_file=0 no_local_path=0 noise_obfuscated=0 \
-                     no_desktop_row=0 outside_root=0 size_excluded=0"
+                    "local-media-plan: index sub=picture files=6 keyed=5 unkeyed=1 keys=5 \
+                     keys_needed=5"
                 ),
                 "{joined}"
             );
-            // file: msg3 noise_obfuscated.
             assert!(
                 joined.contains(
-                    "local-media-plan: kind=file rows=1 already_downloaded=0 would_copy=0 \
-                     magic_mismatch=0 missing_file=0 no_local_path=0 noise_obfuscated=1 \
-                     no_desktop_row=0 outside_root=0 size_excluded=0"
+                    "local-media-plan: index sub=video files=2 keyed=2 unkeyed=0 keys=2 \
+                     keys_needed=2"
                 ),
                 "{joined}"
             );
-            // would_copy bytes: the 4-byte JXL + the 10-byte mp4.
             assert!(
-                joined.contains("local-media-plan: total would_copy bytes=14"),
+                joined.contains(
+                    "local-media-plan: index sub=resource files=1 keyed=1 unkeyed=0 keys=1 \
+                     keys_needed=1"
+                ),
                 "{joined}"
             );
-            // The Goal's census: msg4 is an imported video row with a
-            // local file and no attachment row; msg5's message is not
-            // in the shadow at all.
             assert!(
-                joined
-                    .contains("local-media-plan:   msgType=18 no_attachment_row=1 not_in_shadow=1"),
+                joined.contains(
+                    "local-media-plan: index sub=file files=2 keyed=0 unkeyed=2 keys=0 \
+                     keys_needed=0"
+                ),
+                "{joined}"
+            );
+            // file: E size_excluded (a 0-byte localPath target) and
+            // K no_candidate (the relative fileNoise localPath —
+            // resolved via folderPath, then skipped, never decoded).
+            assert!(
+                joined.contains(
+                    "local-media-plan: kind=file rows=2 outcomes already_downloaded=0(bytes=0) \
+                     would_copy_renderable=0(bytes=0) would_copy_jxl_only=0(bytes=0) \
+                     magic_mismatch=0(bytes=0) size_excluded=1(bytes=0) no_candidate=1(bytes=0)"
+                ),
+                "{joined}"
+            );
+            // image: A renderable via the resource copy (rule 1), B
+            // and G×2 jxl-only, D magic_mismatch (an mp4-magic
+            // picture file), F no_candidate, I already downloaded,
+            // J the localPath route.
+            assert!(
+                joined.contains(
+                    "local-media-plan: kind=image rows=8 outcomes already_downloaded=1(bytes=0) \
+                     would_copy_renderable=2(bytes=13) would_copy_jxl_only=3(bytes=20) \
+                     magic_mismatch=1(bytes=0) size_excluded=0(bytes=0) no_candidate=1(bytes=0)"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-plan: kind=image won picture:3 video:0 resource:1 file:0 \
+                     localPath:1"
+                ),
+                "{joined}"
+            );
+            // video: M would_copy via the video sub.
+            assert!(
+                joined.contains(
+                    "local-media-plan: kind=video rows=1 outcomes already_downloaded=0(bytes=0) \
+                     would_copy_renderable=1(bytes=12) would_copy_jxl_only=0(bytes=0) \
+                     magic_mismatch=0(bytes=0) size_excluded=0(bytes=0) no_candidate=0(bytes=0)"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-plan: kind=video won picture:0 video:1 resource:0 file:0 \
+                     localPath:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-plan: total would_copy bytes=45"),
+                "{joined}"
+            );
+            // Multi-image: A has TWO fitting candidates (the
+            // picture JXL and the resource JPG); D and F have none;
+            // G's two attachments share one candidate each; I is
+            // decided before the lookup and never counted here.
+            assert!(
+                joined.contains(
+                    "local-media-plan: image attachments (kind=image, not already downloaded): \
+                     rows=7 fitting histogram 0:2 1:4 2:1 3+:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(
+                    "local-media-plan: image messages: messages=6 atts_vs_fitting_differ=3"
+                ),
+                "{joined}"
+            );
+            // Picture vs resource (A): the 5-byte resource jpg over
+            // the 4-byte picture jxl → 1.25, and the jxl/jpg pair.
+            assert!(
+                joined.contains(
+                    "local-media-plan: picture vs resource (both fitting): pairs=1 ratio \
+                     <0.25:0 0.25–0.75:0 0.75–1.33:1 >1.33:0"
+                ),
+                "{joined}"
+            );
+            assert!(
+                joined.contains("local-media-plan: picture vs resource magic pairs jxl/jpg=1"),
+                "{joined}"
+            );
+            // Videos: C (NO attachment row — the one batch 27b must
+            // create) and M (with one).
+            assert!(
+                joined.contains(
+                    "local-media-plan: videos (import messages with Desktop msgType 18): \
+                     messages=2 with_fitting_candidate=2 bytes=22 no_attachment_row=1"
+                ),
                 "{joined}"
             );
             assert!(
                 joined.contains("local-media-plan: done (DRY RUN ONLY — nothing was written)"),
                 "{joined}"
             );
-            // H-rule: no path value, file name, uid, msgId or message
-            // text anywhere.
+            // H-rule self-check: no path value, file name, uid, msgId,
+            // cliMsgId, url or message text anywhere.
             for banned in [
-                "1763600000000_0011",
-                "elsewhere",
-                "0123456789abcdef0123456789abcdef",
+                id_a.as_str(),
+                id_b.as_str(),
+                id_c.as_str(),
+                id_d.as_str(),
+                id_e.as_str(),
+                id_f.as_str(),
+                id_g.as_str(),
+                id_i.as_str(),
+                id_j.as_str(),
+                id_k.as_str(),
+                id_m.as_str(),
+                cli_a.as_str(),
+                "clib",
+                "plainname",
+                "readme",
+                "empty.bin",
+                "0123456789abcdef",
                 "https://",
                 "'x'",
             ] {
@@ -4303,9 +5143,9 @@ mod tests {
             );
             assert!(
                 joined.contains(
-                    "local-media-plan: kind=image rows=1 already_downloaded=0 would_copy=1 \
-                     magic_mismatch=0 missing_file=0 no_local_path=0 noise_obfuscated=0 \
-                     no_desktop_row=0 outside_root=0 size_excluded=0"
+                    "local-media-plan: kind=image rows=1 outcomes already_downloaded=0(bytes=0) \
+                     would_copy_renderable=0(bytes=0) would_copy_jxl_only=1(bytes=4) \
+                     magic_mismatch=0(bytes=0) size_excluded=0(bytes=0) no_candidate=0(bytes=0)"
                 ),
                 "{joined}"
             );

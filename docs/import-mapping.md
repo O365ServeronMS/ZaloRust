@@ -1256,3 +1256,59 @@ local-media-probe: picture-name hash: md5=unavailable (no MD5 implementation exi
 A later batch may revisit it only with an approved dependency (or a
 reviewer-vetted hand-rolled MD5, which the current brief does not
 allow).
+
+### 10.6 The plan matches by cache name keys (batch 27e, DRY RUN ONLY)
+
+The v1 plan (§10.3) followed `localPath` only. Measured on the real
+cache with the 27d probe, the cache file NAMES carry the message key:
+`picture` = `<letter><13 digits>_<32 alnum>.jxl|jpg` and `video` =
+`<13 digits>`, both equal to the Desktop `message.msgId` (which is the
+shadow `messages.msg_id` of an import row); `resource` files are named
+by the 13-digit `message.cliMsgId`. The plan v2 therefore builds ONE
+in-memory candidate index from a single read-only walk of
+`<root>\media\*\ZaloDownloads\{picture,video,resource,file}` (the 27d
+walk: `*.rescache` skipped, 200 000-file cap) and chooses per
+attachment:
+
+- **Keys.** picture/video: the one 13-digit run of the stem is the
+  msgId; resource: it is the cliMsgId (the plan's Desktop scan now
+  also reads `cliMsgId`, tolerantly as in 27c). A stem with zero or
+  more than one 13-digit run is `unkeyed` (counted per sub).
+  `file` files are real-named and stay unkeyed here; `fileNoise` is
+  never indexed or decoded. The Desktop row's own `localPath`
+  (batch 27) stays as one more candidate source when it resolves under
+  the root.
+- **`choose_candidate(kind, cands)`** (pure). Keep candidates whose
+  magic fits the kind (`media::magic_ok`: image jpg/png/gif/webp/jxl,
+  video mp4/webm, file and voice any), drop size 0 and size above
+  512 MB. Preference: (1) a renderable copy beats JXL (the WebView2
+  archive viewer cannot render JPEG XL), (2) picture/video before
+  resource, (3) the larger size. Outcomes: `already_downloaded`
+  (decided before the lookup), `would_copy_renderable`,
+  `would_copy_jxl_only`, `magic_mismatch`, `size_excluded`,
+  `no_candidate`.
+- **What the files are.** Only the first 16 bytes and
+  `metadata().len()` are read. The H-rule holds: counts, fixed
+  vocabularies, buckets and booleans only. No writes.
+
+Report lines (all counts; `<w>` = `picture|video|resource|file|localPath`):
+
+```
+local-media-plan: kind=<k> rows=<n> outcomes already_downloaded=<n>(bytes=<b>) would_copy_renderable=<n>(bytes=<b>) would_copy_jxl_only=<n>(bytes=<b>) magic_mismatch=<n>(bytes=<b>) size_excluded=<n>(bytes=<b>) no_candidate=<n>(bytes=<b>)
+local-media-plan: kind=<k> won picture:<n> video:<n> resource:<n> file:<n> localPath:<n>
+local-media-plan: total would_copy bytes=<b>
+local-media-plan: image attachments (kind=image, not already downloaded): rows=<n> fitting histogram 0:<n> 1:<n> 2:<n> 3+:<n>
+local-media-plan: image messages: messages=<n> atts_vs_fitting_differ=<n>
+local-media-plan: picture vs resource (both fitting): pairs=<n> ratio <0.25:<n> 0.25–0.75:<n> 0.75–1.33:<n> >1.33:<n>
+local-media-plan: picture vs resource magic pairs <picMagic>/<resMagic>=<n> ... | none
+local-media-plan: videos (import messages with Desktop msgType 18): messages=<n> with_fitting_candidate=<n> bytes=<b> no_attachment_row=<n>
+local-media-plan: candidate walk: ... cap_hit=yes|no
+local-media-plan: index sub=<picture|video|resource|file> files=<n> keyed=<n> unkeyed=<n> keys=<n> keys_needed=<n>
+```
+
+The picture-vs-resource ratio is resource size over picture size; it
+tells whether `resource` is a thumbnail (`<0.25`) or the original.
+`no_attachment_row` counts msgType-18 videos that have no attachment
+row, which batch 27b will have to create. Attachment-index to file
+ordering is unknown, so multi-image messages are only counted
+(`atts_vs_fitting_differ`), never matched one to one.
