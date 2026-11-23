@@ -11,46 +11,118 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# Batch 27b M2: the deployed app is a DEBUG build, and the archive viewer
-# decodes JPEG XL (jxl-oxide) and encodes a PNG per image. Unoptimised those
-# crates are an order of magnitude too slow, so they build at opt-level 3 in
-# dev profiles. Everything else stays at the dev defaults.
+# Batch 27b M2 / batch 28 M4: the deployed app is a DEBUG build, and the
+# archive viewer decodes JPEG XL (jxl-oxide) / JPEG / PNG (image), resizes
+# and encodes WebP (libwebp, a bundled C build). Unoptimised those crates
+# are an order of magnitude too slow, so they build at opt-level 3 in dev
+# profiles, WITHOUT debug assertions and overflow checks (both are on in the
+# dev profile and cost another ~2x inside the pixel loops; the crates are
+# audited upstream and the app never relies on their panics). libwebp-sys
+# is C: its `cc` build reads the profile's opt-level, so without the
+# override it is compiled -O0. Everything else stays at the dev defaults.
+# (A generic function of these crates that the app instantiates itself, such
+# as `image::imageops::resize`, is compiled at the APP's opt-level: the app
+# therefore calls only the non-generic entry points, see shadow/img_derive.)
 [profile.dev.package.jxl-oxide]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-oxide-common]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-bitstream]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-coding]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-color]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-frame]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-grid]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-image]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-jbr]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-modular]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-render]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-threadpool]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.jxl-vardct]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.png]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.miniz_oxide]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.fdeflate]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.crc32fast]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
 [profile.dev.package.simd-adler32]
 opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package."brotli-decompressor@5.0.3"]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.image]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.zune-core]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.webp]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.libwebp-sys]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.bytemuck]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
 
 [lib]
 name = "zalors_lib"
@@ -69,12 +141,15 @@ ureq = { version = "3", default-features = false, features = ["rustls", "socks-p
 semver = "1"
 sha2 = "0.10"
 # Batch 27b M2: the archive viewer shows JPEG XL (WebView2 cannot decode it)
-# by decoding to PNG with this pure-Rust decoder. default-features = false
+# by decoding it with this pure-Rust decoder (batch 28: to WebP
+# derivatives, see below). default-features = false
 # drops rayon (single-threaded decode, no CMS) -- the only new crate family.
 jxl-oxide = { version = "0.12.6", default-features = false }
-# Already in Cargo.lock through tauri (0.18.1); named directly, pinned to
-# that version, to encode the decoded JXL frame. Not a new crate.
-png = "=0.18.1"
+# Batch 28: lossy WebP derivatives (thumb + view) of the archive images.
+# `webp` wraps the bundled libwebp C build (cc); `image` (already in the
+# lockfile through tauri) decodes JPEG/PNG and resizes. Nothing else new.
+webp = { version = "=0.3.1", default-features = false }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
 
 # --- Shadow DB (feat/shadow-db-rebuild) --------------------------------------
 # SQLCipher storage for the shadow DB. `bundled-sqlcipher-vendored-openssl`

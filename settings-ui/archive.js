@@ -21,8 +21,31 @@
   }
 
   // Media URL for one attachment: ids only, never a path.
-  function mediaUrl(msgId, idx) {
-    return mediaBase() + "/media/" + encodeURIComponent(String(msgId)) + "/" + Number(idx);
+  // Batch 28: an image is served as a WebP derivative; `variant` is
+  // "thumb" (long edge <= 480), "view" (<= 2048) or "orig" (the full
+  // size of a JPEG XL; the original bytes for JPEG/PNG). No variant =
+  // no query, which the server reads as "view". Anything else is
+  // dropped, so a URL never carries a value the server would refuse.
+  var VARIANTS = { thumb: 1, view: 1, orig: 1 };
+  function mediaUrl(msgId, idx, variant) {
+    var url = mediaBase() + "/media/" + encodeURIComponent(String(msgId)) + "/" + Number(idx);
+    if (typeof variant === "string" && Object.prototype.hasOwnProperty.call(VARIANTS, variant)) {
+      url += "?v=" + variant;
+    }
+    return url;
+  }
+
+  // The one rule for an <img> in a message bubble (.att-media is at
+  // most 320 CSS px wide, see archive.css): when that box needs no more
+  // than 480 device pixels (320 x devicePixelRatio <= 480, i.e. a 100%
+  // or 125%/150% display) the 480 px thumb is sharp enough; on denser
+  // displays the 2048 px view is used.
+  var BUBBLE_CSS_MAX_PX = 320;
+  var THUMB_EDGE_PX = 480;
+  function imageVariant(dpr) {
+    var d = Number(dpr);
+    if (!(d > 0)) d = 1;
+    return BUBBLE_CSS_MAX_PX * d <= THUMB_EDGE_PX ? "thumb" : "view";
   }
 
   function isRecalled(msg) {
@@ -81,7 +104,7 @@
       img.className = "att-media";
       img.alt = "";
       img.loading = "lazy";
-      img.src = mediaUrl(msgId, a.idx);
+      img.src = mediaUrl(msgId, a.idx, imageVariant(root.devicePixelRatio));
       wrap.appendChild(img);
     } else if (a.has_local && a.kind === "video") {
       var vid = doc.createElement("video");
@@ -191,6 +214,7 @@
   var api = {
     mediaBase: mediaBase,
     mediaUrl: mediaUrl,
+    imageVariant: imageVariant,
     isRecalled: isRecalled,
     isGone: isGone,
     fmtTs: fmtTs,

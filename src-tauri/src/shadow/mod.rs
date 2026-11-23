@@ -71,7 +71,9 @@ pub mod import_apply;
 /// classification against a temp COPY of the shadow store, and the
 /// `sync_cursors` delta groundwork.
 pub mod import_map;
-pub mod jxl_png;
+pub mod derive_cli;
+pub mod img_derive;
+pub mod jxl_decode;
 pub mod media;
 /// Batch 26 M1 (media for imported history): the `zalors media` CLI —
 /// a READ-ONLY shape tool over the media queue (census of attachments

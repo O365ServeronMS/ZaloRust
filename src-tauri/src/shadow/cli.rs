@@ -159,7 +159,21 @@ modes (one per run; everything except --apply is dry-run only):
                              have none, only when a video candidate is
                              selected. Without it videos are only counted
   --limit <N>                with --local-media-copy: stop after N copies (a
-                             first small real run)
+                             first small real run); with --media-derivatives:
+                             process only the first N distinct files
+  --media-derivatives        batch 28: pre-warm the WebP derivative cache
+                             (thumb 480 px q75, view 2048 px q80) of every
+                             downloaded image attachment (JPEG XL, JPEG,
+                             PNG) into <media root>\\cache\\img\\. The store
+                             opens READ-ONLY (the app may keep running); the
+                             only writes are cache files (temp + rename).
+                             Idempotent: a second run builds 0. Disk check
+                             first. Counts only in the report. Needs
+                             --target (no snapshot flags, no --apply).
+  --variants <list>          with --media-derivatives: comma list of thumb,
+                             view (default thumb,view)
+  --threads <N>              with --media-derivatives: worker threads
+                             (default: cores - 2, at least 1; max 64)
   --apply                    2.5, the guarded write step (see the
                              preconditions at the bottom) — needs
                              --mapping, --target and --i-have-a-backup-plan
@@ -347,6 +361,15 @@ pub struct ImportArgs {
     /// memory only, never printed) BEFORE the shape folding. Valid
     /// only with `--content-shape`; the output stays shape only.
     pub decrypt_basic: bool,
+    /// `--media-derivatives` (batch 28 M3): pre-warm the WebP
+    /// derivative cache. Its own mode; read-only on the store;
+    /// requires `--target` (no snapshot flags).
+    pub media_derivatives: bool,
+    /// `--variants thumb,view` (batch 28): the variants to build;
+    /// empty = both. `orig` is refused here (it is built on demand).
+    pub variants: Vec<super::img_derive::Variant>,
+    /// `--threads N` (batch 28): worker threads, 1..=64.
+    pub threads: Option<u32>,
     /// `--apply`: write into the shadow DB (guarded by the
     /// preconditions in `import_apply`).
     pub apply: bool,
@@ -385,6 +408,35 @@ fn validate_uin_hash(flag: &str, value: &str) -> Result<String, String> {
         ));
     }
     Ok(value.to_string())
+}
+
+/// Parse the `--variants` value: a comma list of `thumb` / `view`, no
+/// duplicates, no empty items. `orig` is refused: the full-size JXL
+/// conversion is built on demand, not pre-warmed.
+fn parse_variants(raw: &str) -> Result<Vec<super::img_derive::Variant>, String> {
+    use super::img_derive::Variant;
+    let mut out: Vec<Variant> = Vec::new();
+    for item in raw.split(',') {
+        let v = match Variant::parse(item) {
+            Some(Variant::Orig) => {
+                return Err(
+                    "--variants: orig is built on demand, pre-warm covers thumb and view only"
+                        .into(),
+                )
+            }
+            Some(v) => v,
+            None => {
+                return Err(format!(
+                    "--variants must be a comma list of thumb,view, got {raw:?}"
+                ))
+            }
+        };
+        if out.contains(&v) {
+            return Err(format!("--variants lists {} twice", v.name()));
+        }
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// Parse the `--cipher-compat` value: only 3 or 4.
@@ -430,6 +482,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
     let (mut local_media_probe, mut local_media_plan) = (false, false);
     let (mut local_media_copy, mut include_video) = (false, false);
     let mut limit: Option<u64> = None;
+    let mut media_derivatives = false;
+    let mut variants_raw: Option<String> = None;
+    let mut threads: Option<u32> = None;
     let mut local_media_root: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
 
@@ -452,6 +507,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                 | "--by"
                 | "--local-media-root"
                 | "--limit"
+                | "--variants"
+                | "--threads"
         );
         if value_flag {
             let value =
@@ -489,6 +546,18 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
                             format!("--limit must be a whole number >= 1, got {value:?}")
                         })?;
                     set_once(&mut limit, flag, n)?
+                }
+                // Batch 28: the pre-warm's variant list and worker count.
+                "--variants" => set_once(&mut variants_raw, flag, value.to_string())?,
+                "--threads" => {
+                    let n: u32 = value
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=64).contains(n))
+                        .ok_or_else(|| {
+                            format!("--threads must be a whole number 1..=64, got {value:?}")
+                        })?;
+                    set_once(&mut threads, flag, n)?
                 }
                 // Batch 14 N1: repeatable, max 10 per run. The spec
                 // shape (kind, table, column) is validated HERE, pure;
@@ -551,6 +620,8 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             // Batch 27b: the copy mode and its video rider.
             "--local-media-copy" => set_bool_once(&mut local_media_copy, flag)?,
             "--include-video" => set_bool_once(&mut include_video, flag)?,
+            // Batch 28: the derivative pre-warm.
+            "--media-derivatives" => set_bool_once(&mut media_derivatives, flag)?,
             "--from-zalo-pc" => {
                 return Err(
                     "unknown flag --from-zalo-pc: renamed to --from-snapshot \
@@ -565,6 +636,62 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
 
     if dry_run && apply {
         return Err("--dry-run and --apply are mutually exclusive".into());
+    }
+    // Batch 28 M3: --media-derivatives is its own mode — read-only on
+    // the store, writes only cache files, so it takes no snapshot
+    // flags and no --apply gate.
+    let variants: Vec<super::img_derive::Variant> = match &variants_raw {
+        None => Vec::new(),
+        Some(raw) => parse_variants(raw)?,
+    };
+    if media_derivatives {
+        let conflicting = [
+            ("--apply", apply),
+            ("--dry-run", dry_run),
+            ("--i-have-a-backup-plan", i_have_a_backup_plan),
+            ("--inventory", inventory),
+            ("--mapping", mapping.is_some()),
+            ("--shadow-copy", shadow_copy.is_some()),
+            ("--delta", delta),
+            ("--media-plan", media_plan),
+            ("--distinct", !distinct.is_empty()),
+            ("--content-shape", content_shape.is_some()),
+            ("--local-media-probe", local_media_probe),
+            ("--local-media-plan", local_media_plan),
+            ("--local-media-copy", local_media_copy),
+            ("--local-media-root", local_media_root.is_some()),
+            ("--include-video", include_video),
+            ("--out", out.is_some()),
+            ("--unmapped-as-raw", unmapped_as_raw),
+            ("--all-dbs", all_dbs),
+            ("--own-uid-from-settings", own_uid_from_settings),
+            ("--from-snapshot", from_snapshot.is_some()),
+            ("--account", account.is_some()),
+            ("--uin-hash", uin_hash.is_some()),
+            ("--key-file", key_file.is_some()),
+            ("--cipher-compat", cipher_compat.is_some()),
+        ]
+        .into_iter()
+        .find(|(_, on)| *on);
+        if let Some((flag, _)) = conflicting {
+            return Err(format!(
+                "--media-derivatives cannot be combined with {flag} (one mode per run; it \
+                 reads the store read-only and needs only --target)"
+            ));
+        }
+        if target.is_none() && !help {
+            return Err(
+                "--media-derivatives needs --target <shadow store dir>: there is no default — \
+                 the live store is never silently chosen"
+                    .into(),
+            );
+        }
+    } else if variants_raw.is_some() || threads.is_some() {
+        return Err(
+            "--variants/--threads are --media-derivatives flags: add --media-derivatives or \
+             drop them"
+                .into(),
+        );
     }
     // Batch 24 D3: --decrypt-basic rides the --content-shape mode (it
     // is that probe's decode step) — checked before the --apply
@@ -629,7 +756,7 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         // Batch 27 M3: --target also rides --local-media-plan (a
         // read-only mode), so the apply-mode refusal is conditional.
         (
-            target.is_some() && !local_media_plan && !local_media_copy,
+            target.is_some() && !local_media_plan && !local_media_copy && !media_derivatives,
             "--target",
         ),
         (i_have_a_backup_plan, "--i-have-a-backup-plan"),
@@ -762,10 +889,17 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             );
         }
     }
-    if (include_video || limit.is_some()) && !local_media_copy {
+    if include_video && !local_media_copy {
         return Err(
             "--include-video/--limit are --local-media-copy flags: add --local-media-copy or \
              drop them"
+                .into(),
+        );
+    }
+    if limit.is_some() && !local_media_copy && !media_derivatives {
+        return Err(
+            "--include-video/--limit are --local-media-copy flags: add --local-media-copy or \
+             drop them (--limit also rides --media-derivatives)"
                 .into(),
         );
     }
@@ -892,14 +1026,31 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
             content_shape,
             by,
             decrypt_basic,
+            media_derivatives,
+            variants,
+            threads,
             apply: false,
             help: true,
         });
     }
+    // --media-derivatives needs no snapshot (it never reads one).
+    let snapshot_flags_optional = media_derivatives;
     Ok(ImportArgs {
-        from_snapshot: from_snapshot.ok_or("missing required --from-snapshot <dir>")?,
-        account: account.ok_or("missing required --account <id>")?,
-        uin_hash: uin_hash.ok_or("missing required --uin-hash <sha256-12>")?,
+        from_snapshot: match from_snapshot {
+            Some(p) => p,
+            None if snapshot_flags_optional => PathBuf::new(),
+            None => return Err("missing required --from-snapshot <dir>".into()),
+        },
+        account: match account {
+            Some(v) => v,
+            None if snapshot_flags_optional => String::new(),
+            None => return Err("missing required --account <id>".into()),
+        },
+        uin_hash: match uin_hash {
+            Some(v) => v,
+            None if snapshot_flags_optional => String::new(),
+            None => return Err("missing required --uin-hash <sha256-12>".into()),
+        },
         key_file,
         cipher_compat,
         inventory,
@@ -923,6 +1074,9 @@ pub fn parse(args: &[String]) -> Result<ImportArgs, String> {
         content_shape,
         by,
         decrypt_basic,
+        media_derivatives,
+        variants,
+        threads,
         apply,
         help: false,
     })
@@ -948,6 +1102,18 @@ pub fn main(args: &[String]) -> i32 {
         // Batch 27b: the local-media COPY mode (dry run or guarded
         // apply) — it carries --apply but NOT --mapping, so it must
         // dispatch before the mapping apply below.
+        // Batch 28 M3: the derivative pre-warm (read-only store, cache
+        // writes only) — it needs no snapshot, no apply gate.
+        Ok(a) if a.media_derivatives => {
+            let mut out = |line: &str| println!("{line}");
+            match super::derive_cli::run_wired(&a, &mut out) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("import failed: {e}");
+                    1
+                }
+            }
+        }
         Ok(a) if a.local_media_copy => {
             let mut out = |line: &str| println!("{line}");
             match import::run_local_media_copy(
@@ -2438,5 +2604,102 @@ mod tests {
         ]));
         assert_eq!(code, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- batch 28 M3: --media-derivatives (parse) ---------------------------
+
+    #[test]
+    fn parse_media_derivatives_rules() {
+        use crate::shadow::img_derive::Variant;
+        // Only --target: no snapshot flags, no --apply.
+        let a = parse(&args(&["--media-derivatives", "--target", r"D:\shadow"])).unwrap();
+        assert!(a.media_derivatives && !a.apply);
+        assert_eq!(a.target, Some(PathBuf::from(r"D:\shadow")));
+        assert!(a.variants.is_empty() && a.threads.is_none() && a.limit.is_none());
+        // The riders.
+        let a = parse(&args(&[
+            "--media-derivatives",
+            "--target",
+            r"D:\shadow",
+            "--variants",
+            "view,thumb",
+            "--limit",
+            "50",
+            "--threads",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(a.variants, vec![Variant::View, Variant::Thumb]);
+        assert_eq!(a.limit, Some(50));
+        assert_eq!(a.threads, Some(3));
+        // --help still short-circuits.
+        assert!(parse(&args(&["--media-derivatives", "--help"])).unwrap().help);
+        // Needs --target.
+        let e = parse(&args(&["--media-derivatives"])).unwrap_err();
+        assert!(e.contains("--media-derivatives needs --target"), "{e}");
+        // Bad rider values.
+        for (extra, needle) in [
+            (vec!["--variants", "orig"], "orig is built on demand"),
+            (vec!["--variants", "thumb,thumb"], "lists thumb twice"),
+            (vec!["--variants", "thumb,"], "comma list of thumb,view"),
+            (vec!["--variants", ""], "comma list of thumb,view"),
+            (vec!["--variants", "big"], "comma list of thumb,view"),
+            (vec!["--threads", "0"], "--threads must be a whole number 1..=64"),
+            (vec!["--threads", "65"], "--threads must be a whole number 1..=64"),
+            (vec!["--threads", "x"], "--threads must be a whole number 1..=64"),
+            (vec!["--limit", "0"], "--limit must be a whole number >= 1"),
+        ] {
+            let mut v = args(&["--media-derivatives", "--target", r"D:\s"]);
+            v.extend(extra.iter().map(|s| s.to_string()));
+            let e = parse(&v).unwrap_err();
+            assert!(e.contains(needle), "{extra:?} -> {e}");
+        }
+        // One mode per run: everything else conflicts, naming the flag.
+        for (extra, flag) in [
+            (vec!["--apply"], "--apply"),
+            (vec!["--i-have-a-backup-plan"], "--i-have-a-backup-plan"),
+            (vec!["--inventory"], "--inventory"),
+            (vec!["--mapping", "m.json"], "--mapping"),
+            (vec!["--delta"], "--delta"),
+            (vec!["--media-plan"], "--media-plan"),
+            (vec!["--local-media-copy"], "--local-media-copy"),
+            (vec!["--local-media-plan"], "--local-media-plan"),
+            (vec!["--local-media-probe"], "--local-media-probe"),
+            (vec!["--local-media-root", "r"], "--local-media-root"),
+            (vec!["--include-video"], "--include-video"),
+            (vec!["--out", "o.json"], "--out"),
+            (vec!["--from-snapshot", "s"], "--from-snapshot"),
+            (vec!["--account", "default"], "--account"),
+            (vec!["--uin-hash", "dca62c394a68"], "--uin-hash"),
+            (vec!["--key-file", "k"], "--key-file"),
+        ] {
+            let mut v = args(&["--media-derivatives", "--target", r"D:\s"]);
+            v.extend(extra.iter().map(|s| s.to_string()));
+            let e = parse(&v).unwrap_err();
+            assert!(
+                e.contains(&format!("--media-derivatives cannot be combined with {flag}")),
+                "{extra:?} -> {e}"
+            );
+        }
+        // The riders without the mode are refused, and --limit keeps
+        // its old rule for the other modes.
+        let e = parse(&with_base(&["--variants", "thumb"])).unwrap_err();
+        assert!(e.contains("are --media-derivatives flags"), "{e}");
+        let e = parse(&with_base(&["--threads", "2"])).unwrap_err();
+        assert!(e.contains("are --media-derivatives flags"), "{e}");
+        let e = parse(&with_base(&["--limit", "2"])).unwrap_err();
+        assert!(e.contains("are --local-media-copy flags"), "{e}");
+        // Without the mode --target is still an apply/plan/copy flag.
+        let e = parse(&with_base(&["--target", r"D:\s"])).unwrap_err();
+        assert!(e.contains("--target is an --apply/--local-media-plan"), "{e}");
+        // Duplicates.
+        let e = parse(&args(&[
+            "--media-derivatives",
+            "--media-derivatives",
+            "--target",
+            r"D:\s",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("given twice"), "{e}");
     }
 }

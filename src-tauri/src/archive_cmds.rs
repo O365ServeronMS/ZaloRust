@@ -30,6 +30,11 @@ use tauri::{AppHandle, Manager, Webview};
 
 use crate::i18n::tr;
 use crate::shadow::archive;
+use crate::shadow::img_derive::{DeriveError, Variant};
+
+/// Derivative files built by the media scheme since start (for the
+/// counts-only log line, one per 100 builds).
+static DERIVATIVE_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The archive window's label — the one caller the data commands
 /// accept, and the webview the media scheme answers.
@@ -319,7 +324,7 @@ pub async fn archive_open(window: Webview, app: AppHandle) -> Result<(), String>
 
 // --- K3: the zrarchive media scheme (handler half; pure fns in shadow/archive) --
 
-/// Serve one `zrarchive://…/media/<msg_id>/<idx>` request. Only the
+/// Serve one `zrarchive://…/media/<msg_id>/<idx>[?v=thumb|view|orig]` request. Only the
 /// archive webview is answered; the file is chosen by the DB row
 /// (never a path from the URL); the content type comes from the magic
 /// bytes; a media row whose bytes fail the sniff is refused. Range
@@ -342,8 +347,11 @@ pub(crate) fn serve_media(
     if label != ARCHIVE_LABEL {
         return not_found();
     }
-    // (b) URL: one strict shape — ids only, no path.
-    let Some((msg_id, idx)) = archive::parse_media_uri(request.uri().path()) else {
+    // (b) URL: one strict shape — ids only, no path — plus the
+    //     optional strict `?v=thumb|view|orig` variant (batch 28).
+    let Some((msg_id, idx, variant)) =
+        archive::parse_media_request(request.uri().path(), request.uri().query())
+    else {
         return not_found();
     };
     // (c) DB row picks the file, resolved INSIDE the media root.
@@ -372,29 +380,57 @@ pub(crate) fn serve_media(
     else {
         return not_found();
     };
-    // (d2) batch 27b M2: WebView2 cannot render JPEG XL. An image row
-    //      whose bytes are JXL is decoded (first frame, 8-bit sRGB) to
-    //      a PNG cached under <media root>\cache\jxl-png\<sha>.png
-    //      and THAT is served as image/png. A decode failure behaves
-    //      like a refused content type (404); nothing is logged (no
-    //      paths).
-    if content_type == "image/jxl" {
-        let root = crate::shadow::media::media_store_root(&cfg);
-        let Ok(png_path) = crate::shadow::jxl_png::cached_png(&path, &root) else {
-            return not_found();
+    // (d2) batch 28 M2: images are served as WebP derivatives, the
+    //      variant picked by `?v=thumb|view|orig` (none = view).
+    //      WebView2 cannot render JPEG XL, so a JXL row ALWAYS goes
+    //      through a derivative (`orig` = a full-size q85 WebP);
+    //      JPEG/PNG rows use the thumb/view derivative unless the
+    //      original is already small (`UseOriginal`), and `orig` on
+    //      them is the original bytes as before. GIF/WebP rows are
+    //      served as they are. A derivative is keyed by the store
+    //      file's sha, so it is immutable. Any other failure behaves
+    //      like a refused content type (404); the only log line is a
+    //      counts-only one per 100 builds (never a path).
+    let mut immutable = false;
+    if kind.as_deref() == Some("image") {
+        let wants_derivative = match (content_type, variant) {
+            ("image/jxl", _) => true,
+            ("image/jpeg" | "image/png", Variant::Thumb | Variant::View) => true,
+            _ => false,
         };
-        let Ok(png_meta) = std::fs::metadata(&png_path) else {
-            return not_found();
-        };
-        let Ok(png_file) = std::fs::File::open(&png_path) else {
-            return not_found();
-        };
-        if !png_meta.is_file() || png_meta.len() == 0 {
-            return not_found();
+        if wants_derivative {
+            let root = crate::shadow::media::media_store_root(&cfg);
+            match crate::shadow::img_derive::cached_derivative_file(&path, &root, variant) {
+                Ok(d) => {
+                    let Ok(webp_meta) = std::fs::metadata(&d.path) else {
+                        return not_found();
+                    };
+                    let Ok(webp_file) = std::fs::File::open(&d.path) else {
+                        return not_found();
+                    };
+                    if !webp_meta.is_file() || webp_meta.len() == 0 {
+                        return not_found();
+                    }
+                    file = webp_file;
+                    len = webp_meta.len();
+                    content_type = "image/webp";
+                    immutable = true;
+                    if d.built {
+                        let n = DERIVATIVE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 100 == 0 {
+                            crate::dlog::log(&format!("archive: derivatives built={n}"));
+                        }
+                    }
+                }
+                // The original is already as small: serve it (never a
+                // JXL, which no WebView can show).
+                Err(DeriveError::UseOriginal) if content_type != "image/jxl" => {}
+                Err(_) => return not_found(),
+            }
         }
-        file = png_file;
-        len = png_meta.len();
-        content_type = "image/png";
+    }
+    if content_type == "image/jxl" {
+        return not_found();
     }
     // (e) range: a single range within a bounded window; a rangeless
     //     request gets the head of the file (images are far below the
@@ -449,7 +485,15 @@ pub(crate) fn serve_media(
         .header(header::CONTENT_LENGTH, body.len())
         // Tell the media element it may seek (video).
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, "private, max-age=3600");
+        .header(
+            header::CACHE_CONTROL,
+            if immutable {
+                // Keyed by the content sha: the bytes never change.
+                "private, max-age=31536000, immutable"
+            } else {
+                "private, max-age=3600"
+            },
+        );
     if let Some(cr) = content_range {
         builder = builder.header(header::CONTENT_RANGE, cr);
     }

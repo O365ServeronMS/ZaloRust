@@ -1428,11 +1428,10 @@ stored bytes are JXL (bare codestream or ISO-BMFF container):
 
 1. the first frame is decoded to 8-bit sRGB with `jxl-oxide` (RGB or
    RGBA; a gray image stays gray);
-2. a PNG is encoded with the `png` crate;
-3. it is cached at `<media root>\cache\jxl-png\<sha>.png` (`<sha>` is
-   the store file's own name, else the sha256 of the bytes): a temp file
-   is written and renamed, and an existing cache file is reused;
-4. it is served as `image/png`.
+2. batch 28 replaced the full-size PNG that this step first produced
+   with WebP derivatives, see §10.8 (`shadow::jxl_decode` keeps the
+   decode, `shadow::img_derive` does the rest);
+3. the result is served as `image/webp`.
 
 More than 50 megapixels refuses before any frame is rendered (the
 header is checked as soon as the image initialises; the decoder's
@@ -1444,8 +1443,137 @@ the conversion.
 Dependencies: `jxl-oxide 0.12.6` with `default-features = false` (no
 rayon, no CMS: a single-threaded decode that handles well-known color
 encodings; an image that needs an external CMS is a decode failure),
-and `png` named directly, pinned to `=0.18.1`, the version already in
-`Cargo.lock` through tauri. The deployed app is a debug build, so
-`[profile.dev.package.*] opt-level = 3` is set for the `jxl-*` decoding
-crates, `png`, `miniz_oxide`, `fdeflate`, `crc32fast` and
-`simd-adler32`.
+and (batch 27b only) `png`, pinned to `=0.18.1`; batch 28 dropped that
+direct dependency (the PNG encoder is gone; `png` stays in the tree
+through `image`). The deployed app is a debug build; the
+`[profile.dev.package.*]` overrides that keep the decoding crates fast
+there are described in §10.8 M4.
+
+### 10.8 WebP derivatives, the pre-warm CLI and a fast debug decode (batch 28)
+
+Batch 27b served a JPEG XL image as a full-size PNG (3.7 MB on average,
+decoded on the first view). Batch 28 replaces that with lossy WebP
+derivatives, cached on disk and pre-warmed.
+
+#### M1 — `shadow::img_derive`
+
+| variant | long edge | WebP quality | sources |
+|---|---|---|---|
+| `thumb` | <= 480 px | 75 | JPEG XL, JPEG, PNG |
+| `view` | <= 2048 px | 80 | JPEG XL, JPEG, PNG |
+| `orig` | <= 16383 px (the WebP maximum) | 85 | JPEG XL only |
+
+- Never upscaled, aspect ratio kept, `image::imageops::resize` with
+  `FilterType::Triangle`.
+- JPEG XL decodes through `shadow::jxl_decode` (64 MB input, 50 MP and
+  2 GiB allocation caps unchanged). JPEG and PNG decode with `image`;
+  the 50 MP cap is checked from the header before any pixel is decoded.
+  The EXIF orientation of a JPEG is applied.
+- GIF, WebP and any other source have no derivative: the original is
+  served as before.
+- Alpha is kept (RGBA WebP); gray becomes RGB.
+- A JPEG/PNG whose long edge is already within the variant's edge and
+  that is smaller than 300 KB gets no derivative (`UseOriginal`): the
+  original is served. `orig` of a JPEG/PNG is always the original.
+- Cache: `<media root>\cache\img\<variant>\<aa>\<sha>.webp`, `<sha>` the
+  store file's own name (64 lowercase hex), `<aa>` its first two
+  characters; a file with another name is keyed by the sha256 of its
+  bytes. A temp file is written in the same directory and renamed; on a
+  lost race the existing file is kept. The old `cache\jxl-png` directory
+  is no longer read or written (it can be deleted).
+- Concurrency: the same sha is never decoded twice at once. A request
+  WAITS (at most 30 s) while another thread builds that sha, then
+  re-checks the cache and serves it; after the 30 s it builds anyway and
+  renames over the other result (same bytes). The guard is an in-process
+  `Mutex<HashSet<sha>>` with a `Condvar`.
+- Every failure is a plain kind (`too_large`, `too_many_pixels`,
+  `decode`, `format`, `encode`, `io`, `unsupported`, `bad_key`,
+  `use_original`); nothing carries a path.
+
+#### M2 — serving
+
+The media URL is `/media/<msgId>/<idx>` plus an optional `?v=thumb`,
+`?v=view` or `?v=orig`; no query means `view`. The query is parsed
+strictly (`archive::parse_media_query`): an empty query, an unknown
+value, a duplicate or any other parameter is refused (404). The URL still
+carries ids only; the file is resolved inside the media root; the CSP
+`img-src zrarchive:` is unchanged.
+
+For an `image` row: `thumb`/`view` serve the cached WebP
+(`image/webp`), or the original bytes when the rule above says so;
+`orig` serves a full-size WebP q85 for a JPEG XL and the original bytes
+for JPEG/PNG. A JPEG XL is never served raw. Any other derivative failure
+is a 404 (`private, no-store`). Derivatives carry
+`Cache-Control: private, max-age=31536000, immutable` (the key is the
+content sha). Video, file and voice rows are unchanged, Range included.
+The only log line is `archive: derivatives built=<n>` once per 100
+builds.
+
+In the viewer (`settings-ui/archive.js`) an `<img>` in a message bubble
+asks for `?v=thumb` when the bubble box (`.att-media`, at most 320 CSS
+px wide) needs no more than 480 device pixels, i.e. 320 x
+`devicePixelRatio` <= 480 (a 100% to 150% display), else `?v=view`.
+`mediaUrl(msgId, idx, variant)` adds the query; videos get none.
+
+#### M3 — pre-warm
+
+```
+zalors import --media-derivatives --target <store> [--variants thumb,view] [--limit N] [--threads N]
+```
+
+Read-only on the store (it opens the way the archive window does, so it
+works next to the running app; a password-protected store without its
+remember file refuses). The only writes are cache files under
+`<media root>\cache\img\`. For every `attachments` row with
+`kind='image' AND status='downloaded'` the file is resolved inside the
+media root and each distinct sha is processed once, all missing variants
+from ONE decode, by `--threads` workers (default cores - 2, at least 1,
+max 64) pulling from a shared queue. A disk check runs first: (220 KB
+per missing view + 20 KB per missing thumb) x 1.2 + 1 GiB must be below
+the free space of the media root's volume (a variant that would not be
+written, such as a small JPEG whose original is served, is not counted).
+Idempotent: a second run builds 0. `--limit N` processes only the first
+N distinct files; `--variants` accepts `thumb` and `view` (`orig` is
+built on demand).
+
+Report lines (counts, fixed vocabulary and byte sums only):
+
+```
+media-derivatives: store=given (read-only)
+media-derivatives: rows=<n> distinct_shas=<n> unresolved_paths=<n> variants=<list> limit=<n|none> threads=<n>
+media-derivatives: missing before: view=<n> thumb=<n>
+media-derivatives: disk check: needed_bytes=<b> (est x 1.2 + 1 GiB) result=<ok|NOT ENOUGH FREE SPACE|free space unmeasurable>
+media-derivatives: progress shas=<n>/<total>            (every 500 shas)
+media-derivatives: variant=<v> built=<n> cached=<n> use_original=<n> errors=<n> <kind>=<n>...
+media-derivatives: shas=<n> bytes_written=<b> elapsed_s=<s>
+media-derivatives: done
+```
+
+#### M4 — a fast decode in the debug build
+
+The deployed app is a debug build. Two things made the image path slow
+there although `jxl-*`/`png` already built at opt-level 3:
+
+1. Generic code that the app instantiates itself is compiled at the
+   app's own opt-level (0), whatever the dependency's profile says:
+   `image::imageops::resize` (a 3000x2000 frame took 1.3 s to the view
+   size) and jxl-oxide's `ImageStream::write_to_buffer::<u8>` (330-400
+   ms of the decode). The app now calls only non-generic entry points:
+   `DynamicImage::resize_exact`, and for RGB/RGBA frames up to 12 MP
+   `Render::image_all_channels` + `DynamicImage::into_rgb8/into_rgba8`
+   (the streaming path stays for gray, extra channels and bigger frames).
+2. `libwebp-sys` is C built through `cc`, which reads the profile's
+   opt-level: it was compiled `-O0` (WebP view encode 540 ms). The dev
+   profile also keeps debug assertions and overflow checks on inside the
+   pixel loops.
+
+The fix is in `Cargo.toml`: `[profile.dev.package.*]` with
+`opt-level = 3`, `debug-assertions = false`, `overflow-checks = false` for
+the `jxl-*` crates, `png`, `miniz_oxide`, `fdeflate`, `crc32fast`,
+`simd-adler32`, `brotli-decompressor@5.0.3`, `image`, `zune-jpeg`,
+`zune-core`, `webp`, `libwebp-sys` and `bytemuck`, plus the two
+non-generic call changes above. Measured in the unit-test (dev) profile
+on a synthetic 3000x2000 JPEG XL (388 KB, made with ffmpeg/libjxl from a
+generated image, not real data): thumb + view derivatives 3.6 s before,
+about 0.7-0.9 s after; a synthetic 3000x2000 JPEG (675 KB) 4.3 s before,
+about 0.35 s after. Real files must be re-measured in the deployed app.

@@ -978,6 +978,9 @@ fn probe_import_content_agree() {
         content_shape: None,
         by: None,
         decrypt_basic: false,
+        media_derivatives: false,
+        variants: Vec::new(),
+        threads: None,
         apply: false,
         help: false,
     };

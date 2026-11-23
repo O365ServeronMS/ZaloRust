@@ -497,6 +497,28 @@ pub fn parse_media_uri(path: &str) -> Option<(String, i64)> {
     Some((msg_id.to_string(), idx))
 }
 
+/// Parse the optional query of a media URL (batch 28 M2): none → the
+/// `view` variant; otherwise EXACTLY `v=thumb`, `v=view` or `v=orig`.
+/// Strict: an empty query, an unknown value, a duplicate or any other
+/// parameter refuses (`None`).
+pub fn parse_media_query(query: Option<&str>) -> Option<super::img_derive::Variant> {
+    use super::img_derive::Variant;
+    match query {
+        None => Some(Variant::View),
+        Some(q) => Variant::parse(q.strip_prefix("v=")?),
+    }
+}
+
+/// The whole media request: path (`/media/<msg_id>/<idx>`) plus the
+/// optional `?v=` variant, both strict.
+pub fn parse_media_request(
+    path: &str,
+    query: Option<&str>,
+) -> Option<(String, i64, super::img_derive::Variant)> {
+    let (msg_id, idx) = parse_media_uri(path)?;
+    Some((msg_id, idx, parse_media_query(query)?))
+}
+
 /// Largest slice one 206 response carries (a media element re-requests
 /// the next window; this bounds memory per request).
 pub const SERVE_WINDOW: u64 = 8 * 1024 * 1024;
@@ -986,6 +1008,34 @@ mod tests {
         ] {
             assert_eq!(parse_media_uri(bad), None, "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn media_query_is_strict_and_defaults_to_view() {
+        use super::super::img_derive::Variant;
+        assert_eq!(parse_media_query(None), Some(Variant::View));
+        assert_eq!(parse_media_query(Some("v=thumb")), Some(Variant::Thumb));
+        assert_eq!(parse_media_query(Some("v=view")), Some(Variant::View));
+        assert_eq!(parse_media_query(Some("v=orig")), Some(Variant::Orig));
+        for bad in [
+            "", "v=", "v=THUMB", "v=full", "v=thumb&v=view", "v=thumb&v=thumb", "v=thumb&x=1",
+            "x=thumb", "v=thumb&", "&v=thumb", "V=thumb", "v=thumb%20", "v=../x", "thumb",
+            "v=thumb;v=view", " v=thumb",
+        ] {
+            assert_eq!(parse_media_query(Some(bad)), None, "{bad:?} must not parse");
+        }
+        // The pair: a good path with a good/absent query, a bad part
+        // anywhere refuses.
+        assert_eq!(
+            parse_media_request("/media/m1/0", Some("v=orig")),
+            Some(("m1".into(), 0, Variant::Orig))
+        );
+        assert_eq!(
+            parse_media_request("/media/m1/0", None),
+            Some(("m1".into(), 0, Variant::View))
+        );
+        assert_eq!(parse_media_request("/media/m1/0", Some("v=x")), None);
+        assert_eq!(parse_media_request("/media/m1/x", Some("v=thumb")), None);
     }
 
     #[test]

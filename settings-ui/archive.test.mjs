@@ -51,6 +51,46 @@ check("media URLs are ids-only and follow the injected scheme base", () => {
   assert.equal(A.mediaUrl("m1", 3), "zrarchive://localhost/media/m1/3", "default base on macOS/Linux");
 });
 
+check("media URLs take only the three known variants as ?v=", () => {
+  globalThis.__ZR_ARCHIVE_MEDIA__ = "http://zrarchive.localhost";
+  assert.equal(A.mediaUrl("m1", 0, "thumb"), "http://zrarchive.localhost/media/m1/0?v=thumb");
+  assert.equal(A.mediaUrl("m1", 0, "view"), "http://zrarchive.localhost/media/m1/0?v=view");
+  assert.equal(A.mediaUrl("m1", 2, "orig"), "http://zrarchive.localhost/media/m1/2?v=orig");
+  // No variant, or anything else: no query at all (never a value the
+  // server refuses, never an injected parameter).
+  for (const bad of [undefined, null, "", "full", "THUMB", "thumb&v=view", "__proto__", "toString", 7, {}]) {
+    assert.equal(A.mediaUrl("m1", 0, bad), "http://zrarchive.localhost/media/m1/0", String(bad));
+  }
+  delete globalThis.__ZR_ARCHIVE_MEDIA__;
+});
+
+check("the bubble rule: thumb up to a 150% display, view on denser ones", () => {
+  // .att-media is <= 320 CSS px wide: 320 x dpr <= 480 -> thumb.
+  assert.equal(A.imageVariant(1), "thumb");
+  assert.equal(A.imageVariant(1.25), "thumb");
+  assert.equal(A.imageVariant(1.5), "thumb");
+  assert.equal(A.imageVariant(1.75), "view");
+  assert.equal(A.imageVariant(2), "view");
+  assert.equal(A.imageVariant(3), "view");
+  // A missing / invalid ratio counts as 1.
+  for (const bad of [undefined, null, 0, -1, NaN, "x"]) assert.equal(A.imageVariant(bad), "thumb", String(bad));
+});
+
+check("an image in a bubble asks for ?v=view on a dense display, a video never gets a variant", () => {
+  globalThis.__ZR_ARCHIVE_MEDIA__ = "http://zrarchive.localhost";
+  const doc = fakeDoc();
+  globalThis.devicePixelRatio = 2;
+  try {
+    const img = find(A.renderAttachment(doc, "m1", { idx: 0, kind: "image", status: "downloaded", has_local: true }), "img")[0];
+    assert.equal(img.src, "http://zrarchive.localhost/media/m1/0?v=view");
+    const vid = find(A.renderAttachment(doc, "m1", { idx: 1, kind: "video", status: "downloaded", has_local: true }), "video")[0];
+    assert.equal(vid.src, "http://zrarchive.localhost/media/m1/1", "video rows are unchanged");
+  } finally {
+    delete globalThis.devicePixelRatio;
+    delete globalThis.__ZR_ARCHIVE_MEDIA__;
+  }
+});
+
 // --- conversation rows ----------------------------------------------------
 
 check("a conversation row shows the name and the preview through textContent", () => {
@@ -101,7 +141,8 @@ check("a message row renders sender, time, text and every attachment state", () 
   assert.equal(body.children[0].textContent, "Chào bạn, mình gửi ảnh đây");
   // downloaded image + video go through the media scheme, ids only
   const img = find(item, "img")[0];
-  assert.equal(img.src, "http://zrarchive.localhost/media/m1/0");
+  // Batch 28: an image in a bubble asks for a derivative (dpr 1 -> thumb).
+  assert.equal(img.src, "http://zrarchive.localhost/media/m1/0?v=thumb");
   assert.equal(img.loading, "lazy");
   const vid = find(item, "video")[0];
   assert.equal(vid.src, "http://zrarchive.localhost/media/m1/1");

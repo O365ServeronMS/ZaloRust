@@ -1470,6 +1470,9 @@ mod tests {
             content_shape: None,
             by: None,
             decrypt_basic: false,
+            media_derivatives: false,
+            variants: Vec::new(),
+            threads: None,
             help: false,
         }
     }
