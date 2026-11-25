@@ -6,7 +6,9 @@
     <!-- K3 (batch 11): this page allows images/media ONLY from the
          internal zrarchive scheme — nothing remote, no data:, no
          http(s) origins. It intersects with the app-wide CSP header;
-         scripts and styles stay local like every other local page. -->
+         scripts and styles stay local like every other local page.
+         Batch 29b rebuilt the layout (3 columns, like Zalo PC); the
+         policy below did not change. -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src zrarchive: http://zrarchive.localhost; media-src zrarchive: http://zrarchive.localhost; connect-src ipc: http://ipc.localhost" />
     <title>Zalo — Arquivo</title>
     <script src="vi.js"></script>
@@ -14,25 +16,83 @@
     <link rel="stylesheet" href="style.css" />
     <link rel="stylesheet" href="archive.css" />
   </head>
-  <body>
-    <header class="app-header archive-header">
-      <div><strong>Arquivo</strong><span id="archive-title" class="archive-title-sub"></span></div>
-      <span id="archive-counts" class="archive-counts"></span>
-    </header>
-    <div class="archive-search">
-      <input type="text" id="search" placeholder="Pesquisar mensagens" aria-label="Pesquisar mensagens" autocomplete="off" spellcheck="false" />
-      <div id="search-results" class="search-results" hidden></div>
-    </div>
-    <main class="archive-layout">
-      <nav id="conv-list" class="conv-list" aria-label="Conversas">
-        <div id="conv-empty" class="archive-empty">Nenhuma conversa encontrada.</div>
-      </nav>
-      <section id="msg-pane" class="msg-pane" aria-label="Mensagens">
-        <div id="msg-empty" class="archive-empty">Selecione uma conversa</div>
-        <div id="msgs" class="msgs" hidden></div>
+  <body class="zl">
+    <div class="zl-app">
+      <!-- left column: search, filter tabs, conversation list -->
+      <aside class="col-left">
+        <div class="left-search">
+          <div class="search-box">
+            <span id="ico-search" class="ico-slot" aria-hidden="true"></span>
+            <input type="text" id="search" placeholder="Pesquisar" aria-label="Pesquisar" autocomplete="off" spellcheck="false" />
+            <button type="button" id="search-clear" class="icon-btn small" aria-label="Limpar" hidden></button>
+          </div>
+        </div>
+        <div id="filter-tabs" class="left-tabs" role="tablist" aria-label="Filtrar conversas">
+          <button type="button" role="tab" class="tab active" data-filter="all" aria-selected="true">Todas</button>
+          <button type="button" role="tab" class="tab" data-filter="private" aria-selected="false">Pessoais</button>
+          <button type="button" role="tab" class="tab" data-filter="group" aria-selected="false">Grupos</button>
+        </div>
+        <nav id="conv-list" class="conv-list" tabindex="0" aria-label="Conversas">
+          <div id="conv-rows"></div>
+          <div id="conv-empty" class="archive-empty" hidden>Nenhuma conversa encontrada.</div>
+          <div id="conv-sentinel" class="sentinel"></div>
+        </nav>
+        <div id="search-results" class="search-results" hidden></div>
+      </aside>
+
+      <!-- middle column: chat header, optional in-chat search, messages, read-only bar -->
+      <section class="col-mid">
+        <header id="chat-head" class="chat-head" hidden>
+          <span id="head-avatar" class="head-avatar"></span>
+          <div class="head-text">
+            <div id="head-name" class="head-name"></div>
+            <div id="head-sub" class="head-sub"></div>
+          </div>
+          <div class="head-actions">
+            <button type="button" id="btn-chat-search" class="icon-btn" aria-label="Pesquisar nesta conversa"></button>
+            <button type="button" id="btn-panel" class="icon-btn" aria-label="Painel lateral" aria-pressed="true"></button>
+          </div>
+        </header>
+        <div id="inchat" class="inchat" hidden>
+          <div class="search-box">
+            <span id="ico-inchat" class="ico-slot" aria-hidden="true"></span>
+            <input type="text" id="inchat-input" placeholder="Pesquisar nesta conversa" aria-label="Pesquisar nesta conversa" autocomplete="off" spellcheck="false" />
+            <span id="inchat-count" class="inchat-count" role="status" aria-live="polite"></span>
+            <button type="button" id="inchat-close" class="icon-btn small" aria-label="Fechar"></button>
+          </div>
+          <div id="inchat-results" class="inchat-results" hidden></div>
+        </div>
+        <div id="msg-pane" class="msg-pane" aria-label="Mensagens">
+          <div id="msg-empty" class="archive-empty">Selecione uma conversa</div>
+          <div id="msgs" class="msgs" hidden>
+            <div id="msg-sentinel" class="sentinel"></div>
+            <div id="msg-list" class="msg-list"></div>
+          </div>
+          <button type="button" id="jump-latest" class="jump-latest" hidden>Ir para as mensagens recentes</button>
+        </div>
+        <footer class="composer">Arquivo · somente leitura</footer>
       </section>
-    </main>
-    <p id="archive-note" class="archive-note" role="status" aria-live="polite"></p>
+
+      <!-- right column: conversation info / storage view -->
+      <aside id="right-panel" class="col-right" aria-label="Informações da conversa"></aside>
+    </div>
+
+    <!-- lightbox: dark overlay for images and videos -->
+    <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Mídia" hidden>
+      <button type="button" id="lb-close" class="lb-btn lb-close" aria-label="Fechar"></button>
+      <button type="button" id="lb-prev" class="lb-btn lb-prev" aria-label="Anterior"></button>
+      <button type="button" id="lb-next" class="lb-btn lb-next" aria-label="Seguinte"></button>
+      <div id="lb-stage" class="lb-stage"></div>
+      <div class="lb-bar">
+        <div id="lb-caption" class="lb-caption"></div>
+        <div class="lb-actions">
+          <button type="button" id="lb-orig" class="lb-act" hidden>Imagem original</button>
+          <button type="button" id="lb-goto" class="lb-act">Ver na conversa</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     <script src="archive.js"></script>
   </body>
 </html>
