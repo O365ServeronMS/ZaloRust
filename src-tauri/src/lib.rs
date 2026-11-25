@@ -287,6 +287,11 @@ pub fn run() {
             archive_cmds::archive_list_messages,
             archive_cmds::archive_search,
             archive_cmds::archive_open,
+            archive_cmds::archive_conv_media,
+            archive_cmds::archive_conv_media_counts,
+            archive_cmds::archive_conv_info,
+            archive_cmds::archive_open_link,
+            archive_cmds::archive_save_attachment,
             // Shadow DB passphrase mode (batch 18): the first five live
             // in the settings window's capability, `shadow_unlock` in
             // the shadow-unlock window's own.

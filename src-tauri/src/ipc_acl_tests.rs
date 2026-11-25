@@ -67,6 +67,12 @@ const ARCHIVE_COMMANDS: &[&str] = &[
     "archive_list_conversations",
     "archive_list_messages",
     "archive_search",
+    // Batch 29a.
+    "archive_conv_media",
+    "archive_conv_media_counts",
+    "archive_conv_info",
+    "archive_open_link",
+    "archive_save_attachment",
 ];
 /// Shadow DB password commands (batch 18): the five settings-window
 /// ones plus the unlock prompt's own — the Zalo page must reach NONE

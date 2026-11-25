@@ -66,6 +66,13 @@ fn main() {
             "archive_list_messages",
             "archive_search",
             "archive_open",
+            // batch 29a: the Zalo-like archive window's read API + the two
+            // user-initiated actions (open a link, save an attachment)
+            "archive_conv_media",
+            "archive_conv_media_counts",
+            "archive_conv_info",
+            "archive_open_link",
+            "archive_save_attachment",
             // shadow DB passphrase mode (batch 18): settings window +
             // the shadow-unlock prompt
             "shadow_password_status",

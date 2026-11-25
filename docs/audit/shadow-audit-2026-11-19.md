@@ -472,6 +472,76 @@ Chưa xác minh runtime (reviewer chạy):
   cập nhật phần v2 (quy tắc worktree-only); nguồn chân lý của v2 là
   `schema.rs`.
 
+#### Batch 29a — API đọc cho cửa sổ Lưu trữ kiểu Zalo (chỉ backend)
+
+Thêm đúng dữ liệu read-only mà UI batch 29b cần (danh sách hội thoại,
+bubble trái/phải, panel "Thông tin hội thoại" với Ảnh/Video, File,
+Link). Không đổi schema, không bump VERSION, không crate mới. Mọi
+command mới đi qua `archive_cmds::read_guard` (label `archive` + app
+lock), có trong `capabilities/archive.json` và danh sách
+`build.rs`; connection read-only như bốn command cũ. Chỉ phân trang
+keyset (không OFFSET), `clamp_page` giới hạn trang.
+
+- **`MsgRow` (mở rộng, giữ field cũ):** `is_self` (sender == own uid:
+  nguồn là dòng `accounts` khi chỉ có ĐÚNG một dòng, ngược lại
+  `settings.shadow.own_uid` hợp lệ — cùng nguồn uid mà normalizer/
+  flusher dùng; không tìm được thì mọi `is_self=false` và ghi MỘT dòng
+  log đếm: `archive: own uid unknown …`), `sender_initials` (≤2 chữ,
+  Unicode; `?` khi không có tên thật), `sender_color` (0..7, FNV-1a
+  theo `sender_id`), `raw_type` (chỉ kind 100, chỉ khi `$.msgType` nằm
+  trong `RAW_TYPE_ALLOW` = `-4`, `-1909` — hai dòng info cục bộ của
+  Desktop mà docs import nêu tên; repo chưa có tên wire nào của cuộc
+  gọi nên không bịa), `quote {sender_name, text_preview ≤120}` (từ
+  `payload.quote`: `msg`, `fromD`, `ownerId`; tên resolve qua
+  `contacts` khi không có `fromD`), `reactions [{code, emoji, count}]`
+  (1 query/trang; bảng `rIcon` port từ zca-js `Reaction.ts`, MIT; mã
+  rỗng = đã gỡ → bỏ; mã lạ → `emoji: null`; sắp theo count giảm dần),
+  `link {title, description_preview, domain}` cho kind 7/9 có `href`
+  http(s) (title/mô tả ≤200 ký tự; `domain` = host thường, bỏ userinfo
+  + port, IDN ở dạng punycode). `AttRow` thêm `name`/`ext`/`size`
+  (kind `file`: title; ext `[a-z0-9]{1,8}` thường; size = cột
+  `attachments.size` khi đã tải, ngược lại `params.fileSize`).
+  Không có width/height (không lưu sẵn, không decode ở đây).
+- **`ConvRow` (mở rộng):** `is_group`, `member_count` (nguồn đầu tiên
+  có dữ liệu: `participants` → `groups.members_json` →
+  `groups.raw_json.$.totalMember`; writer hiện KHÔNG ghi hai nguồn đầu
+  nên thực tế là nguồn thứ ba nếu `gridInfoMap` có `totalMember`),
+  `initials`, `color_idx`, `last_sender_is_self`, `last_sender_name`
+  (chỉ tên contact), `last_kind` (dùng với `preview_label`).
+- **`archive_conv_media(conv_id, tab, before, limit)`**, `tab` =
+  `"media"` | `"file"` | `"link"`, `before` = `[ts, msg_id, idx]` của
+  dòng cuối trang trước. media: `{msg_id, idx, kind, ts, has_local,
+  status}` (image/video); file: `{msg_id, idx, ts, name, ext, size,
+  has_local, status, sender_name}`; link: `{msg_id, ts, title, domain,
+  sender_name}`. Mới nhất trước, keyset `(ts, msg_id, idx)`. Plan được
+  ghim bằng `EXPLAIN QUERY PLAN` trong test: `SEARCH m USING INDEX
+  idx_messages_conv_ts` + `SEARCH a USING INDEX
+  sqlite_autoindex_attachments_1` — không full scan, KHÔNG cần index
+  mới. Tab link lọc bằng `m.type IN (7,9)` + chuỗi `"href":"http` rồi
+  parse lại, bỏ ứng viên không phải URL http(s) và lấy tiếp cho đủ
+  trang.
+- **`archive_conv_media_counts(conv_id)`** → `{media, file, link}`;
+  **`archive_conv_info(conv_id)`** → `{name, is_group, member_count,
+  initials, color_idx, first_ts, last_ts, msg_count}` (`null` nếu không
+  có hội thoại).
+- **Hành động (chỉ do người dùng bấm, không ghi DB):**
+  `archive_open_link(msg_id)` đọc lại href phía server, chỉ http/https,
+  mở bằng `opener::open_url` sẵn có, trả `ok` hoặc kind lỗi (`bad-id`,
+  `no-link`, `bad-scheme`); JS không bao giờ thấy href.
+  `archive_save_attachment(msg_id, idx)` mở hộp thoại Save native
+  (`tauri-plugin-dialog`, phía Rust), tên mặc định = title đã làm sạch
+  (bỏ dấu phân cách đường dẫn + ký tự điều khiển, ≤120 ký tự, ký tự
+  cấm của Windows thành `_`) hoặc `zalo-<kind>-<ts>.<ext>`, copy file
+  trong kho tới nơi người dùng chọn, trả `{saved: bool}` (không trả
+  đường dẫn; lỗi: `bad-id`, `bad-idx`, `not-found`, `bad-path`,
+  `copy-failed`). Không có lệnh reveal/mở file bằng shell.
+- **`archive_search`** nhận thêm `conv_id` tuỳ chọn (cùng truy vấn FTS5,
+  thêm `m.conv_id = ?`; vẫn là top-N theo bm25 nên chưa có cursor).
+- **Không bao giờ sang JS:** URL, `local_path`, sha, số điện thoại/
+  `phone_hash`, `payload_json`/`raw_json`, avatar url, href đầy đủ,
+  thumb. Test `nothing_that_crosses_to_js_…` serialize mọi dòng và tìm
+  các giá trị đó. Lỗi chỉ báo kind SQLite; log chỉ có dòng đếm.
+
 ### Desktop schema inventory + mapping + overlap probe — batch 12
 
 Phase 2.3 prep (§4 items 2.3/2.4/2.7 groundwork); cách dùng đầy đủ nằm

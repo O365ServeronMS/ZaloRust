@@ -4,7 +4,7 @@
 //! Isolation model (three layers, each independently testable):
 //! 1. **Capability** (`capabilities/archive.json`, identifier
 //!    `archive-local`, webview `archive`): the ACL only lets the
-//!    `archive` webview invoke the four `archive_*` commands (plus
+//!    `archive` webview invoke the `archive_*` commands (plus
 //!    `core:default` and the window-close permission it needs);
 //!    `main-remote` grants NONE of them, settings gains only
 //!    `allow-archive-open`. `src/ipc_acl_tests.rs` runs the real
@@ -253,6 +253,31 @@ fn query_failure(stage: &str, kind: String) -> String {
 
 // --- the commands -------------------------------------------------------------
 
+/// Logged once per process when the own user id cannot be found
+/// (counts-only line: no id, no value).
+static OWN_UID_UNKNOWN_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The own user id for `is_self`/"Bạn: …" (batch 29a M1): the
+/// `accounts` row when it is the only one, else the configured
+/// `settings.shadow.own_uid` (pure rule: `archive::resolve_own`).
+/// Unknown → `None` and every `is_self` is false, with one log line.
+fn own_uid(app: &AppHandle, conn: &rusqlite::Connection) -> Option<String> {
+    let ids = archive::account_ids(conn).unwrap_or_default();
+    let configured = if ids.len() == 1 {
+        None
+    } else {
+        crate::settings::load(app).shadow.own_uid
+    };
+    let own = archive::resolve_own(&ids, configured.as_deref());
+    if own.is_none()
+        && !OWN_UID_UNKNOWN_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        crate::dlog::log("archive: own uid unknown (is_self false for every row)");
+    }
+    own
+}
+
 /// Conversations of the archive, newest first, keyset-paginated on
 /// `(last_ts, id)`. Archive webview only; read-only.
 #[tauri::command]
@@ -264,8 +289,14 @@ pub async fn archive_list_conversations(
 ) -> Result<Vec<archive::ConvRow>, String> {
     read_guard(&window, &app)?;
     with_conn(&app, |conn| {
-        archive::list_conversations(conn, before.as_ref(), archive::clamp_page(limit))
-            .map_err(|kind| query_failure("list_conversations", kind))
+        let own = own_uid(&app, conn);
+        archive::list_conversations(
+            conn,
+            own.as_deref(),
+            before.as_ref(),
+            archive::clamp_page(limit),
+        )
+        .map_err(|kind| query_failure("list_conversations", kind))
     })
 }
 
@@ -281,26 +312,178 @@ pub async fn archive_list_messages(
 ) -> Result<Vec<archive::MsgRow>, String> {
     read_guard(&window, &app)?;
     with_conn(&app, |conn| {
-        archive::list_messages(conn, &conv_id, before.as_ref(), archive::clamp_page(limit))
-            .map_err(|kind| query_failure("list_messages", kind))
+        let own = own_uid(&app, conn);
+        archive::list_messages(
+            conn,
+            own.as_deref(),
+            &conv_id,
+            before.as_ref(),
+            archive::clamp_page(limit),
+        )
+        .map_err(|kind| query_failure("list_messages", kind))
     })
 }
 
 /// Full-text search (batch 9 FTS5, Vietnamese-friendly), joined back
-/// to full rows + conversation names. Archive webview only; read-only.
+/// to full rows + conversation names. Batch 29a M6: an optional
+/// `conv_id` restricts the same query to one conversation. Archive
+/// webview only; read-only.
 #[tauri::command]
 pub async fn archive_search(
     window: Webview,
     app: AppHandle,
     query: String,
+    conv_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<archive::SearchRow>, String> {
     read_guard(&window, &app)?;
     let query: String = query.chars().take(200).collect();
     with_conn(&app, |conn| {
-        archive::search_messages(conn, &query, archive::clamp_page(limit))
-            .map_err(|kind| query_failure("search", kind))
+        let own = own_uid(&app, conn);
+        archive::search_messages(
+            conn,
+            own.as_deref(),
+            &query,
+            conv_id.as_deref(),
+            archive::clamp_page(limit),
+        )
+        .map_err(|kind| query_failure("search", kind))
     })
+}
+
+/// One keyset page of a conversation's info-panel tab (batch 29a M3):
+/// `tab` is `"media"` (images/videos), `"file"` or `"link"`; `before`
+/// is the `(ts, msg_id, idx)` of the last row of the previous page.
+/// Display fields only — no url/path/sha/href. Archive webview only;
+/// read-only. An unknown tab is the error kind `bad-tab`.
+#[tauri::command]
+pub async fn archive_conv_media(
+    window: Webview,
+    app: AppHandle,
+    conv_id: String,
+    tab: String,
+    before: Option<(i64, String, i64)>,
+    limit: Option<u32>,
+) -> Result<Vec<archive::ConvMediaRow>, String> {
+    read_guard(&window, &app)?;
+    let tab = archive::MediaTab::parse(&tab).ok_or_else(|| "bad-tab".to_string())?;
+    with_conn(&app, |conn| {
+        archive::conv_media(conn, &conv_id, tab, before.as_ref(), archive::clamp_page(limit))
+            .map_err(|kind| query_failure("conv_media", kind))
+    })
+}
+
+/// `{media, file, link}` counts of one conversation (batch 29a M3).
+/// Archive webview only; read-only.
+#[tauri::command]
+pub async fn archive_conv_media_counts(
+    window: Webview,
+    app: AppHandle,
+    conv_id: String,
+) -> Result<archive::ConvMediaCounts, String> {
+    read_guard(&window, &app)?;
+    with_conn(&app, |conn| {
+        archive::conv_media_counts(conn, &conv_id)
+            .map_err(|kind| query_failure("conv_media_counts", kind))
+    })
+}
+
+/// Header facts of one conversation (batch 29a M4); `null` when the
+/// conversation does not exist. Archive webview only; read-only.
+#[tauri::command]
+pub async fn archive_conv_info(
+    window: Webview,
+    app: AppHandle,
+    conv_id: String,
+) -> Result<Option<archive::ConvInfo>, String> {
+    read_guard(&window, &app)?;
+    with_conn(&app, |conn| {
+        archive::conv_info(conn, &conv_id).map_err(|kind| query_failure("conv_info", kind))
+    })
+}
+
+/// Open one stored link in the default browser (batch 29a M5). The
+/// webview passes the MESSAGE ID only; the href is re-read here, must
+/// be http(s), and is opened through the app's own external-link
+/// opener — it never reaches JS. Returns `Ok(())` or an error kind
+/// (`bad-id`, `no-link`, `bad-scheme`). No DB write.
+#[tauri::command]
+pub async fn archive_open_link(
+    window: Webview,
+    app: AppHandle,
+    msg_id: String,
+) -> Result<(), String> {
+    read_guard(&window, &app)?;
+    if !archive::valid_msg_id(&msg_id) {
+        return Err("bad-id".into());
+    }
+    let found = with_conn(&app, |conn| {
+        archive::link_url(conn, &msg_id).map_err(|kind| query_failure("open_link", kind))
+    })?;
+    match found {
+        archive::LinkLookup::Url(url) => {
+            crate::opener::open_url(&app, url);
+            Ok(())
+        }
+        archive::LinkLookup::NoLink => Err("no-link".into()),
+        archive::LinkLookup::BadScheme => Err("bad-scheme".into()),
+    }
+}
+
+/// Result of `archive_save_attachment`: whether a file was written.
+/// The chosen path is never returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SaveResult {
+    pub saved: bool,
+}
+
+/// Save one downloaded attachment through a native Save dialog (batch
+/// 29a M5). The webview passes `(msg_id, idx)` only: the source is the
+/// DB row's file inside the media root (the media scheme's own guard),
+/// the default name is the stored title sanitised or
+/// `zalo-<kind>-<ts>.<ext>`, the destination is whatever the user
+/// picks, and the result is `{saved}` — no path either way. Returns an
+/// error kind (`bad-id`, `bad-idx`, `not-found`, `bad-path`,
+/// `copy-failed`) on failure. Does not write the DB, never opens the
+/// file with the shell.
+#[tauri::command]
+pub async fn archive_save_attachment(
+    window: Webview,
+    app: AppHandle,
+    msg_id: String,
+    idx: i64,
+) -> Result<SaveResult, String> {
+    read_guard(&window, &app)?;
+    if !archive::valid_msg_id(&msg_id) {
+        return Err("bad-id".into());
+    }
+    if !(0..=64).contains(&idx) {
+        return Err("bad-idx".into());
+    }
+    let cfg = crate::settings::load(&app).shadow;
+    // The session lock is held only for the lookup, not the dialog.
+    let target = with_conn(&app, |conn| {
+        archive::save_target(conn, &cfg, &msg_id, idx)
+            .map_err(|kind| query_failure("save_target", kind))
+    })?
+    .ok_or_else(|| "not-found".to_string())?;
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_file_name(&target.default_name)
+        .set_parent(&window.window())
+        .blocking_save_file()
+    else {
+        return Ok(SaveResult { saved: false });
+    };
+    let dest = picked.into_path().map_err(|_| "bad-path".to_string())?;
+    if std::fs::copy(&target.path, &dest).is_err() {
+        // Kind only: a path or an OS message could name the file.
+        crate::dlog::log("archive: save copy failed");
+        return Err("copy-failed".into());
+    }
+    Ok(SaveResult { saved: true })
 }
 
 /// Open (or focus) the archive window. Callable from the archive
@@ -531,6 +714,48 @@ mod tests {
         }
     }
 
+    /// Every data command (the old three and batch 29a's five) must run
+    /// `read_guard` — archive label on a local URL, then the app lock —
+    /// as its FIRST statement, so a non-archive label is refused before
+    /// anything is read. `read_guard` itself refuses through
+    /// `caller_can_read` (pinned above for every non-archive label);
+    /// this pins that no command forgets to call it.
+    #[test]
+    fn every_archive_data_command_starts_with_the_read_guard() {
+        let src = include_str!("archive_cmds.rs");
+        for cmd in [
+            "archive_list_conversations",
+            "archive_list_messages",
+            "archive_search",
+            "archive_conv_media",
+            "archive_conv_media_counts",
+            "archive_conv_info",
+            "archive_open_link",
+            "archive_save_attachment",
+        ] {
+            let marker = format!("pub async fn {cmd}(");
+            let at = src.find(&marker).unwrap_or_else(|| panic!("{cmd} is missing"));
+            let rest = &src[at + marker.len()..];
+            let end = rest.find("#[tauri::command]").unwrap_or(rest.len());
+            let body = &rest[..end];
+            let open = body.find("{
+").expect("fn body");
+            assert!(
+                body[open + 2..].trim_start().starts_with("read_guard(&window, &app)?;"),
+                "{cmd} must call read_guard first"
+            );
+        }
+        // The two actions never write the DB or shell-open a file.
+        for cmd in ["archive_open_link", "archive_save_attachment"] {
+            let at = src.find(&format!("pub async fn {cmd}(")).unwrap();
+            let rest = &src[at..];
+            let body = &rest[..rest.find("#[tauri::command]").unwrap_or(rest.len())];
+            for banned in ["execute(", "execute_batch(", "open_file(", "reveal", "Command::new"] {
+                assert!(!body.contains(banned), "{cmd} must not use {banned}");
+            }
+        }
+    }
+
     #[test]
     fn archive_open_is_callable_from_archive_and_settings_only() {
         assert!(caller_can_open("archive"));
@@ -620,6 +845,12 @@ mod tests {
         "allow-archive-list-conversations",
         "allow-archive-list-messages",
         "allow-archive-search",
+        // Batch 29a.
+        "allow-archive-conv-media",
+        "allow-archive-conv-media-counts",
+        "allow-archive-conv-info",
+        "allow-archive-open-link",
+        "allow-archive-save-attachment",
     ];
 
     #[test]
@@ -707,6 +938,12 @@ mod tests {
             "archive_list_messages",
             "archive_search",
             "archive_open",
+            // Batch 29a.
+            "archive_conv_media",
+            "archive_conv_media_counts",
+            "archive_conv_info",
+            "archive_open_link",
+            "archive_save_attachment",
         ] {
             let quoted = format!("\"{cmd}\"");
             let n = src.matches(&quoted).count();

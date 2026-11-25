@@ -93,6 +93,19 @@ pub fn build_match(query: &str) -> String {
 /// `messages.rowid = messages_fts.rowid`. Errors are log-safe kinds
 /// only (H-rule — no SQL, no user input in the message).
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>, String> {
+    search_in(conn, query, None, limit)
+}
+
+/// [`search`] optionally restricted to one conversation (batch 29a M6):
+/// the SAME FTS5 MATCH, the same bm25-then-`ts` order and limit, with
+/// `m.conv_id = ?` added to the join-back (`None` = every
+/// conversation, byte-for-byte the old query result).
+pub fn search_in(
+    conn: &Connection,
+    query: &str,
+    conv_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Hit>, String> {
     let m = build_match(query);
     if m.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -104,12 +117,13 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Hit>, 
              FROM messages_fts
              JOIN messages m ON m.rowid = messages_fts.rowid
              WHERE messages_fts MATCH ?1
+               AND (?3 IS NULL OR m.conv_id = ?3)
              ORDER BY bm25(messages_fts), m.ts DESC
              LIMIT ?2",
         )
         .map_err(|e| format!("prepare:{}", kind(&e)))?;
     let rows = st
-        .query_map(rusqlite::params![m, limit as i64], |r| {
+        .query_map(rusqlite::params![m, limit as i64, conv_id], |r| {
             Ok(Hit {
                 msg_id: r.get(0)?,
                 conv_id: r.get(1)?,

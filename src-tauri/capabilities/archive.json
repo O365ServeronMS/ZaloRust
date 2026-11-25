@@ -1,14 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "archive-local",
-  "description": "IPC for the Lưu trữ (archive) window: the four read-only archive commands plus core:default and the window-close permission it needs. No remote, no account/lock/settings/notification permissions; per-command authorization is also enforced in Rust (archive_cmds::read_guard checks the caller label + app lock). The remote Zalo page gets nothing from this set, and settings gains only allow-archive-open.",
+  "description": "IPC for the Lưu trữ (archive) window: the read-only archive commands (batch 29a adds the info-panel lists plus open-link and save-attachment, both user-initiated) plus core:default and the window-close permission it needs. No remote, no account/lock/settings/notification permissions; per-command authorization is also enforced in Rust (archive_cmds::read_guard checks the caller label + app lock). The remote Zalo page gets nothing from this set, and settings gains only allow-archive-open.",
   "permissions": [
     "core:default",
     "core:window:allow-close",
     "allow-archive-list-conversations",
     "allow-archive-list-messages",
     "allow-archive-search",
-    "allow-archive-open"
+    "allow-archive-open",
+    "allow-archive-conv-media",
+    "allow-archive-conv-media-counts",
+    "allow-archive-conv-info",
+    "allow-archive-open-link",
+    "allow-archive-save-attachment"
   ],
   "webviews": [
     "archive"
