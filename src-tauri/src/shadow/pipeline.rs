@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 use serde_json::Value;
 
+use super::event_stats::EventTally;
 use super::{Write, normalize, writer};
 
 /// One decoded item entering the pipeline.
@@ -48,6 +49,11 @@ pub struct Summary {
     /// 500 one-kind failures is one entry. Error text, SQL params and
     /// payloads never enter here.
     pub write_error_kinds: BTreeMap<String, usize>,
+    /// Batch 30: the counts-only tally of the passive WS event decoding
+    /// and the extra REST normalizers for this batch (the flusher hands
+    /// it to `event_stats::record`). Not a success counter: it counts
+    /// what was DECODED, so `zero_success` leaves it alone.
+    pub events: EventTally,
 }
 
 impl Summary {
@@ -55,8 +61,10 @@ impl Summary {
         match tag {
             "message" => self.messages += 1,
             "conversation" => self.conversations += 1,
-            "group" => self.groups += 1,
-            "contact" => self.contacts += 1,
+            // Batch 30: the new group / contact write kinds count in the
+            // same log buckets as their older siblings.
+            "group" | "group_event" | "group_stub" => self.groups += 1,
+            "contact" | "contact_fill" => self.contacts += 1,
             _ => self.other_writes += 1,
         }
     }
@@ -190,13 +198,27 @@ pub fn normalize_kind(
     env: &Value,
     own_uid: Option<&str>,
 ) -> Vec<Write> {
+    normalize_kind_ex(kind, endpoint, env, own_uid).0
+}
+
+/// [`normalize_kind`] plus the batch-30 event tally (the same
+/// dispatch; `process_batch` uses this one).
+pub fn normalize_kind_ex(
+    kind: &str,
+    endpoint: &str,
+    env: &Value,
+    own_uid: Option<&str>,
+) -> (Vec<Write>, EventTally) {
     match kind {
-        "ws" => normalize::normalize_ws(env, own_uid),
-        "rest" => normalize::normalize_rest(endpoint, env, own_uid),
-        "e2ee" => normalize::normalize_e2ee_message(env, own_uid)
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
+        "ws" => normalize::normalize_ws_ex(env, own_uid),
+        "rest" => normalize::normalize_rest_ex(endpoint, env, own_uid),
+        "e2ee" => (
+            normalize::normalize_e2ee_message(env, own_uid)
+                .into_iter()
+                .collect(),
+            EventTally::default(),
+        ),
+        _ => (Vec::new(), EventTally::default()),
     }
 }
 
@@ -244,7 +266,8 @@ pub fn process_batch(
                 }
             }
         }
-        let writes = normalize_kind(item.kind, &item.endpoint, &item.env, own_uid);
+        let (writes, tally) = normalize_kind_ex(item.kind, &item.endpoint, &item.env, own_uid);
+        s.events.merge(&tally);
         for (j, w) in writes.iter().enumerate() {
             match apply_item(conn, w) {
                 Ok(tag) => s.add_write(tag),
@@ -482,6 +505,7 @@ mod tests {
             other_writes: 1,
             write_errors: 0,
             write_error_kinds: BTreeMap::new(),
+            events: EventTally::default(),
         };
         count_aborted(&mut s, ["message", "conversation"].into_iter(), 2, 1);
         assert_eq!(s.write_errors, 5);
@@ -597,5 +621,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(flipped, 0);
+    }
+    // --- Batch 30: the passive event decoding end to end ------------------
+
+    fn ws_env(cmd: u16, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"cmd": cmd, "subCmd": 0, "data": {"data": payload, "error_code": 0}})
+    }
+
+    fn ws_item(cmd: u16, payload: serde_json::Value) -> Incoming {
+        Incoming {
+            kind: "ws",
+            direction: "in",
+            endpoint: format!("ws:{cmd}/0"),
+            env: ws_env(cmd, payload),
+        }
+    }
+
+    #[test]
+    fn batch30_group_event_and_reaction_frames_land_and_replay_cleanly() {
+        let conn = db();
+        let gid = "4945066207717951086";
+        let join = ws_item(
+            601,
+            serde_json::json!({"controls": [{"content": {"act_type": "group", "act": "join", "data": {
+                "groupId": gid, "groupName": "Nhóm dự án", "sourceId": "7001", "time": "1731987200000",
+                "updateMembers": [{"id": "8441", "dName": "Lan", "avatar": "https://ava.example.invalid/1.jpg"}]
+            }}}]}),
+        );
+        let react = ws_item(
+            612,
+            serde_json::json!({"reactGroups": [{"uidFrom": "8441", "idTo": gid, "ts": "1731987201000",
+                "content": "{\"rMsg\":[{\"gMsgID\":\"g-late\",\"cMsgID\":\"1\",\"msgType\":1}],\"rIcon\":\"/-heart\"}"}]}),
+        );
+        let receipts = ws_item(502, serde_json::json!({"delivereds": [{"msgId": "1"}], "seens": []}));
+        let batch = vec![join, react, receipts];
+        let s = process_batch(&conn, &batch, &[], 7, None);
+        assert_eq!(s.write_errors, 0, "{:?}", s.write_error_kinds);
+        assert_eq!(s.raw_events, 3);
+        assert_eq!(s.events.get("grp.join"), 1);
+        assert_eq!(s.events.get("grp.sys_line"), 1);
+        assert_eq!(s.events.get("react.applied"), 1);
+        assert_eq!(s.events.get("rcpt.502.delivereds"), 1);
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(q("SELECT COUNT(*) FROM messages WHERE type = 10 AND source = 'capture'"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM participants"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM reactions WHERE msg_id = 'g-late'"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM messages WHERE msg_id = 'g-late'"), 0, "no message needed");
+        assert_eq!(q("SELECT COUNT(*) FROM contacts WHERE user_id = '8441'"), 1);
+        // Replay the same batch: nothing duplicates, no revision appears.
+        let s2 = process_batch(&conn, &batch, &[], 7, None);
+        assert_eq!(s2.write_errors, 0);
+        assert_eq!(q("SELECT COUNT(*) FROM messages WHERE type = 10"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM participants"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM reactions"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM message_revisions"), 0);
+        // The new write kinds count in the batch log buckets.
+        assert!(s.contacts >= 1 && s.groups >= 1);
+    }
+
+    #[test]
+    fn batch30_rest_endpoints_flow_through_the_pipeline() {
+        let conn = db();
+        let item = |ep: &str, data: serde_json::Value| Incoming {
+            kind: "rest",
+            direction: "in",
+            endpoint: ep.into(),
+            env: serde_json::json!({"error_code": 0, "data": data}),
+        };
+        let batch = vec![
+            item(
+                "/api/social/friend/getfriends",
+                serde_json::json!([{"userId": "8441", "displayName": "Lan", "avatar": "https://ava.example.invalid/1.jpg"}]),
+            ),
+            item(
+                "/api/group/getlg/v4",
+                serde_json::json!({"version": "1", "gridVerMap": {"4945066207717951086": "3"}}),
+            ),
+        ];
+        let s = process_batch(&conn, &batch, &[], 7, None);
+        assert_eq!(s.write_errors, 0, "{:?}", s.write_error_kinds);
+        assert_eq!(s.events.get("rest.getfriends.items"), 1);
+        assert_eq!(s.events.get("rest.getlg.items"), 1);
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(q("SELECT COUNT(*) FROM contacts WHERE display_name = 'Lan'"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM groups"), 1);
+        assert_eq!(q("SELECT COUNT(*) FROM conversations"), 0, "stubs touch groups only");
     }
 }

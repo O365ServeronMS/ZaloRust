@@ -48,10 +48,11 @@ pub struct ConvRow {
     pub last_msg_preview: Option<String>,
     /// Batch 29a M2: `conv_type == 1`.
     pub is_group: bool,
-    /// Batch 29a M2: groups only. First populated source wins:
-    /// `participants` rows, then `groups.members_json` (array
-    /// length), then `groups.raw_json` `$.totalMember`. `None` for a
-    /// private chat or when none of them is populated.
+    /// Batch 29a M2: groups only. The largest populated source (batch
+    /// 30; was first-populated): `participants` rows,
+    /// `groups.members_json` (array length), `groups.raw_json`
+    /// `$.totalMember`. `None` for a private chat or when none of
+    /// them is populated.
     pub member_count: Option<i64>,
     /// Up to 2 letters for the avatar circle, from `name`.
     pub initials: String,
@@ -636,9 +637,16 @@ fn file_meta(info: &PayloadInfo) -> (Option<String>, Option<String>) {
 
 // --- conversations ---------------------------------------------------------------
 
-/// Member count from the populated source: `participants` rows, then
-/// `groups.members_json` (array length), then `groups.raw_json`
+/// Member count: the LARGEST populated source among `participants`
+/// rows, `groups.members_json` (array length) and `groups.raw_json`
 /// `$.totalMember`. Groups only.
+///
+/// Batch 30: this used to take the first populated source
+/// (`participants` first). Group events and member lists now write
+/// PARTIAL `participants` rows (a join of 2 people into a 50-member
+/// group), and a partial roster must not shrink the count a full
+/// snapshot (`totalMember` / `members_json`) already gave; when the
+/// roster really is the biggest source it still wins.
 fn member_count_of(
     is_group: bool,
     participants: i64,
@@ -651,7 +659,8 @@ fn member_count_of(
     [Some(participants), members_json, total_member]
         .into_iter()
         .flatten()
-        .find(|n| *n > 0)
+        .filter(|n| *n > 0)
+        .max()
 }
 
 /// SQL: the member-count inputs of a conversation `c` joined with
@@ -2760,13 +2769,19 @@ mod tests {
         let g = list_conversations(&conn, None, None, 10).unwrap().into_iter().find(|c| c.id == "g-1").unwrap();
         assert!(!g.last_sender_is_self);
         assert_eq!(g.last_sender_name.as_deref(), Some("Tôi"));
-        // Member count sources, in order: participants rows win, then members_json.
+        // Member count: the largest populated source (batch 30: a partial
+        // participants roster must not shrink a fuller snapshot). The
+        // fixture's raw_json.totalMember is 5.
         conn.execute("UPDATE groups SET members_json = '[\"a\",\"b\",\"c\"]' WHERE group_id = 'g-1'", []).unwrap();
-        assert_eq!(conv_info(&conn, "g-1").unwrap().unwrap().member_count, Some(3));
+        assert_eq!(conv_info(&conn, "g-1").unwrap().unwrap().member_count, Some(5), "totalMember 5 > members_json 3");
         for u in ["p1", "p2"] {
             conn.execute("INSERT INTO participants (conv_id, user_id) VALUES ('g-1', ?1)", rusqlite::params![u]).unwrap();
         }
-        assert_eq!(conv_info(&conn, "g-1").unwrap().unwrap().member_count, Some(2));
+        assert_eq!(conv_info(&conn, "g-1").unwrap().unwrap().member_count, Some(5), "2 partial rows do not shrink 5");
+        for u in ["p3", "p4", "p5", "p6"] {
+            conn.execute("INSERT INTO participants (conv_id, user_id) VALUES ('g-1', ?1)", rusqlite::params![u]).unwrap();
+        }
+        assert_eq!(conv_info(&conn, "g-1").unwrap().unwrap().member_count, Some(6), "a bigger roster wins");
         // Malformed JSON never breaks the list.
         conn.execute("UPDATE groups SET members_json = 'not json', raw_json = '{oops' WHERE group_id = 'g-1'", []).unwrap();
         conn.execute("DELETE FROM participants", []).unwrap();

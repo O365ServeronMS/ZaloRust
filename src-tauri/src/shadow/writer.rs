@@ -220,10 +220,27 @@ pub fn apply(conn: &Connection, w: &Write) -> rusqlite::Result<&'static str> {
             user_id,
             emoji,
             ts,
+            remove,
         } => {
+            if *remove {
+                // Batch 30 M2: `rIcon == ""` deletes that user's reaction,
+                // unless the stored one is NEWER than the removal (an
+                // out-of-order replay must not erase a later reaction).
+                conn.execute(
+                    "DELETE FROM reactions
+                      WHERE msg_id = ?1 AND user_id = ?2 AND COALESCE(ts, 0) <= ?3",
+                    rusqlite::params![msg_id, user_id, ts],
+                )?;
+                return Ok("reaction");
+            }
+            // Batch 30 M2: the upsert only moves FORWARD in ts (the 610/611
+            // history frames can arrive after a live 612 for the same
+            // message; replays converge). No FK: a reaction whose target
+            // message has not been captured yet is stored anyway.
             conn.execute(
                 "INSERT INTO reactions (msg_id, user_id, emoji, ts) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(msg_id, user_id) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts",
+                 ON CONFLICT(msg_id, user_id) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts
+                 WHERE COALESCE(excluded.ts, 0) >= COALESCE(reactions.ts, 0)",
                 rusqlite::params![msg_id, user_id, emoji, ts],
             )?;
             Ok("reaction")
@@ -274,7 +291,163 @@ pub fn apply(conn: &Connection, w: &Write) -> rusqlite::Result<&'static str> {
             )?;
             Ok("group")
         }
+        Write::GroupEvent {
+            group_id,
+            name,
+            avatar_url,
+            ts,
+        } => {
+            let now = schema::now_ms();
+            if let Some(n) = name.as_deref().filter(|n| !n.is_empty()) {
+                let stored: Option<(Option<String>, Option<i64>)> = conn
+                    .query_row(
+                        "SELECT name, updated_at FROM groups WHERE group_id = ?1",
+                        rusqlite::params![group_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok();
+                let (empty, updated) = match &stored {
+                    Some((nm, up)) => (nm.as_deref().is_none_or(str::is_empty), *up),
+                    None => (true, None),
+                };
+                if event_wins(empty, updated, *ts) {
+                    conn.execute(
+                        "INSERT INTO groups (group_id, name, raw_json, updated_at)
+                         VALUES (?1, ?2, NULL, ?3)
+                         ON CONFLICT(group_id) DO UPDATE SET
+                           name = excluded.name, updated_at = excluded.updated_at",
+                        rusqlite::params![group_id, n, now],
+                    )?;
+                    // Same mirror as getmg-v2: the conversation title.
+                    conn.execute(
+                        "UPDATE conversations SET title = ?2, updated_at = MAX(updated_at, ?3)
+                          WHERE id = ?1",
+                        rusqlite::params![group_id, n, now],
+                    )?;
+                }
+            }
+            if let Some(a) = avatar_url.as_deref().filter(|a| !a.is_empty()) {
+                let stored: Option<(Option<String>, i64)> = conn
+                    .query_row(
+                        "SELECT avatar_url, updated_at FROM conversations WHERE id = ?1",
+                        rusqlite::params![group_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .ok();
+                // No conversation row yet: nothing to attach it to (the
+                // system line / the first message creates the stub, and a
+                // later event or refresh fills the avatar).
+                if let Some((av, up)) = stored {
+                    let empty = av.as_deref().is_none_or(str::is_empty);
+                    if event_wins(empty, Some(up), *ts) {
+                        conn.execute(
+                            "UPDATE conversations SET avatar_url = ?2 WHERE id = ?1",
+                            rusqlite::params![group_id, a],
+                        )?;
+                    }
+                }
+            }
+            Ok("group_event")
+        }
+        Write::ParticipantsDelta {
+            conv_id,
+            add,
+            remove,
+            roles,
+            ts,
+        } => {
+            for u in add {
+                conn.execute(
+                    "INSERT INTO participants (conv_id, user_id, role, joined_ts, raw_json)
+                     VALUES (?1, ?2, 0, ?3, NULL)
+                     ON CONFLICT(conv_id, user_id) DO UPDATE SET
+                       joined_ts = MAX(COALESCE(participants.joined_ts, 0), excluded.joined_ts)",
+                    rusqlite::params![conv_id, u, ts],
+                )?;
+            }
+            for u in remove {
+                conn.execute(
+                    "DELETE FROM participants
+                      WHERE conv_id = ?1 AND user_id = ?2 AND COALESCE(joined_ts, 0) <= ?3",
+                    rusqlite::params![conv_id, u, ts],
+                )?;
+            }
+            for (u, role) in roles {
+                conn.execute(
+                    "INSERT INTO participants (conv_id, user_id, role, joined_ts, raw_json)
+                     VALUES (?1, ?2, ?3, NULL, NULL)
+                     ON CONFLICT(conv_id, user_id) DO UPDATE SET role = excluded.role",
+                    rusqlite::params![conv_id, u, role],
+                )?;
+            }
+            Ok("participants_delta")
+        }
+        Write::ContactFill {
+            user_id,
+            display_name,
+            avatar_url,
+            event_ts,
+            raw,
+        } => {
+            let stored: Option<(Option<String>, Option<String>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT display_name, avatar_url, updated_at FROM contacts WHERE user_id = ?1",
+                    rusqlite::params![user_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let (st_name, st_avatar, st_updated) = stored.unwrap_or((None, None, None));
+            let wins = |empty: bool| match event_ts {
+                Some(t) => event_wins(empty, st_updated, *t),
+                None => empty,
+            };
+            let new_name = display_name
+                .as_deref()
+                .filter(|n| !n.is_empty() && wins(st_name.as_deref().is_none_or(str::is_empty)))
+                .map(str::to_string);
+            let new_avatar = avatar_url
+                .as_deref()
+                .filter(|a| !a.is_empty() && wins(st_avatar.as_deref().is_none_or(str::is_empty)))
+                .map(str::to_string);
+            // The row is created (or its NULL raw filled) even when no
+            // name/avatar wins: the contact id itself is a fact.
+            conn.execute(
+                "INSERT INTO contacts (user_id, display_name, phone_hash, avatar_url, raw_json, updated_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                   display_name = COALESCE(?2, contacts.display_name),
+                   avatar_url   = COALESCE(?3, contacts.avatar_url),
+                   raw_json     = COALESCE(contacts.raw_json, ?4),
+                   updated_at   = CASE WHEN ?2 IS NOT NULL OR ?3 IS NOT NULL
+                                       THEN ?5 ELSE contacts.updated_at END",
+                rusqlite::params![user_id, new_name, new_avatar, raw, schema::now_ms()],
+            )?;
+            Ok("contact_fill")
+        }
+        Write::GroupStub { group_id } => {
+            conn.execute(
+                "INSERT OR IGNORE INTO groups (group_id, name, raw_json, updated_at)
+                 VALUES (?1, NULL, NULL, ?2)",
+                rusqlite::params![group_id, schema::now_ms()],
+            )?;
+            Ok("group_stub")
+        }
     }
+}
+
+/// Clock-skew margin for the event-vs-stored-row comparison (batch 30):
+/// a live event may carry a server time a little behind this machine's
+/// write time of the previous row, and must still win; an OLD replayed
+/// event (hours or days behind) must not.
+const EVENT_SKEW_MS: i64 = 120_000;
+
+/// Does an event with server time `event_ts` (ms) get to overwrite a
+/// stored cell? Always when the cell is empty; otherwise only when the
+/// event is not older than the stored row's `updated_at` (minus the
+/// skew margin). `None` (no stored row timestamp) counts as old stored
+/// data, so the event wins.
+pub(crate) fn event_wins(stored_empty: bool, stored_updated: Option<i64>, event_ts: i64) -> bool {
+    stored_empty || stored_updated.is_none_or(|u| event_ts.saturating_add(EVENT_SKEW_MS) > u)
 }
 
 /// Source precedence rank (H4-a/T4): `e2ee` (3) > `capture` (2) >

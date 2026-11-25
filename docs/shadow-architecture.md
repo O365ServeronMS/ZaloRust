@@ -58,6 +58,27 @@
 | A7 | **Import Desktop (P2) = merge 1 chiều vào kho**: `source='import'`, không đè capture plaintext (writer guard), media Desktop hardlink (D9, cùng volume D:) | kho Web + kho Desktop thành MỘT lịch sử duy nhất |
 | A8 | **Backup (P4) cuối pipeline**: VACUUM INTO + manifest sha256/counts, 6h + on-exit, 7 daily + 4 weekly (D3), media incremental theo sha256 filename | backup luôn phản ánh kho đã ổn định |
 
+**A2 sau batch 30 (25/11/2026): vẫn read-only.** Batch 30 chỉ GIẢI MÃ THÊM những gì Zalo Web đã nhận (WS `encrypt=3`, reaction, sự kiện nhóm, `getLoginInfo`, 5 endpoint REST danh bạ/nhóm). Không gửi request nào, không ghi gì vào page. Khóa của `getLoginInfo` suy ra trong RAM từ `zcid`/`zcid_ext` nằm trong URL request mà CDP đã báo; không khóa, `zcid`, cookie, uid hay URL nào được lưu hoặc log (A6). Việc "đọc nhẹ chủ động" qua trang (nới A2) là batch 33 và chưa làm.
+
+### 2.1 Bảng WS cmd (batch 30)
+
+Nguồn: zca-js v2.4.0 `src/apis/listen.ts` (MIT, xem `docs/third-party-notices.md`). Code: `shadow/ws_events.rs` (`classify_cmd`).
+
+| cmd | Nội dung | Phân loại | Kết quả |
+|---|---|---|---|
+| 501 510 511 521 551 | tin nhắn (đường cũ `msgs`/`groupMsgs`/...) | giải mã | `Write::Message` như trước |
+| 601 | `controls[]`: `group`, `fr`, `transfer_sync2`, `file_done` | giải mã | sự kiện nhóm -> `groups`/`conversations`/`contacts`/`participants` + dòng hệ thống (`messages.type=10`); `fr`, `transfer_sync2`, `file_done` chỉ đếm |
+| 610 611 612 | reaction (lịch sử, nhóm, trực tiếp) | giải mã | `Write::Reaction` (thêm/gỡ), đích có thể chưa có trong `messages` |
+| 502 522 | đã nhận / đã xem | chỉ đếm | số frame + số phần tử mỗi mảng, không lưu |
+| 602 | đang gõ | chỉ đếm | số frame + số phần tử |
+| 3000 | đăng nhập trùng | chỉ đếm | bộ đếm + 1 dòng log mỗi giờ: `ws: session replaced elsewhere (cmd 3000)` |
+| 1 2 | khóa / ping | bỏ qua | chỉ bộ đếm frame |
+| khác | chưa phân loại | chưa biết | `frames.unclassified` (nhóm "lạ" duy nhất còn lại) |
+
+`encrypt=3` (batch 30 M1): AES-GCM giống `encrypt=2` (cùng khóa, cùng bố cục `[IV 16][AAD 16][ct+tag]`) nhưng KHÔNG gzip.
+
+Quy ước dữ liệu từ sự kiện nhóm: dòng hệ thống có `msg_id = sys:<groupId>:<time>:<act>:<hash8 member id>` (replay idempotent), `source='capture'`, `payload_json = {"sys":"group","act","actor","members":[ids]}` chỉ chứa id. `participants.role`: 0 thành viên, 1 phó nhóm. Số thành viên ở màn Lưu trữ lấy nguồn LỚN NHẤT trong `participants`/`members_json`/`totalMember` (vì `participants` chỉ có từng phần từ sự kiện).
+
 ## 3. Thành phần as-built (đường dẫn ngắn; chi tiết trong audit handoff §3)
 
 | Thành phần | File | Trạng thái 19-Nov |

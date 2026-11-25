@@ -21,7 +21,8 @@
 
 use serde_json::Value;
 
-use super::Write;
+use super::event_stats::EventTally;
+use super::{rest_ext, ws_events, Write};
 
 /// Unwrap the envelope nesting to the actual payload object.
 ///
@@ -64,36 +65,53 @@ pub fn unwrap_payload(env: &Value) -> Value {
 /// `own_uid`: the logged-in account uid (bridge handshake); self-sent
 /// messages carry `uidFrom == "0"` and get `sender_id = own_uid`.
 pub fn normalize_ws(env: &Value, own_uid: Option<&str>) -> Vec<Write> {
+    normalize_ws_ex(env, own_uid).0
+}
+
+/// [`normalize_ws`] plus the counts-only [`EventTally`] of the passive
+/// event decoding (batch 30 M2-M4: reactions, controls, receipts,
+/// typing, duplicate login; see `ws_events`). The message / conversation
+/// writes are EXACTLY the pre-batch-30 ones and come first; the event
+/// writes (new kinds only) are appended after them.
+pub fn normalize_ws_ex(env: &Value, own_uid: Option<&str>) -> (Vec<Write>, EventTally) {
     let mut out = Vec::new();
+    let mut tally = EventTally::default();
     let payload = unwrap_payload(env);
-    let Some(data) = payload.as_object() else {
-        return out;
-    };
-    for (key, is_group) in [
-        ("msgs", Some(false)),
-        ("groupMsgs", Some(true)),
-        ("pageMsgs", Some(false)),
-        ("eeMsgs", Some(false)),
-    ] {
-        let Some(arr) = data.get(key).and_then(Value::as_array) else {
-            continue;
-        };
-        for m in arr {
-            if let Some(w) = message_to_write(m, is_group, "capture", own_uid) {
-                out.push(w);
+    if let Some(data) = payload.as_object() {
+        for (key, is_group) in [
+            ("msgs", Some(false)),
+            ("groupMsgs", Some(true)),
+            ("pageMsgs", Some(false)),
+            ("eeMsgs", Some(false)),
+        ] {
+            let Some(arr) = data.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            for m in arr {
+                if let Some(w) = message_to_write(m, is_group, "capture", own_uid) {
+                    out.push(w);
+                }
+            }
+        }
+        // WS frames also carry conversation stubs (clearUnreads) on message
+        // pushes: {idTo, isGroup, lastMsgId} (verified: same shape as REST).
+        if let Some(clear) = data.get("clearUnreads").and_then(Value::as_array) {
+            for c in clear {
+                if let Some(w) = clear_to_conversation(c) {
+                    out.push(w);
+                }
             }
         }
     }
-    // WS frames also carry conversation stubs (clearUnreads) on message
-    // pushes: {idTo, isGroup, lastMsgId} (verified: same shape as REST).
-    if let Some(clear) = data.get("clearUnreads").and_then(Value::as_array) {
-        for c in clear {
-            if let Some(w) = clear_to_conversation(c) {
-                out.push(w);
-            }
-        }
+    // Batch 30: the passive event decoding, keyed by the envelope's cmd.
+    if let Some(cmd) = env
+        .get("cmd")
+        .and_then(Value::as_u64)
+        .and_then(|c| u16::try_from(c).ok())
+    {
+        out.extend(ws_events::decode(cmd, &payload, own_uid, &mut tally));
     }
-    out
+    (out, tally)
 }
 
 fn clear_to_conversation(c: &Value) -> Option<Write> {
@@ -117,10 +135,24 @@ fn clear_to_conversation(c: &Value) -> Option<Write> {
 
 /// Map a decoded REST envelope for `endpoint` to writes.
 pub fn normalize_rest(endpoint: &str, env: &Value, own_uid: Option<&str>) -> Vec<Write> {
+    normalize_rest_ex(endpoint, env, own_uid).0
+}
+
+/// [`normalize_rest`] plus the counts-only tally of the batch-30 M6
+/// endpoints (`rest_ext`). The pre-batch-30 branches are unchanged.
+pub fn normalize_rest_ex(
+    endpoint: &str,
+    env: &Value,
+    own_uid: Option<&str>,
+) -> (Vec<Write>, EventTally) {
     let mut out = Vec::new();
+    let mut tally = EventTally::default();
     let payload = unwrap_payload(env);
+    // Batch 30 M6: friends / group id list / member + mini profiles /
+    // avatar urls (an array body for getfriends, objects for the rest).
+    out.extend(rest_ext::normalize_rest_ext(endpoint, &payload, &mut tally));
     let Some(data) = payload.as_object() else {
-        return out;
+        return (out, tally);
     };
     if endpoint.contains("get-last-msgs") || endpoint.contains("preloadconvers") {
         if let Some(clear) = data.get("clearUnreads").and_then(Value::as_array) {
@@ -184,7 +216,7 @@ pub fn normalize_rest(endpoint: &str, env: &Value, own_uid: Option<&str>) -> Vec
             });
         }
     }
-    out
+    (out, tally)
 }
 
 /// Why an E2EE bridge payload was refused (audit 1.0-a, A6).
@@ -407,6 +439,46 @@ pub fn msg_type_code(t: &str) -> i64 {
         "recall" => 8,
         "chatContent" => 9,
         _ if t.is_empty() => 0,
+        _ => 100,
+    }
+}
+
+/// Map zca-js's numeric client message type (`cliMsgType`, e.g.
+/// `quote.cliMsgType`, sync ingest) to ZaloRust's `msg_type_code`
+/// (batch 30 M7). The numbers are the ones zca-js `getClientMessageType`
+/// assigns to the wire strings:
+///
+/// | zca-js | wire string | ZaloRust code |
+/// |---|---|---|
+/// | 1 | webchat | 1 |
+/// | 31 | chat.voice | 5 |
+/// | 32 | chat.photo | 2 |
+/// | 36 | chat.sticker | 3 |
+/// | 37 | chat.doodle | 12 |
+/// | 38 | chat.recommended / chat.link | 7 |
+/// | 43 | chat.location.new | 13 |
+/// | 44 | chat.video.msg | 6 |
+/// | 46 | share.file | 4 |
+/// | 49 | chat.gif | 11 |
+///
+/// Anything else is 100 (genuinely unknown), the same honest bucket
+/// `msg_type_code` uses. 29a's quote extraction (`archive::
+/// parse_payload`) reads only a quote's text/attach/sender, never its
+/// cliMsgType, so it has no consumer of this yet.
+///
+/// Ported from zca-js src/utils.ts getClientMessageType (MIT, (c) RFS-ADRENO and contributors)
+pub fn cli_msg_type_code(n: i64) -> i64 {
+    match n {
+        1 => 1,
+        31 => 5,
+        32 => 2,
+        36 => 3,
+        37 => 12,
+        38 => 7,
+        43 => 13,
+        44 => 6,
+        46 => 4,
+        49 => 11,
         _ => 100,
     }
 }
@@ -688,6 +760,59 @@ mod tests {
         // Unknown strings land in 100, empty in 0.
         assert_eq!(msg_type_code("chat.brand.new"), 100);
         assert_eq!(msg_type_code(""), 0);
+    }
+
+    #[test]
+    fn cli_msg_type_code_maps_the_zca_js_numbers() {
+        // Batch 30 M7: every zca-js getClientMessageType number lands on
+        // the same code msg_type_code gives its wire string.
+        for (n, wire, code) in [
+            (1i64, "webchat", 1i64),
+            (31, "chat.voice", 5),
+            (32, "chat.photo", 2),
+            (36, "chat.sticker", 3),
+            (37, "chat.doodle", 12),
+            (38, "chat.recommended", 7),
+            (43, "chat.location.new", 13),
+            (44, "chat.video.msg", 6),
+            (46, "share.file", 4),
+            (49, "chat.gif", 11),
+        ] {
+            assert_eq!(cli_msg_type_code(n), code, "number {n}");
+            assert_eq!(msg_type_code(wire), code, "wire {wire} agrees");
+        }
+        assert_eq!(msg_type_code("chat.link"), cli_msg_type_code(38));
+        for unknown in [0i64, 2, 30, 39, 99, -1, i64::MAX] {
+            assert_eq!(cli_msg_type_code(unknown), 100, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn ws_events_leave_the_message_writes_untouched() {
+        // Batch 30: a message frame still yields exactly its message
+        // writes; a 601 control frame yields event writes only.
+        let msg = json!({
+            "cmd": 501, "subCmd": 0,
+            "data": {"data": {"msgs": [{"msgId": "m1", "uidFrom": "8441", "idTo": "0", "ts": 1, "msgType": "webchat", "content": "x"}]}}
+        });
+        let (w, t) = normalize_ws_ex(&msg, None);
+        assert_eq!(w.len(), 1);
+        assert!(matches!(&w[0], Write::Message { kind: 1, .. }));
+        assert_eq!(t.get("frames.501"), 1);
+        let ctl = json!({
+            "cmd": 601, "subCmd": 0,
+            "data": {"data": {"controls": [{"content": {"act_type": "fr", "act": "remove", "data": "8441"}}]}}
+        });
+        let (w, t) = normalize_ws_ex(&ctl, None);
+        assert!(w.is_empty());
+        assert_eq!((t.get("frames.601"), t.get("fr.remove")), (1, 1));
+        // normalize_ws is the same writes without the tally.
+        assert_eq!(normalize_ws(&msg, None), normalize_ws_ex(&msg, None).0);
+        // An undecoded (ciphertext-string) envelope is still just a frame count.
+        let opaque = json!({"cmd": 612, "subCmd": 0, "encrypt": 3, "undecoded": "no-key", "body": "x"});
+        let (w, t) = normalize_ws_ex(&opaque, None);
+        assert!(w.is_empty());
+        assert_eq!(t.get("frames.612"), 1);
     }
 
     #[test]

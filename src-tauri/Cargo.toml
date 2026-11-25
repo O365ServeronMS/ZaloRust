@@ -140,6 +140,10 @@ argon2 = { version = "0.5.3", features = ["std"] }  # Argon2id password hashing 
 ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
 semver = "1"
 sha2 = "0.10"
+# Batch 30 M5: MD5 for the getLoginInfo response key (zca-js
+# ParamsEncryptor.createEncryptKey: MD5(zcid_ext)). RustCrypto, the same
+# family as sha2/aes/cbc; the ONLY crate batch 30 adds (user-approved).
+md-5 = { version = "0.10", default-features = false }
 # Batch 27b M2: the archive viewer shows JPEG XL (WebView2 cannot decode it)
 # by decoding it with this pure-Rust decoder (batch 28: to WebP
 # derivatives, see below). default-features = false

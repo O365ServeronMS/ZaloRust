@@ -16,6 +16,11 @@
 //!   bytes are `[IV 16][AAD 16][ct+tag]` of AES-128-GCM with the
 //!   per-connection key (frame `cmd=1 subCmd=1`, field `key`, RAM only),
 //!   and the plaintext is gzip.
+//! - `encrypt = 3` (batch 30 M1): exactly like 2 (same key, same
+//!   `[IV 16][AAD 16][ct+tag]` layout, same error kinds) but the
+//!   plaintext is the JSON itself, NOT gzip. Ported from zca-js
+//!   `src/utils.ts` `decodeEventData` (MIT, (c) RFS-ADRENO and
+//!   contributors).
 //!
 //! # REST bodies
 //!
@@ -38,6 +43,9 @@ use serde_json::{json, Map, Value};
 /// AES-128-GCM with a 16-byte nonce (Zalo's nonstandard GCM IV length).
 type Aes128GcmN16 = aes_gcm::AesGcm<aes_gcm::aes::Aes128, aes_gcm::aead::consts::U16>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+/// Batch 30 M5: the `getLoginInfo` response is AES-256-CBC (a 32-char
+/// UTF-8 key derived from the request's own query params).
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 /// The ENCODE side of the CBC format — used only by the test fixture
 /// builders below (the app only decodes).
 #[cfg(test)]
@@ -128,9 +136,17 @@ pub fn decode_ws_frame(frame: &WsFrame, key: Option<&[u8; 16]>) -> WsDecoded {
         },
         (2, Value::String(s)) => match key {
             None => return undecoded(&frame, 2, Undecoded::NoKey),
-            Some(k) => match decode_gcm_gzip(&s, k) {
+            Some(k) => match decode_gcm(&s, k, true) {
                 Some(v) => v,
                 None => return undecoded(&frame, 2, Undecoded::Crypto),
+            },
+        },
+        // Batch 30 M1: encrypt=3 = AES-GCM like 2, no gunzip.
+        (3, Value::String(s)) => match key {
+            None => return undecoded(&frame, 3, Undecoded::NoKey),
+            Some(k) => match decode_gcm(&s, k, false) {
+                Some(v) => v,
+                None => return undecoded(&frame, 3, Undecoded::Crypto),
             },
         },
         // Unknown encode or unexpected `data` type: keep as-is.
@@ -223,8 +239,11 @@ fn decode_gzip_b64(s: &str) -> Option<Value> {
     gunzip(&raw).and_then(|t| serde_json::from_slice(&t).ok())
 }
 
-/// percent-decode -> base64 -> [IV16|AAD16|ct+tag] AES-128-GCM -> gunzip.
-fn decode_gcm_gzip(s: &str, key: &[u8; 16]) -> Option<Value> {
+/// percent-decode -> base64 -> [IV16|AAD16|ct+tag] AES-128-GCM ->
+/// (gunzip when `gz`, i.e. encrypt=2; plain JSON for encrypt=3).
+///
+/// Ported from zca-js src/utils.ts decodeEventData (MIT, (c) RFS-ADRENO and contributors)
+fn decode_gcm(s: &str, key: &[u8; 16], gz: bool) -> Option<Value> {
     let pct = percent_decode(s);
     let raw = B64.decode(pct.trim()).ok()?;
     if raw.len() < 32 + 16 {
@@ -237,8 +256,12 @@ fn decode_gcm_gzip(s: &str, key: &[u8; 16]) -> Option<Value> {
     let plain = cipher
         .decrypt(nonce, aes_gcm::aead::Payload { msg: ct, aad })
         .ok()?;
-    let json = gunzip(&plain)?;
-    serde_json::from_slice(&json).ok()
+    if gz {
+        let json = gunzip(&plain)?;
+        serde_json::from_slice(&json).ok()
+    } else {
+        serde_json::from_slice(&plain).ok()
+    }
 }
 
 /// R1 (batch 21): WHY one REST body did not land a decoded envelope.
@@ -318,6 +341,33 @@ pub fn decode_rest_body_why(data: &str, key: &[u8; 16]) -> Result<Value, RestFai
     // the arm instead of inventing one).
     let iv = [0u8; 16];
     let dec = Aes128CbcDec::new(
+        aes::cipher::generic_array::GenericArray::from_slice(key),
+        aes::cipher::generic_array::GenericArray::from_slice(&iv),
+    );
+    let plain = dec
+        .decrypt_padded_vec_mut::<Pkcs7>(&ct)
+        .map_err(|_| RestFail::BadPadding)?;
+    let text = std::str::from_utf8(&plain).map_err(|_| RestFail::NotUtf8)?;
+    serde_json::from_str(text).map_err(|_| RestFail::NotJson)
+}
+
+/// Batch 30 M5: the AES-256 twin of [`decode_rest_body_why`] — percent-
+/// decode -> base64 -> AES-256-CBC (zero IV, PKCS7) -> inner JSON, with
+/// the same failure stages. Used only for the `getLoginInfo` response,
+/// whose 32-byte key is derived from the request's `zcid`/`zcid_ext`
+/// (see `login_info`). CryptoJS semantics: `enc.Utf8.parse(key)` of a
+/// 32-char key is a 32-byte WordArray, and CryptoJS AES picks the
+/// variant from the key length (8 words -> 14 rounds = AES-256).
+///
+/// Ported from zca-js src/utils.ts decryptResp / decodeRespAES (MIT, (c) RFS-ADRENO and contributors)
+pub fn decode_rest_body_why_256(data: &str, key: &[u8; 32]) -> Result<Value, RestFail> {
+    let pct = percent_decode(data);
+    let ct = B64.decode(pct.trim()).map_err(|_| RestFail::BadB64)?;
+    if ct.is_empty() || ct.len() % 16 != 0 {
+        return Err(RestFail::BadLen);
+    }
+    let iv = [0u8; 16];
+    let dec = Aes256CbcDec::new(
         aes::cipher::generic_array::GenericArray::from_slice(key),
         aes::cipher::generic_array::GenericArray::from_slice(&iv),
     );
@@ -430,7 +480,7 @@ pub(crate) fn data_is_opaque_string(env: &Value) -> bool {
 /// Minimal percent-decoder (no allocation for unreserved input).
 ///
 /// C5 (batch 3): a literal `+` is NOT mapped to space. Every caller
-/// feeds the result straight into base64 (`decode_gcm_gzip`,
+/// feeds the result straight into base64 (`decode_gcm`,
 /// `decode_rest_body`) and the base64 alphabet has no space — so a
 /// literal `+` in these payloads is always a real base64 char. A
 /// percent-encoder escapes `+` to `%2B` anyway, so no legitimate
@@ -484,10 +534,22 @@ pub fn test_gzip(data: &[u8]) -> Vec<u8> {
 pub fn test_encode_gcm_gzip(payload: &Value, key: &[u8; 16], iv: &[u8; 16], aad: &[u8]) -> String {
     let json = serde_json::to_vec(payload).unwrap();
     let gz = test_gzip(&json);
+    test_encode_gcm_bytes(&gz, key, iv, aad)
+}
+
+/// Batch 30 M1: the encrypt=3 encode side — AES-GCM over the JSON
+/// itself, no gzip.
+#[cfg(test)]
+pub fn test_encode_gcm_plain(payload: &Value, key: &[u8; 16], iv: &[u8; 16], aad: &[u8]) -> String {
+    test_encode_gcm_bytes(&serde_json::to_vec(payload).unwrap(), key, iv, aad)
+}
+
+#[cfg(test)]
+fn test_encode_gcm_bytes(plain: &[u8], key: &[u8; 16], iv: &[u8; 16], aad: &[u8]) -> String {
     let cipher = <Aes128GcmN16 as aes_gcm::KeyInit>::new(key.into());
     let nonce = aes_gcm::aead::generic_array::GenericArray::from_slice(iv);
     let ct = cipher
-        .encrypt(nonce, aes_gcm::aead::Payload { msg: &gz, aad })
+        .encrypt(nonce, aes_gcm::aead::Payload { msg: plain, aad })
         .unwrap();
     let mut raw = Vec::with_capacity(32 + ct.len());
     raw.extend_from_slice(iv);
@@ -583,6 +645,50 @@ mod tests {
             panic!("with key must decode");
         };
         assert_eq!(env["data"]["data0"]["hello"], "world");
+    }
+
+    #[test]
+    fn encrypt3_roundtrip_is_gcm_without_gzip() {
+        // Batch 30 M1: same key + layout as encrypt=2, plaintext is
+        // the JSON (no gunzip).
+        let key: [u8; 16] = [5; 16];
+        let iv: [u8; 16] = [3; 16];
+        let aad: &[u8] = &[0xBB; 16];
+        let payload = json!({"data": {"reacts": [], "reactGroups": []}});
+        let enc = test_encode_gcm_plain(&payload, &key, &iv, aad);
+        let body = json!({"data": enc, "encrypt": 3, "error_code": 0});
+        let f = frame(612, 0, body);
+        let WsDecoded::Envelope(env) = decode_ws_frame(&f, Some(&key)) else {
+            panic!("encrypt=3 with the key must decode");
+        };
+        assert!(env["data"]["data"]["reacts"].is_array());
+        // No key -> the same error kind as encrypt=2, tagged encrypt 3.
+        let WsDecoded::Undecoded { why, stored } = decode_ws_frame(&f, None) else {
+            panic!("no key must not decode");
+        };
+        assert_eq!(why, Undecoded::NoKey);
+        assert_eq!(stored["encrypt"], 3);
+        // Wrong key -> Crypto.
+        let bad = [6u8; 16];
+        let WsDecoded::Undecoded { why, .. } = decode_ws_frame(&f, Some(&bad)) else {
+            panic!("wrong key must not decode");
+        };
+        assert_eq!(why, Undecoded::Crypto);
+        // A gzip body sent as encrypt=3 is NOT gunzipped: it is not
+        // JSON, so it fails as Crypto (the plaintext check), and an
+        // encrypt=2 body of plain JSON fails the gunzip the same way.
+        let gz_as_3 = test_encode_gcm_gzip(&payload, &key, &iv, aad);
+        let f3 = frame(612, 0, json!({"data": gz_as_3, "encrypt": 3}));
+        assert!(matches!(
+            decode_ws_frame(&f3, Some(&key)),
+            WsDecoded::Undecoded { why: Undecoded::Crypto, .. }
+        ));
+        let plain_as_2 = test_encode_gcm_plain(&payload, &key, &iv, aad);
+        let f2 = frame(612, 0, json!({"data": plain_as_2, "encrypt": 2}));
+        assert!(matches!(
+            decode_ws_frame(&f2, Some(&key)),
+            WsDecoded::Undecoded { why: Undecoded::Crypto, .. }
+        ));
     }
 
     #[test]

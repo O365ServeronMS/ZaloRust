@@ -48,6 +48,7 @@ use tauri::Manager;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::account::{self, UidEvent};
+use super::login_info;
 use super::bounded::{BoundedMap, Inserted};
 use super::passphrase::StoreKeyMode;
 use super::pipeline;
@@ -435,72 +436,18 @@ fn flusher(
                     // too — wiped once the decode is done.
                     let key_b64 = zeroize::Zeroizing::new(key_b64);
                     if let Some(k) = wire::decode_key_field(&key_b64) {
-                        // L4/D4: a replaced key is wiped, not dropped.
-                        if let Some(mut old) = rest_key.replace(k) {
-                            old.zeroize();
-                        }
-                        crate::dlog::log("shadow: rest decode key armed (len 16)");
-                        // R1 (batch 19): an arm OR a replacement drains
-                        // every held body with the NEW key, in arrival
-                        // order. Bodies that decode join this batch as
-                        // normal `kind:"rest"` items — `process_batch`
-                        // writes their NEW decoded raw rows plus the
-                        // normalized writes, and the old no-key rows stay
-                        // untouched. Bodies that still fail are dropped
-                        // (counted). The drain itself only ever logs
-                        // counts (H-rule).
-                        let drained = pending.drain_with_key(&k);
-                        if drained.decoded() + drained.failed > 0 {
-                            crate::dlog::log(&format!(
-                                "shadow rest pending drain: decoded={} failed={}",
-                                drained.decoded(),
-                                drained.failed
-                            ));
-                        }
-                        // R1 (batch 21): a drain that had failures emits
-                        // ONE more line — the per-(safe_endpoint, kind)
-                        // tally, counts and safe endpoint paths only.
-                        if drained.failed > 0 {
-                            crate::dlog::log(&format!(
-                                "shadow rest pending drain fail: {}",
-                                drained.fail_tally.render()
-                            ));
-                        }
-                        for _ in 0..drained.decoded() {
-                            rest_stats::bump(RestStage::PendingDecoded);
-                        }
-                        for _ in 0..drained.failed {
-                            rest_stats::bump(RestStage::PendingFailed);
-                        }
-                        items.extend(drained.items);
+                        arm_rest_key(k, &mut rest_key, &mut pending, &mut items);
                     } else {
                         crate::dlog::log("shadow: handshake key rejected (bad shape)");
                     }
                     // D1 (KQ2): a configured uid ALWAYS wins; the
                     // handshake's uid only cross-checks.
-                    let (resolved, ev) = account::resolve_own_uid(
+                    adopt_uid(
                         cfg.own_uid.as_deref(),
-                        own_uid.as_deref(),
+                        &mut own_uid,
                         uid.as_deref(),
+                        &mut uid_mismatch_logged,
                     );
-                    match ev {
-                        UidEvent::Learned => {
-                            own_uid = resolved;
-                            crate::dlog::log(&format!(
-                                "shadow: own uid learned (len {})",
-                                own_uid.as_deref().map_or(0, |u| u.len())
-                            ));
-                        }
-                        UidEvent::Mismatch => {
-                            own_uid = resolved;
-                            if !uid_mismatch_logged {
-                                uid_mismatch_logged = true;
-                                // No values, ever (H-rule).
-                                crate::dlog::log("shadow: own uid mismatch (configured kept)");
-                            }
-                        }
-                        UidEvent::Same => {}
-                    }
                 }
                 Job::WsFrame { bytes, conn: ws_conn, direction } => {
                     let Some(frame) = wire::parse_ws_frame(&bytes) else {
@@ -556,6 +503,51 @@ fn flusher(
                             continue;
                         }
                     };
+                    // Batch 30 M5: getLoginInfo is NOT encrypted with the REST
+                    // key — its key derives from the request's own zcid /
+                    // zcid_ext, which ride in the (RAM-only) request URL.
+                    // Decoded here, passively; the body is never stored
+                    // (redacted shape) and never held for the drain.
+                    if login_info::is_login_info_endpoint(&endpoint) {
+                        let d = login_info::decode_login_info(&endpoint, &outer);
+                        rest_stats::bump_rest_decode(&outer, &d.env, d.outcome);
+                        items.push(pipeline::Incoming {
+                            kind: "rest",
+                            direction,
+                            endpoint: super::capture::safe_endpoint(&endpoint),
+                            env: d.env,
+                        });
+                        if let Some(mut facts) = d.facts {
+                            // Counts only in the log (H-rule): no key, uid,
+                            // url or service name ever reaches it.
+                            let services = facts.service_map.as_ref().map_or(0, |m| m.services());
+                            if let Some(m) = facts.service_map.take() {
+                                login_info::publish_service_map(m);
+                            }
+                            crate::dlog::log(&format!(
+                                "shadow: login-info decoded (keys {}, services {})",
+                                facts.top_keys, services
+                            ));
+                            adopt_uid(
+                                cfg.own_uid.as_deref(),
+                                &mut own_uid,
+                                facts.uid.as_deref(),
+                                &mut uid_mismatch_logged,
+                            );
+                            if let Some(mut k) = facts.rest_key {
+                                match rest_key {
+                                    Some(cur) => {
+                                        crate::dlog::log(login_info::agree_line(cur == k));
+                                    }
+                                    // No REST key yet: arm it from here
+                                    // (drains the held bodies, like a handshake).
+                                    None => arm_rest_key(k, &mut rest_key, &mut pending, &mut items),
+                                }
+                                k.zeroize();
+                            }
+                        }
+                        continue;
+                    }
                     let (env, outcome) =
                         wire::rest_envelope_outcome(&endpoint, &outer, rest_key.as_ref());
                     // C2 + batch 21 R1: decoded / undecoded / no-key
@@ -574,7 +566,7 @@ fn flusher(
                     // FULL ciphertext rides the bounded pending queue
                     // until a handshake arms the key. Non-string `data`
                     // bodies have nothing to decode and never queue.
-                    if rest_key.is_none() && outer.get("data").and_then(Value::as_str).is_some() {
+                    if login_info::should_hold_pending(&endpoint, &outer, rest_key.is_some()) {
                         rest_stats::bump(RestStage::PendingQueued);
                         let out = pending.push(endpoint, outer, direction, schema::now_ms());
                         for _ in 0..out.evicted {
@@ -684,6 +676,8 @@ fn flusher(
             continue;
         }
         let s = pipeline::process_batch(&conn, &items, &media, cfg.raw_events_days, own_uid.as_deref());
+        // Batch 30: counts-only event tally (throttled summary line).
+        super::event_stats::record(&s.events);
         if s.raw_events > 0 {
             crate::dlog::log(&format!(
                 "shadow batch: raw={} msgs={} convs={} groups={} contacts={} other={}",
@@ -721,6 +715,84 @@ fn flusher(
     // no-key rows.
     drop(pending);
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+}
+
+/// Arm (or replace) the REST decode key and drain the pending queue
+/// with it (R1, batch 19). Shared by the bridge handshake and the
+/// batch-30 getLoginInfo decode (`zpw_enk`, when no key is armed yet).
+/// Counts only in the log (H-rule).
+fn arm_rest_key(
+    k: [u8; 16],
+    rest_key: &mut Option<[u8; 16]>,
+    pending: &mut PendingRest,
+    items: &mut Vec<pipeline::Incoming>,
+) {
+    // L4/D4: a replaced key is wiped, not dropped.
+    if let Some(mut old) = rest_key.replace(k) {
+        old.zeroize();
+    }
+    crate::dlog::log("shadow: rest decode key armed (len 16)");
+    // R1 (batch 19): an arm OR a replacement drains every held body
+    // with the NEW key, in arrival order. Bodies that decode join this
+    // batch as normal `kind:"rest"` items — `process_batch` writes
+    // their NEW decoded raw rows plus the normalized writes, and the
+    // old no-key rows stay untouched. Bodies that still fail are
+    // dropped (counted). The drain itself only ever logs counts.
+    let drained = pending.drain_with_key(&k);
+    if drained.decoded() + drained.failed > 0 {
+        crate::dlog::log(&format!(
+            "shadow rest pending drain: decoded={} failed={}",
+            drained.decoded(),
+            drained.failed
+        ));
+    }
+    // R1 (batch 21): a drain that had failures emits ONE more line —
+    // the per-(safe_endpoint, kind) tally, counts and safe endpoint
+    // paths only.
+    if drained.failed > 0 {
+        crate::dlog::log(&format!(
+            "shadow rest pending drain fail: {}",
+            drained.fail_tally.render()
+        ));
+    }
+    for _ in 0..drained.decoded() {
+        rest_stats::bump(RestStage::PendingDecoded);
+    }
+    for _ in 0..drained.failed {
+        rest_stats::bump(RestStage::PendingFailed);
+    }
+    items.extend(drained.items);
+}
+
+/// D1 (KQ2): resolve the own uid after a handshake or a getLoginInfo
+/// decode. A configured uid ALWAYS wins; a learned one only fills an
+/// unconfigured install or cross-checks. No values are ever logged;
+/// the mismatch line fires at most once per process.
+fn adopt_uid(
+    configured: Option<&str>,
+    own_uid: &mut Option<String>,
+    learned: Option<&str>,
+    mismatch_logged: &mut bool,
+) {
+    let (resolved, ev) = account::resolve_own_uid(configured, own_uid.as_deref(), learned);
+    match ev {
+        UidEvent::Learned => {
+            *own_uid = resolved;
+            crate::dlog::log(&format!(
+                "shadow: own uid learned (len {})",
+                own_uid.as_deref().map_or(0, |u| u.len())
+            ));
+        }
+        UidEvent::Mismatch => {
+            *own_uid = resolved;
+            if !*mismatch_logged {
+                *mismatch_logged = true;
+                // No values, ever (H-rule).
+                crate::dlog::log("shadow: own uid mismatch (configured kept)");
+            }
+        }
+        UidEvent::Same => {}
+    }
 }
 
 /// D1 (KQ2/KQ10): the flusher-start `accounts` upsert, in its own

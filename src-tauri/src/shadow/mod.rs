@@ -57,6 +57,10 @@ pub mod cli;
 /// Disk-space guard for the media store (audit §4 4.3, D13, batch 8):
 /// pure verdict + `GetDiskFreeSpaceExW` (hand-declared — no new crates).
 pub mod disk_space;
+/// Counts-only tally of the passively decoded WS events and REST
+/// normalizers (batch 30): fixed label vocabulary, throttled summary
+/// line, the hourly cmd-3000 line.
+pub mod event_stats;
 pub mod import;
 /// The apply step of the Desktop import (audit §4 item 2.5, batch 16
 /// P1): the ONLY code path that writes into a shadow store, guarded
@@ -74,6 +78,9 @@ pub mod import_map;
 pub mod derive_cli;
 pub mod img_derive;
 pub mod jxl_decode;
+/// Passive decode of the `getLoginInfo` response (batch 30 M5): the key
+/// is derived from the request's own `zcid`/`zcid_ext` (zca-js port).
+pub mod login_info;
 pub mod media;
 /// Batch 26 M1 (media for imported history): the `zalors media` CLI —
 /// a READ-ONLY shape tool over the media queue (census of attachments
@@ -111,6 +118,9 @@ pub mod rest_stats;
 /// handshake drain that turns held bodies into normal `kind:"rest"`
 /// pipeline items. Pure — the flusher owns all `rest_stats` bumping.
 pub mod rest_pending;
+/// Batch 30 M6: the extra REST normalizers (friends, group id list,
+/// member profiles, mini profiles, avatar urls), counts-only stats.
+pub mod rest_ext;
 pub mod runtime;
 pub mod schema;
 /// Full-text search over `messages` via the contentless FTS5 mirror
@@ -122,6 +132,9 @@ pub mod search;
 /// G1): the pure checks `commands::set_settings` runs before the
 /// settings file is written.
 pub mod settings_check;
+/// Batch 30 M2-M4: passive WS event decoding (reactions, controls =
+/// group/friend/sync events, receipts, typing, duplicate login).
+pub mod ws_events;
 /// WS frame stage counters (audit M4/D2, batch 4).
 pub mod ws_stats;
 pub mod wire;
@@ -276,12 +289,17 @@ pub enum Write {
         kind: String,
         payload: String,
     },
-    /// A reaction (cmd 603/610/611/612 in the WS stream).
+    /// A reaction (cmd 610/611/612 in the WS stream; batch 30 M2).
+    /// `remove: true` is a delete of that user's reaction on the
+    /// message (`rIcon == ""` on the wire; `emoji` is then empty).
+    /// The target message may not exist yet: the table has no FK, the
+    /// reaction is stored anyway and the archive joins it later.
     Reaction {
         msg_id: String,
         user_id: String,
         emoji: String,
         ts: i64,
+        remove: bool,
     },
     /// A group member list snapshot.
     Participants { conv_id: String, raw: String },
@@ -298,6 +316,46 @@ pub enum Write {
         name: Option<String>,
         raw: String,
     },
+    /// Batch 30 M3: a group event's name / avatar update. `name` and
+    /// `avatar_url` are only ever non-empty values. The writer applies
+    /// them when the stored cell is empty or the event (`ts`, ms) is
+    /// not older than the stored row's `updated_at` (minus a skew
+    /// margin) — a replay of an old event never overwrites a newer
+    /// name. The avatar lands in `conversations.avatar_url` (the only
+    /// avatar column a group has).
+    GroupEvent {
+        group_id: String,
+        name: Option<String>,
+        avatar_url: Option<String>,
+        ts: i64,
+    },
+    /// Batch 30 M3: member changes from a group event. `add` joins,
+    /// `remove` leaves/kicks (a removal older than the stored
+    /// `joined_ts` is ignored), `roles` sets `participants.role`
+    /// (0 member, 1 admin).
+    ParticipantsDelta {
+        conv_id: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+        roles: Vec<(String, i64)>,
+        ts: i64,
+    },
+    /// Batch 30 M3/M6: a contact name/avatar that must not clobber a
+    /// better stored value. The name (and avatar) is written when the
+    /// stored cell is empty; otherwise only when `event_ts` is `Some`
+    /// and not older than the stored `updated_at` (minus a skew
+    /// margin). `event_ts: None` is fill-only. `raw` fills a NULL
+    /// `raw_json` only.
+    ContactFill {
+        user_id: String,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+        event_ts: Option<i64>,
+        raw: Option<String>,
+    },
+    /// Batch 30 M6: make sure a `groups` row exists (`getlg/v4` id
+    /// list). Never changes or deletes an existing row.
+    GroupStub { group_id: String },
 }
 
 impl Write {
@@ -311,6 +369,10 @@ impl Write {
             Write::Participants { .. } => "participants",
             Write::Contact { .. } => "contact",
             Write::Group { .. } => "group",
+            Write::GroupEvent { .. } => "group_event",
+            Write::ParticipantsDelta { .. } => "participants_delta",
+            Write::ContactFill { .. } => "contact_fill",
+            Write::GroupStub { .. } => "group_stub",
         }
     }
 }
